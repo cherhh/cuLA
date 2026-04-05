@@ -354,7 +354,11 @@ struct KdaChunkFwdRecompWUKernelSm100 {
 // ===================================================================
 // Default Kernel type: uses the self-contained mainloop
 // ===================================================================
-using KdaChunkFwdRecompWUKernelSm100Default = KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100>;
+using KdaChunkFwdRecompWUKernelSm100Default = KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<>>;
+
+// BetaBF16 variant: loads beta from bf16 GMEM
+using KdaChunkFwdRecompWUKernelSm100_BetaBF16 =
+    KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<__nv_bfloat16>>;
 
 // ===================================================================
 // __global__ kernel wrapper (free function — CUDA requires this)
@@ -370,10 +374,9 @@ __launch_bounds__(384, 1, 1) kda_fwd_recomp_w_u_sm100_kernel_entry(
 // ===================================================================
 // Host-side launcher: constructs TMA descriptors and launches kernel
 // ===================================================================
+template <typename Kernel>
 inline void
-run_kda_fwd_recomp_w_u_sm100_impl(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
-    using Kernel = KdaChunkFwdRecompWUKernelSm100Default;
-
+run_kda_fwd_recomp_w_u_sm100_impl_dispatch(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
     auto shape_KVG = make_shape(params.total_len, params.d, params.h);
     auto stride_KVG = make_stride(params.h * params.d, _1{}, params.d);
     auto shape_Akk = make_shape(params.total_len, params.chunk_size, params.h);
@@ -418,6 +421,18 @@ run_kda_fwd_recomp_w_u_sm100_impl(KDA_fwd_recomp_w_u_params& params, cudaStream_
     dim3 grid_dim(Kernel::TileScheduler::get_grid_shape(params.tile_scheduler_params));
     dim3 block_dim(Kernel::NumTotalThreads, 1, 1);
     kernel_fn<<<grid_dim, block_dim, smem_size, stream>>>(params, tma_params);
+}
+
+// ===================================================================
+// Runtime dispatch based on params.is_beta_bf16
+// ===================================================================
+inline void
+run_kda_fwd_recomp_w_u_sm100_impl(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
+    if (params.is_beta_bf16) {
+        run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100_BetaBF16>(params, stream);
+    } else {
+        run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100Default>(params, stream);
+    }
 }
 
 }  // namespace kda::sm100

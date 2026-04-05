@@ -271,3 +271,79 @@ def test_safe_gate_chunk_varlen(
     assert_close("dg", ref_dg, tri_dg, 0.015)
     assert_close("db", ref_db, tri_db, 0.015)
     assert_close("dh0", ref_dh0, tri_dh0, 0.007)
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "D", "use_gate_in_kernel"),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-D{}-gate{}".format(*test))
+        for test in [
+            (2, 500, 3, 128, False),
+            (4, 1024, 4, 128, False),
+            (4, 2048, 8, 128, True),
+        ]
+    ],
+)
+def test_bf16_beta(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    use_gate_in_kernel: bool,
+):
+    """Verify that bf16 beta produces the same output as fp32 beta."""
+    torch.manual_seed(42)
+    q = torch.rand(B, T, H, D, dtype=torch.bfloat16)
+    k = torch.rand(B, T, H, D, dtype=torch.bfloat16)
+    v = torch.rand(B, T, H, D, dtype=torch.bfloat16)
+
+    if use_gate_in_kernel:
+        g = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+        A_log = torch.randn(H, dtype=torch.float32)
+        dt_bias = torch.randn(H * D, dtype=torch.float32)
+    else:
+        g = F.logsigmoid(torch.randn(B, T, H, D, dtype=torch.float32))
+        g = g.clamp(-5, 0)
+        A_log, dt_bias = None, None
+
+    beta_fp32 = torch.randn(B, T, H, dtype=torch.float32).sigmoid()
+    beta_bf16 = beta_fp32.bfloat16()
+    h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+
+    if use_gate_in_kernel:
+        A_log, dt_bias = map(lambda x: x.to(device), (A_log, dt_bias))
+    q, k, v, g, beta_fp32, beta_bf16, h0 = map(lambda x: x.to(device), (q, k, v, g, beta_fp32, beta_bf16, h0))
+
+    ref, ref_ht = chunk_kda(
+        q=F.normalize(q, p=2, dim=-1),
+        k=F.normalize(k, p=2, dim=-1),
+        v=v,
+        g=g,
+        beta=beta_fp32,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=h0,
+        output_final_state=True,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=True,
+        lower_bound=-5.0,
+    )
+
+    tri, tri_ht = chunk_kda(
+        q=F.normalize(q, p=2, dim=-1),
+        k=F.normalize(k, p=2, dim=-1),
+        v=v,
+        g=g,
+        beta=beta_bf16,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=h0,
+        output_final_state=True,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=True,
+        lower_bound=-5.0,
+    )
+
+    # bf16 beta loses some precision vs fp32 beta, but should be close
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)

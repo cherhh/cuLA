@@ -34,6 +34,7 @@ struct KdaChunkFwdRecompWUSm100NamedBarriers {
 // constants, and the persistent loop bodies for each warp role.
 // The Kernel struct is templated on this Mainloop.
 // ===================================================================
+template <typename ElementBeta_ = float>
 struct KdaChunkFwdRecompWUMainloopSm100 {
     // ===================== Tile / Buffer Constants =====================
     static constexpr int TileT = 64;
@@ -753,8 +754,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
             if (thread_idx < TileT) {
                 float beta_val =
                     (thread_idx < sub_seq_len)
-                        ? reinterpret_cast<float*>(
-                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h + head_idx]
+                        ? float(reinterpret_cast<ElementBeta_*>(
+                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h + head_idx])
                         : float(0);
                 shared_plan->beta_smem[beta_pipe_state_write.index()][thread_idx] = beta_val;
             }
