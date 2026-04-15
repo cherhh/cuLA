@@ -28,6 +28,16 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 chunk_gated_delta_rule_fwd_h = _mod.chunk_gated_delta_rule_fwd_h
 
+# ─── Intracard CP ───
+from cula.ops.cp.chunk_delta_h import (
+    compute_subseq_len,
+    intracard_fwd_h,
+    prepare_subseq_cu_seqlens,
+    _precompute_intracard_indices,
+    SplitSeqInfo,
+)
+from cula.ops.cp.merge import merge_fwd
+
 
 BT = 64
 device = "cuda"
@@ -304,6 +314,207 @@ def test_varlen_vs_nonvarlen():
         rtol=1e-6,
         msg="varlen vs non-varlen v_new mismatch for single sequence",
     )
+
+
+# ===================== Intracard CP unit tests =====================
+
+
+def test_cp_stage0_compute_subseq_len():
+    """Test compute_subseq_len produces sane values."""
+    # Short sequence: no splitting
+    ssl = compute_subseq_len(256, 208, 64, 64)
+    assert ssl >= 256, f"Short seq should not split: {ssl}"
+
+    # Long sequence: should split
+    ssl = compute_subseq_len(131072, 208, 64, 64)
+    assert ssl < 131072, f"Long seq should split: {ssl}"
+    assert ssl % 64 == 0, f"Must be chunk_size aligned: {ssl}"
+
+
+def test_cp_stage0_prepare_subseq_cu_seqlens():
+    """Test sequence splitting."""
+    # Single long sequence
+    T = 65536
+    cu = torch.tensor([0, T], dtype=torch.int64)
+    ssl = compute_subseq_len(T, 208, 4, 64)
+
+    boundaries, split_info, total_subseqs = prepare_subseq_cu_seqlens(cu, ssl, 64)
+    assert split_info, "Long seq should be split"
+    assert len(boundaries) == total_subseqs + 1
+    assert boundaries[0] == 0
+    assert boundaries[-1] == T
+
+    # Short sequence: no split
+    cu_short = torch.tensor([0, 128], dtype=torch.int64)
+    boundaries, split_info, total = prepare_subseq_cu_seqlens(cu_short, ssl, 64)
+    assert not split_info, "Short seq should not be split"
+
+
+def test_cp_stage0_precompute_indices():
+    """Test index precomputation."""
+    split_info = SplitSeqInfo(
+        split_seq_ids=[0],
+        start_subseq_idx=[0],
+        num_subseqs=[4],
+    )
+    cu_values = [0, 1024, 2048, 3072, 4096]
+
+    result = _precompute_intracard_indices(split_info, cu_values, N_orig=1)
+    (non_first, first_idx, last_idx,
+     num_nf, seq_starts, seq_counts, init_off) = result
+
+    assert non_first == [1, 2, 3]
+    assert first_idx == [0]
+    assert last_idx == [3]
+    assert num_nf == 3
+    assert seq_starts == [0]
+    assert seq_counts == [4]
+    assert init_off == [0, 3]
+
+
+def test_cp_merge_kernel():
+    """Test merge standalone with a known case."""
+    torch.manual_seed(42)
+    S = 4  # 4 sub-seqs from 1 original seq
+    H = 2
+    K, V = 128, 128
+
+    # Random hm
+    hm = torch.randn(S, H, K, V + K, device=device, dtype=torch.float32) * 0.01
+    he = hm[:, :, :, :V]
+    m_mat = hm[:, :, :, V:]
+
+    # Reference: sequential prefix scan
+    h_ref_list = []
+    b_h = torch.zeros(H, K, V, device=device, dtype=torch.float32)
+    for s in range(S):
+        b_h = torch.bmm(m_mat[s], b_h) + he[s]
+        if s < S - 1:
+            h_ref_list.append(b_h.clone())
+    h_ref = torch.stack(h_ref_list)  # [3, H, K, V]
+
+    # merge_fwd
+    num_non_first = S - 1
+    seq_starts = [0]
+    seq_counts = [S]
+    init_offsets = [0, num_non_first]
+    split_seq_ids = [0]
+
+    h_out = merge_fwd(
+        hm=hm,
+        seq_starts=seq_starts,
+        seq_counts=seq_counts,
+        init_offsets=init_offsets,
+        split_seq_ids=split_seq_ids,
+        h0=None,
+        num_non_first=num_non_first,
+    )
+
+    rel = (h_out - h_ref).abs().max().item() / (h_ref.abs().max().item() + 1e-8)
+    assert rel < 5e-3, f"merge relative error too large: {rel}"
+
+
+# ===================== Intracard CP E2E tests =====================
+
+
+@pytest.mark.parametrize("T", [32768, 65536])
+@pytest.mark.parametrize("H", [4, 8])
+@pytest.mark.parametrize("use_gk", [True, False])
+def test_cp_e2e_single_seq(T, H, use_gk):
+    """E2E: intracard_fwd_h vs baseline for a single long sequence."""
+    torch.manual_seed(42)
+    K, V = 128, 128
+
+    k = torch.randn(1, T, H, K, device=device, dtype=torch.bfloat16) * 0.02
+    w = torch.randn(1, T, H, K, device=device, dtype=torch.bfloat16) * 0.02
+    u = torch.randn(1, T, H, V, device=device, dtype=torch.bfloat16) * 0.02
+    gk = (torch.randn(1, T, H, K, device=device, dtype=torch.float32) * 0.01) if use_gk else None
+
+    cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int64)
+
+    h_base, v_base, _ = chunk_gated_delta_rule_fwd_h(
+        k=k, w=w, u=u, gk=gk,
+        initial_state=None, output_final_state=False,
+        chunk_size=BT, save_new_value=True,
+        cu_seqlens=cu_seqlens,
+    )
+    h_cp, v_cp, _ = intracard_fwd_h(
+        k=k, w=w, u=u, gk=gk,
+        initial_state=None, output_final_state=False,
+        chunk_size=BT, save_new_value=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    h_rel = (h_cp.float() - h_base.float()).abs().max().item() / (h_base.float().abs().max().item() + 1e-8)
+    v_rel = (v_cp.float() - v_base.float()).abs().max().item() / (v_base.float().abs().max().item() + 1e-8) if v_cp is not None else 0
+    assert h_rel < 0.05, f"h relative error too large: {h_rel}"
+    assert v_rel < 0.05, f"v_new relative error too large: {v_rel}"
+
+
+def test_cp_e2e_multi_seq():
+    """E2E: mixed-length batch with long + short sequences."""
+    torch.manual_seed(123)
+    K, V, H = 128, 128, 4
+    seq_lens = [32768, 256, 32768, 128]
+    T = sum(seq_lens)
+
+    k = torch.randn(1, T, H, K, device=device, dtype=torch.bfloat16) * 0.02
+    w = torch.randn(1, T, H, K, device=device, dtype=torch.bfloat16) * 0.02
+    u = torch.randn(1, T, H, V, device=device, dtype=torch.bfloat16) * 0.02
+
+    cu = [0]
+    for sl in seq_lens:
+        cu.append(cu[-1] + sl)
+    cu_seqlens = torch.tensor(cu, device=device, dtype=torch.int64)
+
+    h_base, _, _ = chunk_gated_delta_rule_fwd_h(
+        k=k, w=w, u=u,
+        initial_state=None, output_final_state=False,
+        chunk_size=BT, save_new_value=True,
+        cu_seqlens=cu_seqlens,
+    )
+    h_cp, _, _ = intracard_fwd_h(
+        k=k, w=w, u=u,
+        initial_state=None, output_final_state=False,
+        chunk_size=BT, save_new_value=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    h_rel = (h_cp.float() - h_base.float()).abs().max().item() / (h_base.float().abs().max().item() + 1e-8)
+    assert h_rel < 0.05, f"h relative error too large: {h_rel}"
+
+
+def test_cp_e2e_with_h0():
+    """E2E: with initial state h0 and output_final_state."""
+    torch.manual_seed(77)
+    K, V, H = 128, 128, 4
+    T = 32768
+    N = 1
+
+    k = torch.randn(1, T, H, K, device=device, dtype=torch.bfloat16) * 0.02
+    w = torch.randn(1, T, H, K, device=device, dtype=torch.bfloat16) * 0.02
+    u = torch.randn(1, T, H, V, device=device, dtype=torch.bfloat16) * 0.02
+    h0 = torch.randn(N, H, K, V, device=device, dtype=torch.float32) * 0.01
+
+    cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int64)
+
+    h_base, _, ht_base = chunk_gated_delta_rule_fwd_h(
+        k=k, w=w, u=u,
+        initial_state=h0, output_final_state=True,
+        chunk_size=BT, save_new_value=False,
+        cu_seqlens=cu_seqlens,
+    )
+    h_cp, _, ht_cp = intracard_fwd_h(
+        k=k, w=w, u=u,
+        initial_state=h0, output_final_state=True,
+        chunk_size=BT, save_new_value=False,
+        cu_seqlens=cu_seqlens,
+    )
+
+    h_rel = (h_cp.float() - h_base.float()).abs().max().item() / (h_base.float().abs().max().item() + 1e-8)
+    ht_rel = (ht_cp.float() - ht_base.float()).abs().max().item() / (ht_base.float().abs().max().item() + 1e-8) if ht_cp is not None else 0
+    assert h_rel < 0.05, f"h relative error too large: {h_rel}"
+    assert ht_rel < 0.05, f"ht relative error too large: {ht_rel}"
 
 
 # ===================== Manual test runner =====================

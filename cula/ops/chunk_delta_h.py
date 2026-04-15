@@ -37,6 +37,11 @@ from fla.utils import tensor_cache
 
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
+# Intracard CP auto-dispatch: env var CULA_INTRACARD_CP=1 enables transparent
+# routing of long varlen sequences through the intracard context-parallel path.
+import os as _os
+_INTRACARD_CP_ENABLED = _os.environ.get("CULA_INTRACARD_CP", "0") == "1"
+
 
 # in FLA, cumsum returns int64 tensor by default
 @tensor_cache
@@ -999,12 +1004,18 @@ class ChunkDeltaRuleFwdH:
                                 cute.printf("[LD] wi=%d c=%d w_P.acq\n", work_idx, chunk_idx)
                     w_h = load_w_P.acquire_and_advance()
                     cute.copy(
-                        atom=tma_atom_w, src=tWgW[None, chunk_idx, 0], dst=tWsW[None, w_h.index], tma_bar_ptr=w_h.barrier
+                        atom=tma_atom_w, 
+                        src=tWgW[None, chunk_idx, 0], 
+                        dst=tWsW[None, w_h.index], 
+                        tma_bar_ptr=w_h.barrier
                     )
 
                     kt_h = load_kt_P.acquire_and_advance()
                     cute.copy(
-                        atom=tma_atom_kt, src=tKgK[None, 0, chunk_idx], dst=tKsK[None, kt_h.index], tma_bar_ptr=kt_h.barrier
+                        atom=tma_atom_kt, 
+                        src=tKgK[None, 0, chunk_idx], 
+                        dst=tKsK[None, kt_h.index], 
+                        tma_bar_ptr=kt_h.barrier
                     )
 
                     u_h = load_u_P.acquire_and_advance()
@@ -2001,6 +2012,7 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     persistent: bool = True,
+    _no_cp: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     ChunkDeltaRuleFwdH forward pass — FLA-compatible API.
@@ -2028,6 +2040,27 @@ def chunk_gated_delta_rule_fwd_h(
         v_new:       [B, T, H, V] bf16      (or None if save_new_value=False)
         final_state: [N, H, K, V] fp32      (or None if output_final_state=False)
     """
+    # --- Intracard CP auto-dispatch ---
+    # When CULA_INTRACARD_CP=1, inference mode, and varlen input,
+    # transparently route through intracard CP for long sequences.
+    # intracard_fwd_h internally falls back to the non-CP path for short sequences.
+    if (
+        _INTRACARD_CP_ENABLED
+        and not _no_cp
+        and cu_seqlens is not None
+        and torch.is_inference_mode_enabled()
+    ):
+        from cula.ops.cp.chunk_delta_h import intracard_fwd_h
+        return intracard_fwd_h(
+            k=k, w=w, u=u, g=g, gk=gk,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            chunk_size=chunk_size,
+            save_new_value=save_new_value,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+
     B, T, H, K_dim = k.shape
     V_dim = u.shape[3]
     BT = chunk_size

@@ -55,6 +55,19 @@ chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h  # noqa: E402
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets  # noqa: E402
 
+# ─── Intracard CP imports ───
+from cula.ops.cp.chunk_delta_h import intracard_fwd_h as cula_cp_fwd_h  # noqa: E402
+
+_fla_cp_fwd_h = None
+
+def _get_fla_cp_fwd_h():
+    """Lazy import of FLA intracard CP."""
+    global _fla_cp_fwd_h
+    if _fla_cp_fwd_h is None:
+        from fla.ops.common.intracard_cp import intracard_fwd_h
+        _fla_cp_fwd_h = intracard_fwd_h
+    return _fla_cp_fwd_h
+
 # ============================================================
 # Constants
 # ============================================================
@@ -383,9 +396,144 @@ def bench_varlen(configs):
 
 
 # ============================================================
+# Intracard CP benchmark (long single-sequence varlen)
+# ============================================================
+def bench_cp(configs):
+    print("\n" + "=" * 80)
+    print(" Intracard CP Benchmark: cuLA-CP vs FLA-CP vs cuLA vs FLA")
+    print("=" * 80)
+    results = []
+
+    fla_cp = _get_fla_cp_fwd_h()
+
+    for T, H, use_gk in configs:
+        torch.manual_seed(42)
+        torch.cuda.empty_cache()
+
+        # Single long sequence, varlen mode (B=1)
+        k = torch.randn(1, T, H, K, device=device, dtype=dtype) * 0.1
+        w = torch.randn(1, T, H, K, device=device, dtype=dtype) * 0.1
+        u = torch.randn(1, T, H, V, device=device, dtype=dtype) * 0.1
+        cu_seqlens = torch.tensor([0, T], dtype=torch.long, device=device)
+        cu_seqlens_i32 = cu_seqlens.int()
+
+        gk = None
+        if use_gk:
+            gk = -torch.abs(torch.randn(1, T, H, K, device=device, dtype=torch.float32) * 0.1).cumsum(dim=1)
+
+        h0 = torch.randn(1, H, K, V, device=device, dtype=torch.float32) * 0.01
+
+        # ---- Reference: FLA (no CP) ----
+        ref_result = fla_fwd_h(
+            k=k, w=w, u=u, g=None, gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            chunk_size=BT,
+            save_new_value=True,
+            cu_seqlens=cu_seqlens,
+        )
+        h_ref = ref_result[0]
+
+        # ---- cuLA-CP ----
+        cula_cp_result = cula_cp_fwd_h(
+            k=k, w=w, u=u, g=None, gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            chunk_size=BT,
+            save_new_value=True,
+            cu_seqlens=cu_seqlens,
+        )
+        h_cula_cp = cula_cp_result[0]
+        torch.cuda.synchronize()
+        max_diff_cula_cp, mean_diff_cula_cp = accuracy_stats(h_ref, h_cula_cp)
+
+        # ---- FLA-CP ----
+        fla_cp_result = fla_cp(
+            k=k, w=w, u=u, g=None, gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            chunk_size=BT,
+            save_new_value=True,
+            cu_seqlens=cu_seqlens,
+        )
+        h_fla_cp = fla_cp_result[0]
+        torch.cuda.synchronize()
+        max_diff_fla_cp, mean_diff_fla_cp = accuracy_stats(h_ref, h_fla_cp)
+
+        # ---- Performance timing ----
+        def run_fla(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens):
+            fla_fwd_h(
+                k=k, w=w, u=u, g=None, gk=gk,
+                initial_state=h0, output_final_state=True,
+                chunk_size=BT, save_new_value=True, cu_seqlens=cu,
+            )
+
+        def run_cute(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_i32):
+            chunk_gated_delta_rule_fwd_h(
+                k=k, w=w, u=u, g=None, gk=gk,
+                initial_state=h0, output_final_state=True,
+                chunk_size=BT, save_new_value=True, cu_seqlens=cu,
+            )
+
+        def run_cula_cp(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens):
+            cula_cp_fwd_h(
+                k=k, w=w, u=u, g=None, gk=gk,
+                initial_state=h0, output_final_state=True,
+                chunk_size=BT, save_new_value=True, cu_seqlens=cu,
+            )
+
+        def run_fla_cp(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens):
+            fla_cp(
+                k=k, w=w, u=u, g=None, gk=gk,
+                initial_state=h0, output_final_state=True,
+                chunk_size=BT, save_new_value=True, cu_seqlens=cu,
+            )
+
+        ms_fla = time_kernel(run_fla)
+        ms_cute = time_kernel(run_cute)
+        ms_cula_cp = time_kernel(run_cula_cp)
+        ms_fla_cp = time_kernel(run_fla_cp)
+
+        flags = []
+        if use_gk:
+            flags.append("gk")
+        flag_str = f" [{','.join(flags)}]" if flags else ""
+
+        r = {
+            "T": T,
+            "H": H,
+            "flags": flag_str,
+            "max_diff_cula_cp": max_diff_cula_cp,
+            "mean_diff_cula_cp": mean_diff_cula_cp,
+            "max_diff_fla_cp": max_diff_fla_cp,
+            "mean_diff_fla_cp": mean_diff_fla_cp,
+            "ms_fla": ms_fla,
+            "ms_cute": ms_cute,
+            "ms_cula_cp": ms_cula_cp,
+            "ms_fla_cp": ms_fla_cp,
+        }
+        results.append(r)
+
+        T_str = f"{T//1024}K" if T >= 1024 else str(T)
+        print(
+            f"  T={T_str:>5s} H={H:2d}{flag_str:<8s} | "
+            f"FLA={ms_fla:.3f}ms  cuLA={ms_cute:.3f}ms  "
+            f"FLA-CP={ms_fla_cp:.3f}ms  cuLA-CP={ms_cula_cp:.3f}ms | "
+            f"cuLA-CP/FLA={ms_fla/ms_cula_cp:.2f}x  cuLA-CP/FLA-CP={ms_fla_cp/ms_cula_cp:.2f}x"
+        )
+        print(
+            f"  {'':>19s} accuracy vs FLA: "
+            f"cuLA-CP max={max_diff_cula_cp:.4e} mean={mean_diff_cula_cp:.4e}  "
+            f"FLA-CP max={max_diff_fla_cp:.4e} mean={mean_diff_fla_cp:.4e}"
+        )
+
+    return results
+
+
+# ============================================================
 # Report table
 # ============================================================
-def print_report(nv_results, vl_results):
+def print_report(nv_results, vl_results, cp_results=None):
     sep = "=" * 110
     print(f"\n\n{sep}")
     print("                     BENCHMARK REPORT: chunk_delta_rule_fwd_h")
@@ -437,6 +585,30 @@ def print_report(nv_results, vl_results):
         geo = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
         print(f"  {'Geometric mean':>55s}  │  {'':>10s}  {'':>12s}  │  {'':>9s}  {'':>9s}  {geo:7.2f}x")
 
+    if cp_results:
+        print("\n  [Intracard CP — Long Sequence]")
+        w = 130
+        print(f"  {'─' * w}")
+        print(
+            f"  {'Config':<20s}  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>9s}  "
+            f"{'FLA-CP(ms)':>10s}  {'cuLA-CP(ms)':>11s}  │  "
+            f"{'cuLA-CP/FLA':>11s}  {'cuLA-CP/FLA-CP':>14s}  │  "
+            f"{'cuLA-CP maxΔ':>12s}  {'FLA-CP maxΔ':>12s}"
+        )
+        print(f"  {'─' * w}")
+        for r in cp_results:
+            T_str = f"{r['T']//1024}K" if r['T'] >= 1024 else str(r['T'])
+            label = f"T={T_str:>5s} H={r['H']:2d}{r['flags']}"
+            sp_fla = r['ms_fla'] / r['ms_cula_cp'] if r['ms_cula_cp'] > 0 else float('inf')
+            sp_fla_cp = r['ms_fla_cp'] / r['ms_cula_cp'] if r['ms_cula_cp'] > 0 else float('inf')
+            print(
+                f"  {label:<20s}  │  {r['ms_fla']:9.3f}  {r['ms_cute']:9.3f}  "
+                f"{r['ms_fla_cp']:10.3f}  {r['ms_cula_cp']:11.3f}  │  "
+                f"{sp_fla:10.2f}x  {sp_fla_cp:13.2f}x  │  "
+                f"{r['max_diff_cula_cp']:12.4e}  {r['max_diff_fla_cp']:12.4e}"
+            )
+        print(f"  {'─' * w}")
+
     print(f"\n{sep}\n")
 
 
@@ -449,8 +621,8 @@ def main():
         "--mode",
         type=str,
         default="both",
-        choices=["non-varlen", "varlen", "both"],
-        help="Which benchmark mode to run (default: both)",
+        choices=["non-varlen", "varlen", "both", "cp", "all"],
+        help="Which benchmark mode to run (default: both). 'cp' runs intracard CP only, 'all' runs everything.",
     )
     parser.add_argument(
         "--ncu",
@@ -482,15 +654,28 @@ def main():
         (25, 32768, 64, 3.0, True, True, True, True),
     ]
 
-    nv_res, vl_res = [], []
+    nv_res, vl_res, cp_res = [], [], []
 
-    if args.mode in ("non-varlen", "both"):
+    if args.mode in ("non-varlen", "both", "all"):
         nv_res = bench_non_varlen(non_varlen_configs)
 
-    if args.mode in ("varlen", "both"):
+    if args.mode in ("varlen", "both", "all"):
         vl_res = bench_varlen(varlen_configs)
 
-    print_report(nv_res, vl_res)
+    if args.mode in ("cp", "all"):
+        # (T, H, use_gk)
+        cp_configs = [
+            (32768,  4, True),
+            (65536,  4, True),
+            (131072, 4, True),
+            (262144, 4, True),
+            (524288, 4, True),
+            (131072, 8, True),
+            (131072, 16, True),
+        ]
+        cp_res = bench_cp(cp_configs)
+
+    print_report(nv_res, vl_res, cp_res)
 
 
 if __name__ == "__main__":
