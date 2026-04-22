@@ -198,3 +198,95 @@ def test_k1_phases_1to6():
     # bf16 mantissa ≈ 0.4% relative; allow 1% for compounded round-trips.
     for n, m in (("qd", mq), ("kd", mk), ("ki", mi), ("kr", mr)):
         assert m < 1e-2, f"{n} relative mismatch: {m}"
+
+
+def test_k1_phases_1to8():
+    """Phases 1-8: validates L (masked + beta), Mqk (upper zeroed), and
+    INV = (I + L)^(-1) via Neumann series (exact for strict-lower 16x16)."""
+    from cula.ops.flashkda_k1 import CHUNK, D, launch_k1_phases_1to8
+
+    B, T, H = 1, 32, 2
+    scale = 0.125
+    gate_scale = -1.0
+    q, k, g_pre, beta, A_log, dt_bias = _make_inputs(B, T, H, seed=3)
+    total_tiles = (B * T) // CHUNK
+    # Re-layout beta to flat [head*T_total + t] order (matches the C++ linear
+    # indexing used by the kernel).
+    # Source beta is [B, T, H]; we want [H, B*T] flattened.
+    beta_flat = beta.view(B * T, H).permute(1, 0).contiguous().view(-1)
+
+    n_cc = total_tiles * H * CHUNK * CHUNK
+    ws_l = torch.zeros(n_cc, dtype=torch.bfloat16, device="cuda")
+    ws_mqk = torch.zeros_like(ws_l)
+    ws_inv = torch.zeros_like(ws_l)
+
+    launch_k1_phases_1to8(
+        q,
+        k,
+        g_pre,
+        A_log,
+        dt_bias,
+        beta_flat,
+        scale,
+        gate_scale,
+        ws_l,
+        ws_mqk,
+        ws_inv,
+    )
+    torch.cuda.synchronize()
+
+    ws_l = ws_l.view(H, total_tiles, CHUNK, CHUNK).float()
+    ws_mqk = ws_mqk.view(H, total_tiles, CHUNK, CHUNK).float()
+    ws_inv = ws_inv.view(H, total_tiles, CHUNK, CHUNK).float()
+
+    # ---- torch reference ----
+    q_tm = q.view(B * T, H, D).view(total_tiles, CHUNK, H, D).permute(2, 0, 1, 3).contiguous().float()
+    k_tm = k.view(B * T, H, D).view(total_tiles, CHUNK, H, D).permute(2, 0, 1, 3).contiguous().float()
+    g_tm = g_pre.view(B * T, H, D).view(total_tiles, CHUNK, H, D).permute(2, 0, 1, 3).contiguous().float()
+    beta_tm = beta.view(B * T, H).permute(1, 0).contiguous().view(H, total_tiles, CHUNK).float()
+
+    q_inv = (q_tm.pow(2).sum(-1, keepdim=True) + 1.0e-6).rsqrt()
+    k_inv_l = (k_tm.pow(2).sum(-1, keepdim=True) + 1.0e-6).rsqrt()
+    q_l2 = (q_tm * q_inv).to(torch.bfloat16).float()
+    k_l2 = (k_tm * k_inv_l).to(torch.bfloat16).float()
+
+    A_exp = torch.exp(A_log.float())
+    g_act = gate_scale * torch.sigmoid(A_exp.view(H, 1, 1, 1) * (g_tm + dt_bias.view(H, 1, 1, D)))
+    g_cs = torch.cumsum(g_act, dim=2)
+    exp_pos = torch.exp(g_cs)
+    inv_pos = 1.0 / exp_pos
+
+    qd = (q_l2 * exp_pos * scale).to(torch.bfloat16).float()
+    kd = (k_l2 * exp_pos).to(torch.bfloat16).float()
+    ki = (k_l2 * inv_pos).to(torch.bfloat16).float()
+
+    # L = kd @ ki^T  (bf16 inputs, fp32 acc)
+    L_full = torch.einsum("htmk,htnk->htmn", kd, ki)  # [H, tot, 16, 16]
+    Mqk_full = torch.einsum("htmk,htnk->htmn", qd, ki)
+
+    # tril mask + beta sigmoid
+    tril_mask = torch.tril(torch.ones(CHUNK, CHUNK, device="cuda"), diagonal=-1)
+    L_masked = L_full * tril_mask  # strict lower
+    sig_b = torch.sigmoid(beta_tm).view(H, total_tiles, CHUNK, 1)
+    L_masked = L_masked * sig_b  # apply per-row beta sigmoid
+
+    # Mqk: zero strict upper (i<j); keep diagonal.
+    keep_mqk = torch.tril(torch.ones(CHUNK, CHUNK, device="cuda"), diagonal=0)
+    Mqk_masked = Mqk_full * keep_mqk
+
+    # INV = (I + L_masked)^(-1)
+    eye = torch.eye(CHUNK, device="cuda").view(1, 1, CHUNK, CHUNK)
+    INV_ref = torch.linalg.inv(eye + L_masked)
+
+    def rel(name, got, ref):
+        d = (got - ref).abs()
+        s = ref.abs().max().clamp_min(1.0)
+        return (d.max() / s).item()
+
+    ml = rel("L", ws_l, L_masked)
+    mm = rel("Mqk", ws_mqk, Mqk_masked)
+    mi = rel("INV", ws_inv, INV_ref)
+    print(f"\n[k1 phases1-8] rel diffs: L={ml:.4e}  Mqk={mm:.4e}  INV={mi:.4e}")
+    assert ml < 1e-2, f"L mismatch: {ml}"
+    assert mm < 1e-2, f"Mqk mismatch: {mm}"
+    assert mi < 5e-2, f"INV mismatch: {mi}"

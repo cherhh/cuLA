@@ -885,3 +885,360 @@ def launch_k1_phases_1to6(
         gate_scale,
         stream,
     )
+
+
+# ===========================================================================
+# Phases 1-8 kernel ??? adds L_Mqk + tril/beta + Neumann inverse
+# ---------------------------------------------------------------------------
+# Phase 7:
+#   L  [16,16] = k_decayed @ k_inv^T   (fp32 acc, then masked)
+#   Mqk[16,16] = q_decayed @ k_inv^T   (fp32 acc, then masked)
+# Mask: L is strict lower-tri; for i>j, L[i,j] *= sigmoid(beta[bos+i]).
+# Mqk is upper-incl-diagonal-zero: Mqk[i,j]=0 for i<j.
+# Phase 8:
+#   INV = (I + L_lower)^(-1) via Neumann series exact for strictly lower 16x16:
+#   INV_init = I - L  (note sign flip because (I+L)^(-1) = (I-L)*(I+L^2)*(I+L^4)*(I+L^8))
+#   then INV ??= (I + L^2k) for k=1,2,3.
+# Implementation uses CUDA-core compute with 256 threads ?? 1 element each
+# (16x16 = 256 outputs). All matmuls staged via SMEM. Tensor cores will be a
+# follow-up perf pass ??? for these tiny 16x16x{16,128} GEMMs the bottleneck is
+# the recurrent K2 kernel anyway.
+# ===========================================================================
+@cute.kernel
+def k1_phases_1to8_kernel(
+    tma_atom_q: cute.CopyAtom,
+    tma_tensor_q: cute.Tensor,
+    tma_atom_k: cute.CopyAtom,
+    tma_tensor_k: cute.Tensor,
+    tma_atom_g: cute.CopyAtom,
+    tma_tensor_g: cute.Tensor,
+    a_log: cute.Tensor,
+    dt_bias: cute.Tensor,
+    beta: cute.Tensor,  # [B*T*H] bf16 flat (linear: head*T + t)
+    ws_l: cute.Tensor,  # bf16 flat [tot*H*16*16]
+    ws_mqk: cute.Tensor,  # bf16 flat [tot*H*16*16]
+    ws_inv: cute.Tensor,  # bf16 flat [tot*H*16*16]
+    H: cutlass.Constexpr[int],
+    total_tiles: cutlass.Constexpr[int],
+    T_total: cutlass.Constexpr[int],
+    scale: cutlass.Constexpr[float],
+    gate_scale: cutlass.Constexpr[float],
+):
+    tile_idx, head_idx, _ = cute.arch.block_idx()
+    tidx, _, _ = cute.arch.thread_idx()
+
+    smem = cutlass.utils.SmemAllocator()
+    qk_layout = cute.make_layout((CHUNK, D), stride=(D, 1))
+    cc_layout = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))  # 16x16
+    sQ = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    sK = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    sGbf = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    sGcs = smem.allocate_tensor(cutlass.Float32, qk_layout, 128)
+    sGtot = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 128)
+    # Phase 6 output tensors (kept in SMEM, then dumped at phase 7+8 end).
+    sQD = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    sKD = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    sKI = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    # Phase 7+8 output tensors (16x16 bf16 / fp32 work).
+    sL = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)  # fp32 for precision
+    sMqk = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
+    sINV = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
+    sLp = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)  # L^2, L^4, L^8 buffer
+    sTmp = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)  # scratch
+    sMbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((1,)), 8)
+    sMbar_ptr = sMbar.iterator
+
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    if warp_idx == 0:
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_init(sMbar_ptr, cutlass.Int32(1))
+    cute.arch.mbarrier_init_fence()
+    cute.arch.barrier()
+
+    gSrc_q = cute.local_tile(tma_tensor_q, (CHUNK, D), (None, None, None))
+    gSrc_k = cute.local_tile(tma_tensor_k, (CHUNK, D), (None, None, None))
+    gSrc_g = cute.local_tile(tma_tensor_g, (CHUNK, D), (None, None, None))
+    tQs, tQg = cpasync.tma_partition(
+        tma_atom_q,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sQ, 0, 2),
+        cute.group_modes(gSrc_q, 0, 2),
+    )
+    tKs, tKg = cpasync.tma_partition(
+        tma_atom_k,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sK, 0, 2),
+        cute.group_modes(gSrc_k, 0, 2),
+    )
+    tGs, tGg = cpasync.tma_partition(
+        tma_atom_g,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sGbf, 0, 2),
+        cute.group_modes(gSrc_g, 0, 2),
+    )
+
+    if warp_idx == 0:
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(sMbar_ptr, cutlass.Int32(3 * CHUNK * D * 2))
+        cute.copy(tma_atom_q, tQg[(None, tile_idx, 0, head_idx)], tQs[(None,)], tma_bar_ptr=sMbar_ptr)
+        cute.copy(tma_atom_k, tKg[(None, tile_idx, 0, head_idx)], tKs[(None,)], tma_bar_ptr=sMbar_ptr)
+        cute.copy(tma_atom_g, tGg[(None, tile_idx, 0, head_idx)], tGs[(None,)], tma_bar_ptr=sMbar_ptr)
+
+    cute.arch.mbarrier_wait(sMbar_ptr, cutlass.Int32(0))
+
+    # -------- L2 normalize q, k --------
+    row = tidx // 16
+    col = (tidx % 16) * 8
+
+    q_sq = cutlass.Float32(0.0)
+    k_sq = cutlass.Float32(0.0)
+    q_vals = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
+    k_vals = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
+    for j in cutlass.range_constexpr(8):
+        qv = cutlass.Float32(sQ[row, col + j])
+        kv = cutlass.Float32(sK[row, col + j])
+        q_vals[j] = qv
+        k_vals[j] = kv
+        q_sq = q_sq + qv * qv
+        k_sq = k_sq + kv * kv
+    q_sq = cute.arch.warp_reduction(q_sq, lambda a, b: a + b, threads_in_group=16)
+    k_sq = cute.arch.warp_reduction(k_sq, lambda a, b: a + b, threads_in_group=16)
+    q_inv = cute.rsqrt(q_sq + cutlass.Float32(1.0e-6), fastmath=True)
+    k_inv = cute.rsqrt(k_sq + cutlass.Float32(1.0e-6), fastmath=True)
+    for j in cutlass.range_constexpr(8):
+        sQ[row, col + j] = cutlass.BFloat16(q_vals[j] * q_inv)
+        sK[row, col + j] = cutlass.BFloat16(k_vals[j] * k_inv)
+    cute.arch.barrier()
+
+    # -------- Gate cumsum + g_total + exp_g_total --------
+    a_log_exp = cute.exp(cutlass.Float32(a_log[head_idx]), fastmath=True)
+    if tidx < 128:
+        col_c = tidx
+        dt = cutlass.Float32(dt_bias[head_idx, col_c])
+        s = cutlass.Float32(0.0)
+        for r in cutlass.range_constexpr(CHUNK):
+            x = cutlass.Float32(sGbf[r, col_c]) + dt
+            x = a_log_exp * x
+            sig = cutlass.Float32(0.5) * (cute.tanh(x * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
+            s = s + cutlass.Float32(gate_scale) * sig
+            sGcs[r, col_c] = s
+        sGtot[col_c] = cute.exp(s, fastmath=True)
+    cute.arch.barrier()
+
+    # -------- Phase 6: decay_apply ??? SMEM --------
+    for j in cutlass.range_constexpr(8):
+        jj: cutlass.Constexpr[int] = j
+        g_cs = sGcs[row, col + jj]
+        exp_pos = cute.exp(g_cs, fastmath=True)
+        inv_pos = cutlass.Float32(1.0) / exp_pos
+        q_v = cutlass.Float32(sQ[row, col + jj])
+        k_v = cutlass.Float32(sK[row, col + jj])
+        sQD[row, col + jj] = cutlass.BFloat16(q_v * exp_pos * cutlass.Float32(scale))
+        sKD[row, col + jj] = cutlass.BFloat16(k_v * exp_pos)
+        sKI[row, col + jj] = cutlass.BFloat16(k_v * inv_pos)
+    cute.arch.barrier()
+
+    # -------- Phase 7: L = sKD @ sKI^T, Mqk = sQD @ sKI^T --------
+    # 256 threads ??? one (i,j) of the 16x16 outputs each.
+    i = tidx // CHUNK
+    j = tidx % CHUNK
+    sum_l = cutlass.Float32(0.0)
+    sum_m = cutlass.Float32(0.0)
+    for kk in cutlass.range(D, unroll=8):
+        ki_v = cutlass.Float32(sKI[j, kk])  # second operand transposed: KI[j, kk]
+        sum_l = sum_l + cutlass.Float32(sKD[i, kk]) * ki_v
+        sum_m = sum_m + cutlass.Float32(sQD[i, kk]) * ki_v
+    # Apply masks + beta sigmoid.
+    # beta linear index: head_idx * T_total + tile_idx * CHUNK + i
+    beta_lin = head_idx * T_total + tile_idx * CHUNK + i
+    if i > j:
+        bv = cutlass.Float32(beta[beta_lin])
+        sig_b = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
+        sL[i, j] = sum_l * sig_b
+    else:
+        sL[i, j] = cutlass.Float32(0.0)
+    if i >= j:
+        sMqk[i, j] = sum_m
+    else:
+        sMqk[i, j] = cutlass.Float32(0.0)
+    cute.arch.barrier()
+
+    # -------- Phase 8: Neumann inverse (I + L)^(-1) --------
+    # Identity Init: INV = I - L. Then iterate 3 powers (L^2, L^4, L^8).
+    # Layout: each (i,j) thread holds 1 element of each 16x16 matrix.
+    inv_v = cutlass.Float32(1.0 if i == j else 0.0) - sL[i, j]
+    sINV[i, j] = inv_v
+    sLp[i, j] = sL[i, j]
+    cute.arch.barrier()
+
+    for _p in cutlass.range_constexpr(3):
+        # 1) sTmp = sLp @ sLp  (compute L^2k ??? temp)
+        s = cutlass.Float32(0.0)
+        for kk in cutlass.range_constexpr(CHUNK):
+            s = s + sLp[i, kk] * sLp[kk, j]
+        # use sMqk as scratch ??? actually we need a separate scratch to avoid races.
+        # We have sTmp.
+        cute.arch.barrier()
+        sTmp[i, j] = s
+        cute.arch.barrier()
+
+        # 2) sLp_new = sTmp; compute INV += INV @ sLp_new
+        s2 = cutlass.Float32(0.0)
+        for kk in cutlass.range_constexpr(CHUNK):
+            s2 = s2 + sINV[i, kk] * sTmp[kk, j]
+        cute.arch.barrier()
+        sINV[i, j] = sINV[i, j] + s2
+        sLp[i, j] = sTmp[i, j]  # promote scratch to current power
+        cute.arch.barrier()
+
+    # -------- Workspace dumps --------
+    # Each (head, tile) has a 16x16 = 256-element output region.
+    ws_base_cc = (head_idx * total_tiles + tile_idx) * (CHUNK * CHUNK)
+    ws_l[ws_base_cc + i * CHUNK + j] = cutlass.BFloat16(sL[i, j])
+    ws_mqk[ws_base_cc + i * CHUNK + j] = cutlass.BFloat16(sMqk[i, j])
+    ws_inv[ws_base_cc + i * CHUNK + j] = cutlass.BFloat16(sINV[i, j])
+
+
+@cute.jit
+def run_k1_phases_1to8(
+    q: cute.Tensor,
+    k: cute.Tensor,
+    g: cute.Tensor,
+    a_log: cute.Tensor,
+    dt_bias: cute.Tensor,
+    beta: cute.Tensor,
+    ws_l: cute.Tensor,
+    ws_mqk: cute.Tensor,
+    ws_inv: cute.Tensor,
+    H: cutlass.Constexpr[int],
+    total_tiles: cutlass.Constexpr[int],
+    T_total: cutlass.Constexpr[int],
+    scale: cutlass.Constexpr[float],
+    gate_scale: cutlass.Constexpr[float],
+    stream: cuda_drv.CUstream,
+):
+    smem_layout_qk = cute.make_layout((CHUNK, D), stride=(D, 1))
+
+    def make_atom(t):
+        view = cute.make_tensor(
+            t.iterator,
+            cute.make_layout((T_total, D, H), stride=(H * D, 1, D)),
+        )
+        return cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            view,
+            smem_layout_qk,
+            (CHUNK, D),
+        )
+
+    tma_atom_q, tma_tensor_q = make_atom(q)
+    tma_atom_k, tma_tensor_k = make_atom(k)
+    tma_atom_g, tma_tensor_g = make_atom(g)
+
+    # SMEM bytes: 6 ?? bf16(CHUNK*D) [q,k,gbf,qd,kd,ki] + fp32(CHUNK*D) [g_cs] +
+    # fp32(D) [g_tot] + 5 ?? fp32(CHUNK*CHUNK) [L,Mqk,INV,Lp,Tmp] + mbar + slack
+    smem_bytes = 6 * (CHUNK * D * 2) + (CHUNK * D * 4) + (D * 4) + 5 * (CHUNK * CHUNK * 4) + 8 + 512
+
+    k1_phases_1to8_kernel(
+        tma_atom_q,
+        tma_tensor_q,
+        tma_atom_k,
+        tma_tensor_k,
+        tma_atom_g,
+        tma_tensor_g,
+        a_log,
+        dt_bias,
+        beta,
+        ws_l,
+        ws_mqk,
+        ws_inv,
+        H,
+        total_tiles,
+        T_total,
+        scale,
+        gate_scale,
+    ).launch(
+        grid=(total_tiles, H, 1),
+        block=[THREADS_PER_CTA, 1, 1],
+        smem=smem_bytes,
+        stream=stream,
+    )
+
+
+_compiled_cache_phases8: dict = {}
+
+
+def launch_k1_phases_1to8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    gate_scale: float,
+    ws_l: torch.Tensor,
+    ws_mqk: torch.Tensor,
+    ws_inv: torch.Tensor,
+) -> None:
+    for t in (q, k, g, beta):
+        assert t.dtype == torch.bfloat16 and t.is_cuda and t.is_contiguous()
+    assert A_log.dtype == torch.float32 and A_log.is_contiguous()
+    assert dt_bias.dtype == torch.float32 and dt_bias.is_contiguous()
+    B, T, H, K = q.shape
+    assert K == D and T % CHUNK == 0
+    total_tiles = (B * T) // CHUNK
+    T_total = B * T
+    # beta layout in C++: linear (head_idx * T_total + t).
+    # Caller expectation: a [B*T*H] bf16 flat tensor in that order.
+    assert beta.numel() == B * T * H
+
+    key = (T_total, H, total_tiles, scale, gate_scale)
+    if key not in _compiled_cache_phases8:
+        stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+        q_flat = q.view(T_total, H, D)
+        k_flat = k.view(T_total, H, D)
+        g_flat = g.view(T_total, H, D)
+        _compiled_cache_phases8[key] = cute.compile(
+            run_k1_phases_1to8,
+            from_dlpack(q_flat.detach(), assumed_align=16),
+            from_dlpack(k_flat.detach(), assumed_align=16),
+            from_dlpack(g_flat.detach(), assumed_align=16),
+            from_dlpack(A_log.detach(), assumed_align=16),
+            from_dlpack(dt_bias.detach(), assumed_align=16),
+            from_dlpack(beta.detach(), assumed_align=16),
+            from_dlpack(ws_l.detach(), assumed_align=16),
+            from_dlpack(ws_mqk.detach(), assumed_align=16),
+            from_dlpack(ws_inv.detach(), assumed_align=16),
+            H=H,
+            total_tiles=total_tiles,
+            T_total=T_total,
+            scale=scale,
+            gate_scale=gate_scale,
+            stream=stream,
+        )
+
+    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    q_flat = q.view(T_total, H, D)
+    k_flat = k.view(T_total, H, D)
+    g_flat = g.view(T_total, H, D)
+    _compiled_cache_phases8[key](
+        q_flat,
+        k_flat,
+        g_flat,
+        A_log,
+        dt_bias,
+        beta,
+        ws_l,
+        ws_mqk,
+        ws_inv,
+        H,
+        total_tiles,
+        T_total,
+        scale,
+        gate_scale,
+        stream,
+    )
