@@ -121,3 +121,80 @@ def test_k1_phases_1to5():
     assert mq < 5e-3, f"q L2 mismatch: {mq}"
     assert mk < 5e-3, f"k L2 mismatch: {mk}"
     assert mgt < 1e-2, f"exp_g_total mismatch: {mgt}"
+
+
+def test_k1_phases_1to6():
+    """Phases 1-6: also validates decay_apply outputs (q_decayed, k_decayed,
+    k_inv, k_restored)."""
+    from cula.ops.flashkda_k1 import CHUNK, D, launch_k1_phases_1to6
+
+    B, T, H = 1, 32, 2
+    scale = 0.125  # typical 1/sqrt(D/2) for KDA-style attention scale
+    gate_scale = -1.0  # mild — keeps exp(g_cs) and exp(-g_cs) in bf16 range
+    q, k, g_pre, _beta, A_log, dt_bias = _make_inputs(B, T, H, seed=2)
+    total_tiles = (B * T) // CHUNK
+
+    ws_qd = torch.zeros(total_tiles * H * CHUNK * D, dtype=torch.bfloat16, device="cuda")
+    ws_kd = torch.zeros_like(ws_qd)
+    ws_ki = torch.zeros_like(ws_qd)
+    ws_kr = torch.zeros_like(ws_qd)
+    ws_gt = torch.zeros(total_tiles * H * D, dtype=torch.float32, device="cuda")
+
+    launch_k1_phases_1to6(
+        q,
+        k,
+        g_pre,
+        A_log,
+        dt_bias,
+        scale,
+        gate_scale,
+        ws_qd,
+        ws_kd,
+        ws_ki,
+        ws_kr,
+        ws_gt,
+    )
+    torch.cuda.synchronize()
+
+    ws_qd = ws_qd.view(H, total_tiles, CHUNK, D)
+    ws_kd = ws_kd.view(H, total_tiles, CHUNK, D)
+    ws_ki = ws_ki.view(H, total_tiles, CHUNK, D)
+    ws_kr = ws_kr.view(H, total_tiles, CHUNK, D)
+
+    # ---- torch reference ----
+    q_tm = q.view(B * T, H, D).view(total_tiles, CHUNK, H, D).permute(2, 0, 1, 3).contiguous().float()
+    k_tm = k.view(B * T, H, D).view(total_tiles, CHUNK, H, D).permute(2, 0, 1, 3).contiguous().float()
+    g_tm = g_pre.view(B * T, H, D).view(total_tiles, CHUNK, H, D).permute(2, 0, 1, 3).contiguous().float()
+
+    q_inv = (q_tm.pow(2).sum(-1, keepdim=True) + 1.0e-6).rsqrt()
+    k_inv_l = (k_tm.pow(2).sum(-1, keepdim=True) + 1.0e-6).rsqrt()
+    q_l2 = (q_tm * q_inv).to(torch.bfloat16).float()  # round-trip bf16 to match kernel
+    k_l2 = (k_tm * k_inv_l).to(torch.bfloat16).float()
+
+    A_exp = torch.exp(A_log.float())
+    g_act = gate_scale * torch.sigmoid(A_exp.view(H, 1, 1, 1) * (g_tm + dt_bias.view(H, 1, 1, D)))  # [H, tot, CHUNK, D]
+    g_cs = torch.cumsum(g_act, dim=2)  # [H, tot, CHUNK, D]
+    g_total = g_cs[:, :, -1, :]  # [H, tot, D]
+
+    exp_pos = torch.exp(g_cs)
+    inv_pos = 1.0 / exp_pos
+    rest = torch.exp(g_total).unsqueeze(2) * inv_pos
+
+    qd_ref = (q_l2 * exp_pos * scale).to(torch.bfloat16)
+    kd_ref = (k_l2 * exp_pos).to(torch.bfloat16)
+    ki_ref = (k_l2 * inv_pos).to(torch.bfloat16)
+    kr_ref = (k_l2 * rest).to(torch.bfloat16)
+
+    def diff(name, got, ref):
+        d = (got.float() - ref.float()).abs()
+        scale_d = ref.float().abs().max().clamp_min(1.0)
+        return (d.max() / scale_d).item()  # relative to dynamic range
+
+    mq = diff("qd", ws_qd, qd_ref)
+    mk = diff("kd", ws_kd, kd_ref)
+    mi = diff("ki", ws_ki, ki_ref)
+    mr = diff("kr", ws_kr, kr_ref)
+    print(f"\n[k1 phases1-6] rel diffs: qd={mq:.4e}  kd={mk:.4e}  ki={mi:.4e}  kr={mr:.4e}")
+    # bf16 mantissa ≈ 0.4% relative; allow 1% for compounded round-trips.
+    for n, m in (("qd", mq), ("kd", mk), ("ki", mi), ("kr", mr)):
+        assert m < 1e-2, f"{n} relative mismatch: {m}"
