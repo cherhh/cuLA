@@ -350,14 +350,43 @@ def flash_kda_prefill(
 def _dispatch_cute(
     q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state, final_state, cu_seqlens, problem: _PrefillProblem
 ):
-    """Launch K1 + K2. WIP — see flashkda_prefill_design.md.
+    """Launch K1 + K2 (CuteDSL ports of FlashKDA C++).
 
-    Phase 1 of the rollout enables a runnable K1 path (workspace materialization
-    only); K2 is gated behind ``CULA_FLASHKDA_K2=1`` and currently raises.
+    K1 is being built up phase-by-phase. K2 (warp-specialized recurrence)
+    follows once K1 produces the correct workspace.
+
+    Until K2 lands, the dispatcher refuses to run end-to-end (raises). To
+    drive K1 development, use the unit tests in
+    ``tests/test_flashkda_k1_phases.py`` which validate each K1 phase against
+    a torch reference by reading the per-tile workspace dump.
     """
+    from cula.ops.flashkda_k1 import launch_k1_workspace_only
+
+    if problem.has_state_in or problem.has_state_out or problem.is_varlen:
+        raise NotImplementedError(
+            "CuteDSL flashkda K1 currently supports fixed-len, no-state inputs only. "
+            "Use the torch reference (unset CULA_FLASHKDA_USE_CUTE) for state/varlen."
+        )
+
+    # K1 fills the workspace; K2 (TODO) consumes it to produce `out` and
+    # update state. Until K2 lands, raise so callers know the path isn't
+    # complete end-to-end.
+    workspace = allocate_workspace(problem.total_tiles, problem.H, device=q.device)
+    launch_k1_workspace_only(
+        q,
+        k,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        scale,
+        lower_bound,
+        workspace,
+        problem,
+    )
+
     raise NotImplementedError(
-        "CuteDSL flash_kda_prefill kernels are still being staged. "
-        "Unset CULA_FLASHKDA_USE_CUTE=1 to fall back to the torch reference."
+        "K1 ran (workspace populated). K2 CuteDSL port is WIP. Use the torch reference for end-to-end output."
     )
 
 
