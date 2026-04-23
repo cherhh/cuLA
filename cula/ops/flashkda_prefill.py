@@ -360,34 +360,51 @@ def _dispatch_cute(
     ``tests/test_flashkda_k1_phases.py`` which validate each K1 phase against
     a torch reference by reading the per-tile workspace dump.
     """
-    from cula.ops.flashkda_k1 import launch_k1_workspace_only
+    from cula.ops.flashkda_k1 import CHUNK as K1_CHUNK
+    from cula.ops.flashkda_k1 import D as K1_D
+    from cula.ops.flashkda_k1 import launch_k1_full
+    from cula.ops.flashkda_k2 import launch_k2_phaseA
 
     if problem.has_state_in or problem.has_state_out or problem.is_varlen:
         raise NotImplementedError(
-            "CuteDSL flashkda K1 currently supports fixed-len, no-state inputs only. "
+            "CuteDSL flashkda currently supports fixed-len, no-state inputs only. "
             "Use the torch reference (unset CULA_FLASHKDA_USE_CUTE) for state/varlen."
         )
 
-    # K1 fills the workspace; K2 (TODO) consumes it to produce `out` and
-    # update state. Until K2 lands, raise so callers know the path isn't
-    # complete end-to-end.
-    workspace = allocate_workspace(problem.total_tiles, problem.H, device=q.device)
-    launch_k1_workspace_only(
+    B, T, H, _ = q.shape
+    T_total = B * T
+    total_tiles = T_total // K1_CHUNK
+
+    # Allocate K2-shaped workspaces (separate buffers per tensor).
+    n_qk = total_tiles * H * K1_CHUNK * K1_D
+    n_cc = total_tiles * H * K1_CHUNK * K1_CHUNK
+    ws_qd = torch.zeros(n_qk, dtype=torch.bfloat16, device=q.device)
+    ws_kd = torch.zeros_like(ws_qd)
+    ws_kr = torch.zeros_like(ws_qd)
+    ws_gt = torch.zeros(total_tiles * H * K1_D, dtype=torch.float32, device=q.device)
+    ws_inv = torch.zeros(n_cc, dtype=torch.bfloat16, device=q.device)
+    ws_mqk = torch.zeros_like(ws_inv)
+
+    # Beta arrives as [B, T, H]; K1/K2 expect head-major [H, B*T] flat.
+    beta_flat = beta.view(T_total, H).permute(1, 0).contiguous().view(-1)
+
+    launch_k1_full(
         q,
         k,
         g,
-        beta,
         A_log,
         dt_bias,
+        beta_flat,
         scale,
         lower_bound,
-        workspace,
-        problem,
+        ws_qd,
+        ws_kd,
+        ws_kr,
+        ws_gt,
+        ws_inv,
+        ws_mqk,
     )
-
-    raise NotImplementedError(
-        "K1 ran (workspace populated). K2 CuteDSL port is WIP. Use the torch reference for end-to-end output."
-    )
+    launch_k2_phaseA(v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, out)
 
 
 # ============================================================================
