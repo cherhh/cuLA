@@ -482,34 +482,35 @@ def k2_phaseB_kernel(
         cute.arch.mbarrier_wait(sMbar_ptr, phase)
         phase = phase ^ cutlass.Int32(1)
 
+        # ----- Fused phase 1+2: U = sigmoid(beta) * (V - sKd @ sState) -----
+        # Same-thread (row16, col_base+ee) → no need to round-trip through sTmp.
+        bv = cutlass.Float32(sBeta[row16])
+        sig_b = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
         for e in cutlass.range_constexpr(16):
             ee: cutlass.Constexpr[int] = e
             acc = cutlass.Float32(0.0)
             for kk in cutlass.range(D, unroll=8):
                 acc = acc + cutlass.Float32(sKd[row16, kk]) * cutlass.Float32(sState[kk, col_base + ee])
-            sTmp[row16, col_base + ee] = acc
-        cute.arch.barrier()
-
-        for e in cutlass.range_constexpr(16):
-            ee: cutlass.Constexpr[int] = e
-            bv = cutlass.Float32(sBeta[row16])
-            sig_b = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
-            diff = cutlass.Float32(sV[row16, col_base + ee]) - sTmp[row16, col_base + ee]
+            diff = cutlass.Float32(sV[row16, col_base + ee]) - acc
             sU[row16, col_base + ee] = cutlass.BFloat16(diff * sig_b)
         cute.arch.barrier()
 
+        # ----- Fused phase 3 (INV @ U) and bf16 cast: hold U-row in regs -----
+        # Need to read all 16 sU rows BEFORE we overwrite our own row.
+        u_new = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), cutlass.Float32)
         for e in cutlass.range_constexpr(16):
             ee: cutlass.Constexpr[int] = e
             acc = cutlass.Float32(0.0)
             for kk in cutlass.range_constexpr(CHUNK):
                 acc = acc + cutlass.Float32(sINV[row16, kk]) * cutlass.Float32(sU[kk, col_base + ee])
-            sTmp[row16, col_base + ee] = acc
+            u_new[ee] = acc
         cute.arch.barrier()
         for e in cutlass.range_constexpr(16):
             ee: cutlass.Constexpr[int] = e
-            sU[row16, col_base + ee] = cutlass.BFloat16(sTmp[row16, col_base + ee])
+            sU[row16, col_base + ee] = cutlass.BFloat16(u_new[ee])
         cute.arch.barrier()
 
+        # ----- Phase 4: O = sQd @ sState + sMqk @ U -----
         for e in cutlass.range_constexpr(16):
             ee: cutlass.Constexpr[int] = e
             acc = cutlass.Float32(0.0)
