@@ -109,38 +109,47 @@ def test_torch_reference_runs_with_state():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_cute_dispatch_raises_until_implemented():
-    """Until K1/K2 land, CULA_FLASHKDA_USE_CUTE=1 should raise NotImplementedError."""
+def test_cute_dispatch_bridges_to_cpp():
+    """Until K1/K2 CuteDSL ports land, CULA_FLASHKDA_USE_CUTE=1 should
+    transparently bridge to the FlashKDA C++ extension and produce numerically
+    consistent output with the torch reference fallback.
+
+    Skips gracefully if the ``flash_kda`` extension is not built locally.
+    """
+    pytest.importorskip("flash_kda")
     B, T, H = 1, 16, 1
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(B, T, H)
-    out = torch.empty_like(v)
+    out_ref = torch.empty_like(v)
+    out_cute = torch.empty_like(v)
+
+    # Reference path (torch fallback).
+    os.environ.pop("CULA_FLASHKDA_USE_CUTE", None)
+    import importlib
+
+    import cula.ops.flashkda_prefill as mod
+
+    importlib.reload(mod)
+    mod.flash_kda_prefill(
+        q, k, v, g, beta,
+        scale=D**-0.5, out=out_ref,
+        A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
+    )
+
     os.environ["CULA_FLASHKDA_USE_CUTE"] = "1"
     try:
-        # Re-import to pick up env (the flag is read at module import time).
-        import importlib
-
-        import cula.ops.flashkda_prefill as mod
-
         importlib.reload(mod)
-        with pytest.raises(NotImplementedError):
-            mod.flash_kda_prefill(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                scale=D**-0.5,
-                out=out,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=-5.0,
-            )
+        mod.flash_kda_prefill(
+            q, k, v, g, beta,
+            scale=D**-0.5, out=out_cute,
+            A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
+        )
+        # Bridged path goes through FlashKDA C++; torch ref vs C++ tolerated
+        # diff in tmp/precision_check.py was ~9e-5. Use loose tolerance for
+        # variable-shape coverage.
+        max_diff = (out_ref.float() - out_cute.float()).abs().max().item()
+        assert max_diff < 1e-2, f"cute-vs-ref max abs diff {max_diff} too large"
     finally:
         os.environ.pop("CULA_FLASHKDA_USE_CUTE", None)
-        import importlib
-
-        import cula.ops.flashkda_prefill as mod
-
         importlib.reload(mod)
 
 
