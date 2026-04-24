@@ -362,12 +362,10 @@ def k2_phaseG_kernel(
         for i in cutlass.range_constexpr(cute.size(tCrU3)):
             ii: cutlass.Constexpr[int] = i
             tCsU_T_w[ii] = cutlass.BFloat16(tCrU3[ii])
-        cute.arch.barrier()
 
-        # ----- Phase 4 (combined TC): out = qd@state (8 K) + Mqk@U_T (1 K) -----
-        # Both contributions accumulate into the same fp32 C-frag tCrOut, then
-        # a single in-frag bf16 write to sOut. Eliminates the scalar epilogue
-        # and one barrier/SMEM RMW pair.
+        # ----- Phase 4 MAIN (TC, no sU_T dep): out = qd @ state (8 K iters) -----
+        # Run BEFORE the sU_T-visibility barrier so it overlaps with phase 3
+        # SMEM writes settling. Reads only sQd, sState — disjoint from sU_T.
         tCrOut.fill(0.0)
         for k in cutlass.range_constexpr(D // 16):
             sQd_k = sQd_tile[None, None, 0, k]
@@ -375,7 +373,9 @@ def k2_phaseG_kernel(
             cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sQd_k), tCrQd_cv)
             cute.copy(smem_tiled_copy_B, smem_thr_copy_B.partition_S(sState_k), tCrState_cv)
             cute.gemm(tiled_mma, tCrOut, tCrQd, tCrState, tCrOut)
-        # 9th K iter: out += Mqk @ U_T
+        cute.arch.barrier()
+
+        # ----- Phase 4 EPI (TC): out += Mqk @ U_T (1 K iter) -----
         cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sMqk_ref), tCrMqk_cv)
         cute.copy(smem_tiled_copy_B, smem_thr_copy_B.partition_S(sU_T_full_ref), tCrU_T_cv)
         cute.gemm(tiled_mma, tCrOut, tCrMqk, tCrU_T, tCrOut)
@@ -384,7 +384,10 @@ def k2_phaseG_kernel(
         tCsOut = thr_mma.partition_C(sOut)
         for i in cutlass.range_constexpr(cute.size(tCrOut)):
             tCsOut[i] = cutlass.BFloat16(tCrOut[i])
-        cute.arch.barrier()
+        # NOTE: no barrier here. Phase 6 below uses entirely disjoint SMEM
+        # (sU_T/sKr_T/sState — never sOut), so it can run in parallel with the
+        # sOut writes settling into SMEM. We fold the sOut visibility barrier
+        # into the single barrier after phase 6 (one fewer cluster-wide sync).
 
         # ----- Phase 6 (TC MMA): state = state*gt + kr.T @ U  -----
         # delta = U^T @ kr  (M=D, N=D, K=CHUNK).
@@ -420,8 +423,9 @@ def k2_phaseG_kernel(
             ii: cutlass.Constexpr[int] = i
             old = cutlass.Float32(state_frag[ii]) * gt_frag[ii]
             tCsState[ii] = cutlass.BFloat16(old + tCrUpd[ii])
-        # NOTE: no barrier here — the final barrier after cp_async_bulk_wait_group
-        # below provides the inter-chunk fence for sState (read by next chunk's phase 1).
+        # Combined barrier: makes sOut (from phase 4) visible to warp 0 for
+        # TMA store AND makes sState visible across warps for next chunk.
+        cute.arch.barrier()
 
         if warp_idx == 0:
             cute.copy(tma_atom_out, tOs[(None,)], tOg[(None, t_g, 0, head_idx)])
