@@ -48,6 +48,7 @@ from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
 
 from cula.ops.flashkda_k2 import CHUNK, D, _make_state_smem_layout
+from cula.ops.flashkda_prefill import movm_t_b16
 
 THREADS_PER_CTA = 128
 N_WARPS = 4
@@ -288,6 +289,12 @@ def k2_phaseH_kernel(
     tCrInv = thr_mma.make_fragment_A(thr_mma.partition_A(sINV_ref))
     tCrInv_cv = smem_thr_copy_A.retile(tCrInv)
     tCrU3 = thr_mma.make_fragment_C(tiled_mma.partition_shape_C((CHUNK, D)))
+    # Register-resident U-post B-fragment (MOVM_T from phase 3 C-frag).
+    # Same shape/dtype as tCrU_T; populated post-phase-3 via inline-PTX
+    # movmatrix.sync.aligned.m8n8.trans.b16. Replaces phase 4-epi B-load
+    # from sU_T (1 SMEM round-trip eliminated per chunk).
+    tCrU_T_post = cute.make_fragment_like(tCrU_T)
+    tCrU3_bf16_tmp = cute.make_fragment_like(tCrU3, cutlass.BFloat16)
 
     bos = seq_idx * seq_len
     t_tiles: cutlass.Constexpr[int] = (seq_len + CHUNK - 1) // CHUNK
@@ -374,7 +381,7 @@ def k2_phaseH_kernel(
             cute.copy(smem_tiled_copy_B, smem_thr_copy_B.partition_S(sState_k), tCrState_cv)
             cute.gemm(tiled_mma, tCrU, tCrKd, tCrState, tCrU)
 
-        # ----- Phase 2: u = sigmoid(beta) * (v - u_pre); cast to bf16 in sU (in-frag) -----
+        # ----- Phase 2: u = sigmoid(beta) * (v - u_pre); MOVM_T into B-frag for phase 3 -----
         lane_in_warp = tidx % 32
         Rrow0 = lane_in_warp // 4
         Rrow1 = Rrow0 + 8
@@ -383,36 +390,48 @@ def k2_phaseH_kernel(
         sig0 = cutlass.Float32(0.5) * (cute.tanh(b0 * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
         sig1 = cutlass.Float32(0.5) * (cute.tanh(b1 * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
         tCsV = thr_mma.partition_C(sV_s)
-        # Write phase 2 output directly into sU_T (K-fast). sU_T physical layout
-        # is (CHUNK, D) so partition_C accepts it like sU.
-        tCsU_T_w = thr_mma.partition_C(sU_T)
         # Pre-load sV into a register frag — breaks SMEM→math dep chain.
         v_frag = cute.make_fragment_like(tCsV, cutlass.BFloat16)
         for i in cutlass.range_constexpr(cute.size(v_frag)):
             ii: cutlass.Constexpr[int] = i
             v_frag[ii] = tCsV[ii]
+        # Compute U_pre = sig*(v-u_pre) into a bf16 register C-frag, then MOVM_T
+        # into tCrU_T (B-frag) for phase 3 GEMM. Eliminates sU_T write here AND
+        # the corresponding cross-thread sync (data stays per-lane).
+        tCrU_pre_bf16 = cute.make_fragment_like(tCrU, cutlass.BFloat16)
         for i in cutlass.range_constexpr(cute.size(tCrU)):
             ii: cutlass.Constexpr[int] = i
             sub_i: cutlass.Constexpr[int] = (ii % 4) // 2
             sig = sig0 if sub_i == 0 else sig1
             diff = cutlass.Float32(v_frag[ii]) - tCrU[ii]
-            tCsU_T_w[ii] = cutlass.BFloat16(diff * sig)
-        # Each warp's phase 3 reads the SAME sU_T stripe its phase 2 wrote
-        # (B-operand partition: warp_i owns N=warp_i*32:(warp_i+1)*32).
-        # Intra-warp sync is sufficient — no cross-warp data exchange here.
-        cute.arch.sync_warp()
+            tCrU_pre_bf16[ii] = cutlass.BFloat16(diff * sig)
+        tCrU_pre_u32 = cute.recast_tensor(tCrU_pre_bf16, dtype=cutlass.Int32)
+        tCrU_T_u32 = cute.recast_tensor(tCrU_T, dtype=cutlass.Int32)
+        for i in cutlass.range_constexpr(cute.size(tCrU_pre_u32)):
+            ii: cutlass.Constexpr[int] = i
+            tCrU_T_u32[ii] = movm_t_b16(cutlass.Int32(tCrU_pre_u32[ii]))
+        # tCsU_T_w retained: phase 6 reads sU_T as A; phase 3 epi will populate it.
+        tCsU_T_w = thr_mma.partition_C(sU_T)
 
         # ----- Phase 3 (TC): U_post = INV @ U_pre  (M=16 N=D K=CHUNK) -----
-        # Reads sU_T (pre, K-fast), writes back into sU_T (post) via in-frag.
+        # B operand U_pre comes from register tCrU_T (MOVM_T'd in phase 2).
         cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sINV_ref_s), tCrInv_cv)
-        cute.copy(smem_tiled_copy_B, smem_thr_copy_B.partition_S(sU_T_full_ref), tCrU_T_cv)
         tCrU3.fill(0.0)
         cute.gemm(tiled_mma, tCrU3, tCrInv, tCrU_T, tCrU3)
-        # In-frag write tCrU3 back to sU_T (overwriting the pre values; safe
-        # because tCrU_T B-frag has already been consumed by the MMA above).
+        # In-frag fp32->bf16 cast (held in register tmp), then ALSO write to
+        # sU_T (still needed by phase 6 as A-operand). The temp frag feeds a
+        # MOVM_T loop that converts C-format bytes to B-frag layout in regs,
+        # so phase 4-epi can skip the SMEM B-load.
         for i in cutlass.range_constexpr(cute.size(tCrU3)):
             ii: cutlass.Constexpr[int] = i
-            tCsU_T_w[ii] = cutlass.BFloat16(tCrU3[ii])
+            v = cutlass.BFloat16(tCrU3[ii])
+            tCrU3_bf16_tmp[ii] = v
+            tCsU_T_w[ii] = v
+        tCrU3_u32 = cute.recast_tensor(tCrU3_bf16_tmp, dtype=cutlass.Int32)
+        tCrU_T_post_u32 = cute.recast_tensor(tCrU_T_post, dtype=cutlass.Int32)
+        for i in cutlass.range_constexpr(cute.size(tCrU3_u32)):
+            ii: cutlass.Constexpr[int] = i
+            tCrU_T_post_u32[ii] = movm_t_b16(cutlass.Int32(tCrU3_u32[ii]))
 
         # ----- Phase 4 MAIN (TC, no sU_T dep): out = qd @ state (8 K iters) -----
         # Run BEFORE the sU_T-visibility barrier so it overlaps with phase 3
@@ -428,8 +447,8 @@ def k2_phaseH_kernel(
 
         # ----- Phase 4 EPI (TC): out += Mqk @ U_T (1 K iter) -----
         cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sMqk_ref_s), tCrMqk_cv)
-        cute.copy(smem_tiled_copy_B, smem_thr_copy_B.partition_S(sU_T_full_ref), tCrU_T_cv)
-        cute.gemm(tiled_mma, tCrOut, tCrMqk, tCrU_T, tCrOut)
+        # B operand from MOVM_T register frag (tCrU_T_post) — skip sU_T B-load.
+        cute.gemm(tiled_mma, tCrOut, tCrMqk, tCrU_T_post, tCrOut)
 
         # Single in-frag bf16 write to sOut.
         tCsOut = thr_mma.partition_C(sOut)

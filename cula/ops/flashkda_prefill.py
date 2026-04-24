@@ -92,7 +92,7 @@ def movm_t_b16(src_u32: Int32, *, loc=None, ip=None) -> Int32:
     """
     result = _llvm.inline_asm(
         _T.i32(),
-        [src_u32],
+        [Int32(src_u32).ir_value(loc=loc, ip=ip)],
         "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;",
         "=r,r",
         has_side_effects=False,
