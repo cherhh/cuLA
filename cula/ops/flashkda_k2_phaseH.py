@@ -443,7 +443,6 @@ def k2_phaseH_kernel(
             cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sQd_k), tCrQd_cv)
             cute.copy(smem_tiled_copy_B, smem_thr_copy_B.partition_S(sState_k), tCrState_cv)
             cute.gemm(tiled_mma, tCrOut, tCrQd, tCrState, tCrOut)
-        cute.arch.barrier()
 
         # ----- Phase 4 EPI (TC): out += Mqk @ U_T (1 K iter) -----
         cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sMqk_ref_s), tCrMqk_cv)
@@ -462,6 +461,12 @@ def k2_phaseH_kernel(
         # ----- Phase 6 (TC MMA): state = state*gt + kr.T @ U  -----
         # delta = U^T @ kr  (M=D, N=D, K=CHUNK).
 
+        # Cross-warp barrier for sU_T visibility (phase 3 wrote per-warp
+        # N-stripes; phase 6 A-load reads full M=D=cross-warp). Moved here
+        # from post-phase-4-main: phase 4-main + 4-epi now have NO sU_T
+        # dependency (B-frag is in registers via MOVM_T), so we can let
+        # them overlap with sU_T SMEM writes settling.
+        cute.arch.barrier()
         # Single TC MMA over full (D, D, CHUNK).
         cute.copy(
             smem_tiled_copy_A6,
