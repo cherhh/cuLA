@@ -397,7 +397,10 @@ def k2_phaseH_kernel(
             sig = sig0 if sub_i == 0 else sig1
             diff = cutlass.Float32(v_frag[ii]) - tCrU[ii]
             tCsU_T_w[ii] = cutlass.BFloat16(diff * sig)
-        cute.arch.barrier()
+        # Each warp's phase 3 reads the SAME sU_T stripe its phase 2 wrote
+        # (B-operand partition: warp_i owns N=warp_i*32:(warp_i+1)*32).
+        # Intra-warp sync is sufficient — no cross-warp data exchange here.
+        cute.arch.sync_warp()
 
         # ----- Phase 3 (TC): U_post = INV @ U_pre  (M=16 N=D K=CHUNK) -----
         # Reads sU_T (pre, K-fast), writes back into sU_T (post) via in-frag.
