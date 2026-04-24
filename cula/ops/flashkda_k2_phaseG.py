@@ -304,10 +304,15 @@ def k2_phaseG_kernel(
 
         # Pre-transpose sKr -> sKr_T early (overlaps with phase 1 TC since
         # phase 1 doesn't read sKr). Visibility ensured by the next barrier.
+        # Two-stage (load all → store all) breaks the load→store dep chain.
         if tidx < D:
+            kr_buf = cute.make_rmem_tensor(cute.make_layout((CHUNK,), stride=(1,)), cutlass.BFloat16)
             for m in cutlass.range_constexpr(CHUNK):
                 mm: cutlass.Constexpr[int] = m
-                sKr_T[tidx, mm] = sKr[mm, tidx]
+                kr_buf[mm] = sKr[mm, tidx]
+            for m in cutlass.range_constexpr(CHUNK):
+                mm: cutlass.Constexpr[int] = m
+                sKr_T[tidx, mm] = kr_buf[mm]
 
         # ============================================================
         # Phase 1 (TENSOR-CORE): u_pre[m, n] = sum_k kd[m, k] * state[n, k]
@@ -333,11 +338,16 @@ def k2_phaseG_kernel(
         # Write phase 2 output directly into sU_T (K-fast). sU_T physical layout
         # is (CHUNK, D) so partition_C accepts it like sU.
         tCsU_T_w = thr_mma.partition_C(sU_T)
+        # Pre-load sV into a register frag — breaks SMEM→math dep chain.
+        v_frag = cute.make_fragment_like(tCsV, cutlass.BFloat16)
+        for i in cutlass.range_constexpr(cute.size(v_frag)):
+            ii: cutlass.Constexpr[int] = i
+            v_frag[ii] = tCsV[ii]
         for i in cutlass.range_constexpr(cute.size(tCrU)):
             ii: cutlass.Constexpr[int] = i
             sub_i: cutlass.Constexpr[int] = (ii % 4) // 2
             sig = sig0 if sub_i == 0 else sig1
-            diff = cutlass.Float32(tCsV[ii]) - tCrU[ii]
+            diff = cutlass.Float32(v_frag[ii]) - tCrU[ii]
             tCsU_T_w[ii] = cutlass.BFloat16(diff * sig)
         cute.arch.barrier()
 
@@ -397,10 +407,18 @@ def k2_phaseG_kernel(
         tCsState = thr_mma6.partition_C(sState)
         coord = cute.make_identity_tensor((D, D))
         tCcState = thr_mma6.partition_C(coord)
+        # Pre-load sState into a bf16 register frag (no dep chain → fully pipelined).
+        state_frag = cute.make_fragment_like(tCsState, cutlass.BFloat16)
+        # Pre-load sGt[n_coord] for each fragment element into a fp32 register cache.
+        gt_frag = cute.make_fragment_like(tCsState, cutlass.Float32)
+        for i in cutlass.range_constexpr(cute.size(state_frag)):
+            ii: cutlass.Constexpr[int] = i
+            state_frag[ii] = tCsState[ii]
+            gt_frag[ii] = sGt[tCcState[ii][1]]
+        # Compute and write back from register data.
         for i in cutlass.range_constexpr(cute.size(tCrUpd)):
             ii: cutlass.Constexpr[int] = i
-            n_coord = tCcState[ii][1]
-            old = cutlass.Float32(tCsState[ii]) * sGt[n_coord]
+            old = cutlass.Float32(state_frag[ii]) * gt_frag[ii]
             tCsState[ii] = cutlass.BFloat16(old + tCrUpd[ii])
         # NOTE: no barrier here — the final barrier after cp_async_bulk_wait_group
         # below provides the inter-chunk fence for sState (read by next chunk's phase 1).
