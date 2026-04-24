@@ -117,7 +117,7 @@ def k2_phaseH_kernel(
     sMqk = smem.allocate_tensor(cutlass.BFloat16, cc_stage_layout, 128)
     sOut = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sState = smem.allocate_tensor(cutlass.BFloat16, state_layout, 128)
-    sU_T = smem.allocate_tensor(cutlass.BFloat16, u_t_layout, 128)
+    # NOTE: sU_T removed (U is now register-resident via MOVM_T inline PTX).
     sKr_T = smem.allocate_tensor(cutlass.BFloat16, kr_t_layout, 128)
     sGt = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 128)
     sBeta = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((CHUNK,)), 128)
@@ -213,6 +213,14 @@ def k2_phaseH_kernel(
     smem_tiled_copy_B = cute.make_tiled_copy_B(copy_atom_AB, tiled_mma)
     smem_thr_copy_A = smem_tiled_copy_A.get_slice(tidx)
     smem_thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
+    # Phase 1/4-main B reads sState in transposed view (N=D_out fast axis).
+    # Use ldmatrix.x4.trans atom because N is now the contig SMEM axis.
+    copy_atom_B_T = cute.make_copy_atom(
+        warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+        cutlass.BFloat16,
+    )
+    smem_tiled_copy_B_T = cute.make_tiled_copy_B(copy_atom_B_T, tiled_mma)
+    smem_thr_copy_B_T = smem_tiled_copy_B_T.get_slice(tidx)
 
     # Phase 6 tiled MMA: same atom layout as phase 1/4.
     tiled_mma6 = cute.make_tiled_mma(
@@ -231,18 +239,12 @@ def k2_phaseH_kernel(
     sQd_s0 = sQd[(None, None, 0)]
     sKd_tile0 = cute.flat_divide(sKd_s0, (CHUNK, 16))
     sQd_tile0 = cute.flat_divide(sQd_s0, (CHUNK, 16))
-    sState_tile = cute.flat_divide(sState, (D, 16))
-
-    sKd_ref = sKd_tile0[None, None, 0, 0]
-    sQd_ref = sQd_tile0[None, None, 0, 0]
-    sState_ref = sState_tile[None, None, 0, 0]
-
-    # Reference 16x16 sub-tiles for fragment construction (use stage-0 view).
-    sKd_s0 = sKd[(None, None, 0)]
-    sQd_s0 = sQd[(None, None, 0)]
-    sKd_tile0 = cute.flat_divide(sKd_s0, (CHUNK, 16))
-    sQd_tile0 = cute.flat_divide(sQd_s0, (CHUNK, 16))
-    sState_tile = cute.flat_divide(sState, (D, 16))
+    # Role-swap convention: sState stores state[K_in, D_out] in normal form
+    # (phase 6 writes (kr^T @ U)[m=K_in, n=D_out] directly). Phase 1/4-main
+    # need B[N=D_out, K=K_in] for u_pre = Kd @ state, which is the transposed
+    # view of sState (axis 0 = D_out, axis 1 = K_in).
+    sState_B_view = cute.make_tensor(sState.iterator, layout=cute.select(sState.layout, mode=[1, 0]))
+    sState_tile = cute.flat_divide(sState_B_view, (D, 16))
 
     sKd_ref = sKd_tile0[None, None, 0, 0]
     sQd_ref = sQd_tile0[None, None, 0, 0]
@@ -256,7 +258,9 @@ def k2_phaseH_kernel(
 
     tCrKd_cv = smem_thr_copy_A.retile(tCrKd)
     tCrQd_cv = smem_thr_copy_A.retile(tCrQd)
-    tCrState_cv = smem_thr_copy_B.retile(tCrState)
+    # tCrState is loaded with the transposed B-copy atom (sState_B_view has
+    # N=D_out as the fast SMEM axis after select-mode-[1,0]).
+    tCrState_cv = smem_thr_copy_B_T.retile(tCrState)
 
     sMqk_s0 = sMqk[(None, None, 0)]
     sMqk_tile0 = cute.flat_divide(sMqk_s0, (CHUNK, CHUNK))
@@ -265,22 +269,19 @@ def k2_phaseH_kernel(
     tCrMqk_cv = smem_thr_copy_A.retile(tCrMqk)
 
     # ---- Phase 6 TC fragments (declared once, reused per chunk) ----
-    # sU_T physical layout is (CHUNK, D) K-fast. For B-operand of phases 3, 4-epi,
-    # and 6 we need shape (N=D, K=CHUNK), so build a select-mode-[1,0] view.
-    sU_T_B_view = cute.make_tensor(sU_T.iterator, layout=cute.select(sU_T.layout, mode=[1, 0]))
-    sU_T_full_tile = cute.flat_divide(sU_T_B_view, (D, CHUNK))  # ((D, CHUNK), 1, 1)
+    # Role-swap: A=sKr_T (D, CHUNK), B=tCrU_T_post (register from MOVM_T).
+    # Result[m, n] = sum_k sKr_T[m, k] * U_post[k, n] = (kr^T @ U)[m, n] —
+    # directly stored as sState[m=K_in, n=D_out]. Eliminates sU_T SMEM trip.
     sKr_T_tile = cute.flat_divide(sKr_T, (D, CHUNK))  # ((D, CHUNK), 1, 1)
-    sU_T_full_ref = sU_T_full_tile[None, None, 0, 0]  # (D, CHUNK)
     sKr_T_ref = sKr_T_tile[None, None, 0, 0]  # (D, CHUNK)
-    tCrU6 = thr_mma6.make_fragment_A(thr_mma6.partition_A(sU_T_full_ref))
-    tCrKr6 = thr_mma6.make_fragment_B(thr_mma6.partition_B(sKr_T_ref))
+    tCrKrA6 = thr_mma6.make_fragment_A(thr_mma6.partition_A(sKr_T_ref))
     tCrUpd = thr_mma6.make_fragment_C(tiled_mma6.partition_shape_C((D, D)))
-    tCrU6_cv = smem_thr_copy_A6.retile(tCrU6)
-    tCrKr6_cv = smem_thr_copy_B6.retile(tCrKr6)
+    tCrKrA6_cv = smem_thr_copy_A6.retile(tCrKrA6)
 
-    # Phase 4-epi B operand: sU_T as (N=D, K=CHUNK) for tiled_mma (M=16 N=128 K=16).
-    tCrU_T = thr_mma.make_fragment_B(thr_mma.partition_B(sU_T_full_ref))
-    tCrU_T_cv = smem_thr_copy_B.retile(tCrU_T)
+    # Phase 3/4-epi B-frag layout: (N=D, K=CHUNK), tile (16, 32, 16).
+    # No backing SMEM (register-resident). Use sKr_T_ref shape to derive
+    # the partition_B layout (same shape (D, CHUNK)).
+    tCrU_T = thr_mma.make_fragment_B(thr_mma.partition_B(sKr_T_ref))
 
     # ---- Phase 3 TC fragments: A=sINV (16,16), B=sU_T (D, CHUNK), C=tCrU3 (16, D) ----
     sINV_s0 = sINV[(None, None, 0)]
@@ -378,7 +379,7 @@ def k2_phaseH_kernel(
             sKd_k = sKd_tile[None, None, 0, k]
             sState_k = sState_tile[None, None, 0, k]
             cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
-            cute.copy(smem_tiled_copy_B, smem_thr_copy_B.partition_S(sState_k), tCrState_cv)
+            cute.copy(smem_tiled_copy_B_T, smem_thr_copy_B_T.partition_S(sState_k), tCrState_cv)
             cute.gemm(tiled_mma, tCrU, tCrKd, tCrState, tCrU)
 
         # ----- Phase 2: u = sigmoid(beta) * (v - u_pre); MOVM_T into B-frag for phase 3 -----
@@ -410,23 +411,19 @@ def k2_phaseH_kernel(
         for i in cutlass.range_constexpr(cute.size(tCrU_pre_u32)):
             ii: cutlass.Constexpr[int] = i
             tCrU_T_u32[ii] = movm_t_b16(cutlass.Int32(tCrU_pre_u32[ii]))
-        # tCsU_T_w retained: phase 6 reads sU_T as A; phase 3 epi will populate it.
-        tCsU_T_w = thr_mma.partition_C(sU_T)
+        # sU_T removed: U is now register-resident across phases 2->3->4-epi->6.
 
         # ----- Phase 3 (TC): U_post = INV @ U_pre  (M=16 N=D K=CHUNK) -----
         # B operand U_pre comes from register tCrU_T (MOVM_T'd in phase 2).
         cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sINV_ref_s), tCrInv_cv)
         tCrU3.fill(0.0)
         cute.gemm(tiled_mma, tCrU3, tCrInv, tCrU_T, tCrU3)
-        # In-frag fp32->bf16 cast (held in register tmp), then ALSO write to
-        # sU_T (still needed by phase 6 as A-operand). The temp frag feeds a
-        # MOVM_T loop that converts C-format bytes to B-frag layout in regs,
-        # so phase 4-epi can skip the SMEM B-load.
+        # In-frag fp32->bf16 cast into a register tmp; MOVM_T converts the
+        # C-format bytes into B-frag layout (tCrU_T_post) for phase 4-epi AND
+        # phase 6. No SMEM trip — sU_T eliminated entirely.
         for i in cutlass.range_constexpr(cute.size(tCrU3)):
             ii: cutlass.Constexpr[int] = i
-            v = cutlass.BFloat16(tCrU3[ii])
-            tCrU3_bf16_tmp[ii] = v
-            tCsU_T_w[ii] = v
+            tCrU3_bf16_tmp[ii] = cutlass.BFloat16(tCrU3[ii])
         tCrU3_u32 = cute.recast_tensor(tCrU3_bf16_tmp, dtype=cutlass.Int32)
         tCrU_T_post_u32 = cute.recast_tensor(tCrU_T_post, dtype=cutlass.Int32)
         for i in cutlass.range_constexpr(cute.size(tCrU3_u32)):
@@ -441,7 +438,7 @@ def k2_phaseH_kernel(
             sQd_k = sQd_tile[None, None, 0, k]
             sState_k = sState_tile[None, None, 0, k]
             cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sQd_k), tCrQd_cv)
-            cute.copy(smem_tiled_copy_B, smem_thr_copy_B.partition_S(sState_k), tCrState_cv)
+            cute.copy(smem_tiled_copy_B_T, smem_thr_copy_B_T.partition_S(sState_k), tCrState_cv)
             cute.gemm(tiled_mma, tCrOut, tCrQd, tCrState, tCrOut)
 
         # ----- Phase 4 EPI (TC): out += Mqk @ U_T (1 K iter) -----
@@ -458,28 +455,20 @@ def k2_phaseH_kernel(
         # sOut writes settling into SMEM. We fold the sOut visibility barrier
         # into the single barrier after phase 6 (one fewer cluster-wide sync).
 
-        # ----- Phase 6 (TC MMA): state = state*gt + kr.T @ U  -----
-        # delta = U^T @ kr  (M=D, N=D, K=CHUNK).
+        # ----- Phase 6 (TC MMA): state[m, n] = state*gt + (kr^T @ U)[m, n] -----
+        # Role-swap: A=sKr_T (D, CHUNK), B=tCrU_T_post (register from MOVM_T).
+        # gt indexed by M (K_in axis) under normal-form sState convention.
 
-        # Cross-warp barrier for sU_T visibility (phase 3 wrote per-warp
-        # N-stripes; phase 6 A-load reads full M=D=cross-warp). Moved here
-        # from post-phase-4-main: phase 4-main + 4-epi now have NO sU_T
-        # dependency (B-frag is in registers via MOVM_T), so we can let
-        # them overlap with sU_T SMEM writes settling.
+        # Cross-warp barrier for sKr_T visibility (cooperative transpose at
+        # chunk start writes per-thread strides; phase 6 A-load is cross-warp).
         cute.arch.barrier()
-        # Single TC MMA over full (D, D, CHUNK).
         cute.copy(
             smem_tiled_copy_A6,
-            smem_thr_copy_A6.partition_S(sU_T_full_ref),
-            tCrU6_cv,
-        )
-        cute.copy(
-            smem_tiled_copy_B6,
-            smem_thr_copy_B6.partition_S(sKr_T_ref),
-            tCrKr6_cv,
+            smem_thr_copy_A6.partition_S(sKr_T_ref),
+            tCrKrA6_cv,
         )
         tCrUpd.fill(0.0)
-        cute.gemm(tiled_mma6, tCrUpd, tCrU6, tCrKr6, tCrUpd)
+        cute.gemm(tiled_mma6, tCrUpd, tCrKrA6, tCrU_T_post, tCrUpd)
 
         # In-frag epilogue: sState = bf16(float(sState)*gt[N] + delta).
         tCsState = thr_mma6.partition_C(sState)
@@ -492,7 +481,8 @@ def k2_phaseH_kernel(
         for i in cutlass.range_constexpr(cute.size(state_frag)):
             ii: cutlass.Constexpr[int] = i
             state_frag[ii] = tCsState[ii]
-            gt_frag[ii] = sGt[tCcState[ii][1]]
+            # gt indexed by M (K_in axis) — normal-form state convention.
+            gt_frag[ii] = sGt[tCcState[ii][0]]
         # Compute and write back from register data.
         for i in cutlass.range_constexpr(cute.size(tCrUpd)):
             ii: cutlass.Constexpr[int] = i
