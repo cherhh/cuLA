@@ -144,6 +144,9 @@ def k2_phaseN_kernel(
     kd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
     # sQd K_INTER swizzled layout (consumed via cute.copy(LdMatrix...) only).
     qd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
+    # NOTE: sKr deliberately KEPT plain stride. Swizzling sKr is correct but
+    # regresses perf ~27% because the per-element sKr->sKr_T cooperative
+    # transpose loop generates worse bank-conflict patterns on swizzled SMEM.
 
     sV = smem.allocate_tensor(cutlass.BFloat16, v_stage_layout, 128)
     sKd = smem.allocate_tensor(cutlass.BFloat16, kd_stage_layout, 128)
