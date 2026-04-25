@@ -1485,7 +1485,9 @@ def k1_full_kernel(
         s = cutlass.Float32(0.0)
         for kk in cutlass.range_constexpr(CHUNK):
             s = s + sLp[i, kk] * sLp[kk, j2]
-        cute.arch.barrier()
+        # No barrier needed before writing sTmp[i,j2]: each thread writes
+        # its own private slot and no other thread reads sTmp until after
+        # the next barrier below.
         sTmp[i, j2] = s
         cute.arch.barrier()
         s2 = cutlass.Float32(0.0)
