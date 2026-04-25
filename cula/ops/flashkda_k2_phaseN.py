@@ -111,19 +111,9 @@ def k2_phaseN_kernel(
     qk_layout = _make_qk_smem_layout()  # K-major swizzled, MMA-ready  # noqa: F841 (kept for parity)
     cc_layout = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))  # noqa: F841 (kept for parity)
     state_layout = _make_state_smem_layout()  # swizzled K-major
-    # Phase 6 TC-friendly K-fast layouts (CHUNK = stride 1):
-    #   sU_T  shape (CHUNK, D) stride (1, CHUNK)  — partition_C compatible with
-    #         tiled_mma C-frag (which has shape (CHUNK, D)) so phase 2 in-frag
-    #         writes directly here. A cute.select view (mode=[1,0]) yields
-    #         shape (D, CHUNK) for B-operand of phases 3, 4-epi, 6.
-    #   sKr_T shape (D, CHUNK) stride (CHUNK, 1)  — direct B-operand layout for phase 6.
-    # Phase L: pad sKr_T row stride to CHUNK+8=24 to break bank-conflict pattern
-    # of the cooperative sKr->sKr_T transpose writes. Pad must be multiple of 8
-    # bf16 to preserve ldmatrix's 16-byte row alignment requirement. With stride
-    # 16 (CHUNK), 8 lanes write the same bank (8-way conflict); with stride 24,
-    # only 4 lanes share each bank (4-way) — 2x reduction.
-    KR_T_PAD: cutlass.Constexpr[int] = CHUNK + 8
-    kr_t_layout = cute.make_layout((D, CHUNK), stride=(KR_T_PAD, 1))
+    # Phase 6 reads sKr's (D, CHUNK) transposed view directly via LdMatrix.x4.trans
+    # (matches cpp baseline). No sKr_T SMEM, no manual transpose loop, no extra
+    # cross-warp barrier.
 
     # Input pipeline (TMA load): InputStages slot ring.
     STAGES: cutlass.Constexpr[int] = 3
@@ -144,9 +134,11 @@ def k2_phaseN_kernel(
     kd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
     # sQd K_INTER swizzled layout (consumed via cute.copy(LdMatrix...) only).
     qd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
-    # NOTE: sKr deliberately KEPT plain stride. Swizzling sKr is correct but
-    # regresses perf ~27% because the per-element sKr->sKr_T cooperative
-    # transpose loop generates worse bank-conflict patterns on swizzled SMEM.
+    # NOTE: sKr deliberately KEPT plain stride. Phase 6 builds a transposed
+    # view via cute.make_tensor(sKr.iterator, transposed_layout); that path
+    # would discard a K_INTER swizzle on sKr (swizzle lives in the layout, not
+    # the iterator), producing wrong addresses. K_INTER on sKr requires a
+    # swizzle-aware transpose view (future work).
 
     sV = smem.allocate_tensor(cutlass.BFloat16, v_stage_layout, 128)
     sKd = smem.allocate_tensor(cutlass.BFloat16, kd_stage_layout, 128)
@@ -157,7 +149,7 @@ def k2_phaseN_kernel(
     sOut = smem.allocate_tensor(cutlass.BFloat16, out_stage_layout, 128)
     sState = smem.allocate_tensor(cutlass.BFloat16, state_layout, 128)
     # NOTE: sU_T removed (U is now register-resident via MOVM_T inline PTX).
-    sKr_T = smem.allocate_tensor(cutlass.BFloat16, kr_t_layout, 128)
+    # NOTE: sKr_T removed (Phase 6 uses LdMatrix.x4.trans on sKr directly).
     sGt = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 128)
     sBeta = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((CHUNK,)), 128)
     # ---- mbarriers (Int64 each) ----
@@ -299,7 +291,9 @@ def k2_phaseN_kernel(
         permutation_mnk=(16, 32, 16),
     )
     thr_mma6 = tiled_mma6.get_slice(tidx)
-    smem_tiled_copy_A6 = cute.make_tiled_copy_A(copy_atom_AB, tiled_mma6)
+    # Phase 6 A operand reads (D, CHUNK) transposed VIEW of sKr (CHUNK, D)
+    # via LdMatrix.x4.trans — no physical sKr_T transpose needed.
+    smem_tiled_copy_A6 = cute.make_tiled_copy_A(copy_atom_B_T, tiled_mma6)
     smem_tiled_copy_B6 = cute.make_tiled_copy_B(copy_atom_AB, tiled_mma6)
     smem_thr_copy_A6 = smem_tiled_copy_A6.get_slice(tidx)
     _ = smem_tiled_copy_B6  # B-operand for phase 6 is register-resident (tCrU_T_post)
@@ -339,10 +333,16 @@ def k2_phaseN_kernel(
     tCrMqk_cv = smem_thr_copy_A.retile(tCrMqk)
 
     # ---- Phase 6 TC fragments (declared once, reused per chunk) ----
-    # Role-swap: A=sKr_T (D, CHUNK), B=tCrU_T_post (register from MOVM_T).
+    # A operand: (D, CHUNK) transposed VIEW of sKr (CHUNK, D, STAGES) — no
+    # physical transpose; LdMatrix.x4.trans handles per-8x8 transpose in regs.
     # Result[m, n] = sum_k sKr_T[m, k] * U_post[k, n] = (kr^T @ U)[m, n] —
     # directly stored as sState[m=K_in, n=D_out]. Eliminates sU_T SMEM trip.
-    sKr_T_tile = cute.flat_divide(sKr_T, (D, CHUNK))  # ((D, CHUNK), 1, 1)
+    sKr_T_view = cute.make_tensor(
+        sKr.iterator,
+        cute.make_layout((D, CHUNK, STAGES), stride=(1, D, CHUNK * D)),
+    )
+    sKr_T_view_s0 = sKr_T_view[(None, None, 0)]
+    sKr_T_tile = cute.flat_divide(sKr_T_view_s0, (D, CHUNK))  # ((D, CHUNK), 1, 1)
     sKr_T_ref = sKr_T_tile[None, None, 0, 0]  # (D, CHUNK)
     tCrKrA6 = thr_mma6.make_fragment_A(thr_mma6.partition_A(sKr_T_ref))
     tCrUpd = thr_mma6.make_fragment_C(tiled_mma6.partition_shape_C((D, D)))
@@ -461,15 +461,9 @@ def k2_phaseN_kernel(
             # Wait for TMA into stage s_dyn (single rotating phase).
             cute.arch.mbarrier_wait(sMbar_ptr + s_dyn, phase_full)
 
-            # Pre-transpose sKr -> sKr_T early.
-            if tidx < D:
-                kr_buf = cute.make_rmem_tensor(cute.make_layout((CHUNK,), stride=(1,)), cutlass.BFloat16)
-                for m in cutlass.range_constexpr(CHUNK):
-                    mm: cutlass.Constexpr[int] = m
-                    kr_buf[mm] = sKr_s[mm, tidx]
-                for m in cutlass.range_constexpr(CHUNK):
-                    mm: cutlass.Constexpr[int] = m
-                    sKr_T[tidx, mm] = kr_buf[mm]
+            # Per-stage transposed view of sKr for Phase 6 (no physical transpose).
+            sKr_T_s = sKr_T_view[(None, None, s_dyn)]
+            sKr_T_ref_s = cute.flat_divide(sKr_T_s, (D, CHUNK))[None, None, 0, 0]
 
             # ============================================================
             # Phase 1+4-MAIN FUSED (TENSOR-CORE): both share same State B-load.
@@ -552,19 +546,18 @@ def k2_phaseN_kernel(
                 smem_thr_store_C.retile(tCrOut_bf16),
                 smem_thr_store_C.partition_D(sOut_s),
             )
-            # NOTE: no barrier here. Phase 6 reads disjoint SMEM (sKr_T,
+            # NOTE: no barrier here. Phase 6 reads disjoint SMEM (sKr,
             # sState) so it can run in parallel with sOut writes settling.
 
             # ----- Phase 6 (TC MMA): state[m, n] = state*gt + (kr^T @ U)[m, n] -----
-            # Role-swap: A=sKr_T (D, CHUNK), B=tCrU_T_post (register from MOVM_T).
+            # Role-swap: A=sKr (D, CHUNK transposed view, LdMatrix.x4.trans),
+            # B=tCrU_T_post (register from MOVM_T).
             # gt indexed by M (K_in axis) under normal-form sState convention.
-            # Cross-warp barrier for sKr_T visibility (cooperative transpose at
-            # chunk start writes per-thread strides; phase 6 A-load is cross-warp).
-            # COMPUTE-ONLY: named barrier id=1 over 128 compute threads.
-            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            # No cross-warp barrier needed: sKr was filled by TMA and we already
+            # mbarrier_wait'd it; LdMatrix.x4.trans reads it directly.
             cute.copy(
                 smem_tiled_copy_A6,
-                smem_thr_copy_A6.partition_S(sKr_T_ref),
+                smem_thr_copy_A6.partition_S(sKr_T_ref_s),
                 tCrKrA6_cv,
             )
             tCrUpd.fill(0.0)
