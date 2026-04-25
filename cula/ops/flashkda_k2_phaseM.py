@@ -335,11 +335,6 @@ def k2_phaseM_kernel(
     coord_state = cute.make_identity_tensor((D, D))
     tCcState = thr_mma6.partition_C(coord_state)
     tCsState = thr_mma6.partition_C(sState)
-    # Phase-6 epilogue scratch: pre-loaded sState bf16 frag + gt fp32 cache.
-    # Hoisted (alloc) so the compiler doesn't re-emit per-iter scratch decls;
-    # its live range remains bounded by the per-iter use inside the t-loop.
-    state_frag = cute.make_fragment_like(tCsState, cutlass.BFloat16)
-    gt_frag = cute.make_fragment_like(tCsState, cutlass.Float32)
 
     bos = seq_idx * seq_len
     t_tiles: cutlass.Constexpr[int] = (seq_len + CHUNK - 1) // CHUNK
@@ -437,16 +432,23 @@ def k2_phaseM_kernel(
                     sKr_T[tidx, mm] = kr_buf[mm]
 
             # ============================================================
-            # Phase 1 (TENSOR-CORE): u_pre[m, n] = sum_k kd[m, k] * state[n, k]
-            # 4 warps split N=128, each computes 16x32 stripe via 8 K-iter loop
+            # Phase 1+4-MAIN FUSED (TENSOR-CORE): both share same State B-load.
+            #   tCrU   += kd  @ state   (Phase 1: u_pre)
+            #   tCrOut += qd  @ state   (Phase 4-main: out)
+            # cpp does this fusion explicitly to halve the State LDSM traffic.
             # ============================================================
             tCrU.fill(0.0)
+            tCrOut.fill(0.0)
             for k in cutlass.range_constexpr(D // 16):
                 sKd_k = sKd_tile[None, None, 0, k]
+                sQd_k = sQd_tile[None, None, 0, k]
                 sState_k = sState_tile[None, None, 0, k]
-                cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
+                # Single State B-load shared by both GEMMs.
                 cute.copy(smem_tiled_copy_B_T, smem_thr_copy_B_T.partition_S(sState_k), tCrState_cv)
+                cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
                 cute.gemm(tiled_mma, tCrU, tCrKd, tCrState, tCrU)
+                cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sQd_k), tCrQd_cv)
+                cute.gemm(tiled_mma, tCrOut, tCrQd, tCrState, tCrOut)
 
             # ----- Phase 2: u = sigmoid(beta) * (v - u_pre); MOVM_T into B-frag for phase 3 -----
             lane_in_warp = tidx % 32
@@ -490,16 +492,7 @@ def k2_phaseM_kernel(
                 ii: cutlass.Constexpr[int] = i
                 tCrU_T_post_u32[ii] = movm_t_b16(cutlass.Int32(tCrU3_u32[ii]))
 
-            # ----- Phase 4 MAIN (TC, no sU_T dep): out = qd @ state (8 K iters) -----
-            # Run BEFORE the sU_T-visibility barrier so it overlaps with phase 3
-            # SMEM writes settling. Reads only sQd, sState — disjoint from sU_T.
-            tCrOut.fill(0.0)
-            for k in cutlass.range_constexpr(D // 16):
-                sQd_k = sQd_tile[None, None, 0, k]
-                sState_k = sState_tile[None, None, 0, k]
-                cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sQd_k), tCrQd_cv)
-                cute.copy(smem_tiled_copy_B_T, smem_thr_copy_B_T.partition_S(sState_k), tCrState_cv)
-                cute.gemm(tiled_mma, tCrOut, tCrQd, tCrState, tCrOut)
+            # ----- Phase 4 MAIN: FUSED above (tCrOut already accumulated qd@state) -----
 
             # ----- Phase 4 EPI (TC): out += Mqk @ U_T (1 K iter) -----
             cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sMqk_ref_s), tCrMqk_cv)
@@ -533,8 +526,11 @@ def k2_phaseM_kernel(
 
             # In-frag epilogue: sState = bf16(float(sState)*gt[N] + delta).
             # NOTE: state_frag + gt_frag preload is CRITICAL — inline RMW
-            # regresses ~1.7× (verified). The preload breaks the SMEM-load
-            # dep chain and lets the compiler overlap with tCrUpd produce.
+            # regresses ~1.7× (verified). Allocated INSIDE the t-loop so the
+            # compiler can prove liveness ends with this scope and reuse the
+            # ~192 registers (128 bf16/2 + 128 fp32) for other work.
+            state_frag = cute.make_fragment_like(tCsState, cutlass.BFloat16)
+            gt_frag = cute.make_fragment_like(tCsState, cutlass.Float32)
             for i in cutlass.range_constexpr(cute.size(state_frag)):
                 ii: cutlass.Constexpr[int] = i
                 state_frag[ii] = tCsState[ii]
