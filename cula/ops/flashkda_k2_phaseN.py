@@ -135,10 +135,19 @@ def k2_phaseN_kernel(
     # StMatrix8x8x16bOp) produces the correct SMEM thread-data mapping.
     out_kinter_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_INTER, cutlass.BFloat16)
     out_stage_layout = cute.tile_to_shape(out_kinter_atom, (CHUNK, D, OUT_STAGES), order=(0, 1, 2))
+    # sV uses K_INTER swizzled layout to reduce shared-load bank conflicts on the
+    # ldmatrix path that feeds Phase-2 MOVM_T (consumed via partition_C, which is
+    # transparent through swizzle).
+    v_kinter_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_INTER, cutlass.BFloat16)
+    v_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
+    # sKd K_INTER swizzled layout (consumed via cute.copy(LdMatrix...) only).
+    kd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
+    # sQd K_INTER swizzled layout (consumed via cute.copy(LdMatrix...) only).
+    qd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
 
-    sV = smem.allocate_tensor(cutlass.BFloat16, qk_stage_layout, 128)
-    sKd = smem.allocate_tensor(cutlass.BFloat16, qk_stage_layout, 128)
-    sQd = smem.allocate_tensor(cutlass.BFloat16, qk_stage_layout, 128)
+    sV = smem.allocate_tensor(cutlass.BFloat16, v_stage_layout, 128)
+    sKd = smem.allocate_tensor(cutlass.BFloat16, kd_stage_layout, 128)
+    sQd = smem.allocate_tensor(cutlass.BFloat16, qd_stage_layout, 128)
     sKr = smem.allocate_tensor(cutlass.BFloat16, qk_stage_layout, 128)
     sINV = smem.allocate_tensor(cutlass.BFloat16, cc_stage_layout, 128)
     sMqk = smem.allocate_tensor(cutlass.BFloat16, cc_stage_layout, 128)
@@ -618,6 +627,13 @@ def run_k2_phaseN(
     qk_smem = _make_qk_smem_layout()
     cc_smem = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
     out_smem = _make_out_kinter_one_stage()
+    # K_INTER swizzled (CHUNK, D) layout for sV TMA atom (matches kernel-side
+    # v_stage_layout for swizzled bank-conflict-free shared loads).
+    v_smem = _make_out_kinter_one_stage()
+    # K_INTER swizzled (CHUNK, D) layout for sKd TMA atom.
+    kd_smem = _make_out_kinter_one_stage()
+    # K_INTER swizzled (CHUNK, D) layout for sQd TMA atom.
+    qd_smem = _make_out_kinter_one_stage()
 
     def make_thd_atom(t, op, smem_layout=qk_smem):
         view = cute.make_tensor(
@@ -626,12 +642,12 @@ def run_k2_phaseN(
         )
         return cpasync.make_tiled_tma_atom(op, view, smem_layout, (CHUNK, D))
 
-    def make_ws_qkd_atom(t):
+    def make_ws_qkd_atom(t, smem_layout=qk_smem):
         view = cute.make_tensor(
             t.iterator,
             cute.make_layout((CHUNK, D, total_tiles * H), stride=(D, 1, CHUNK * D)),
         )
-        return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, qk_smem, (CHUNK, D))
+        return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, smem_layout, (CHUNK, D))
 
     def make_ws_cc_atom(t):
         view = cute.make_tensor(
@@ -640,10 +656,10 @@ def run_k2_phaseN(
         )
         return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, cc_smem, (CHUNK, CHUNK))
 
-    tma_atom_v, tma_tensor_v = make_thd_atom(v, cpasync.CopyBulkTensorTileG2SOp())
+    tma_atom_v, tma_tensor_v = make_thd_atom(v, cpasync.CopyBulkTensorTileG2SOp(), smem_layout=v_smem)
     tma_atom_out, tma_tensor_out = make_thd_atom(out, cpasync.CopyBulkTensorTileS2GOp(), smem_layout=out_smem)
-    tma_atom_kd, tma_tensor_kd = make_ws_qkd_atom(ws_kd)
-    tma_atom_qd, tma_tensor_qd = make_ws_qkd_atom(ws_qd)
+    tma_atom_kd, tma_tensor_kd = make_ws_qkd_atom(ws_kd, smem_layout=kd_smem)
+    tma_atom_qd, tma_tensor_qd = make_ws_qkd_atom(ws_qd, smem_layout=qd_smem)
     tma_atom_kr, tma_tensor_kr = make_ws_qkd_atom(ws_kr)
     tma_atom_inv, tma_tensor_inv = make_ws_cc_atom(ws_inv)
     tma_atom_mqk, tma_tensor_mqk = make_ws_cc_atom(ws_mqk)
