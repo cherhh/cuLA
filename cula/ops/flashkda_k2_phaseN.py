@@ -355,6 +355,27 @@ def k2_phaseN_kernel(
     tCrUpd = thr_mma6.make_fragment_C(tiled_mma6.partition_shape_C((D, D)))
     tCrKrA6_cv = smem_thr_copy_A6.retile(tCrKrA6)
 
+    # ---- Phase 6 BLOCKED accumulator ref (CHUNK_M = CHUNK = 16) ----
+    # Decompose the (D, D) Phase-6 GEMM into D/CHUNK = 4 M-block iterations
+    # of (CHUNK, D, CHUNK) each. Per-warp accumulator per iteration is only
+    # CHUNK / atom_M(=16) × D / (atom_N(=8) × 4 warps) × 8 fp32 = 1 × 2 × 8
+    # = 8 fp32 regs (vs 64 for the full (D, D) accumulator). This matches
+    # the cpp baseline pattern in fwd_kernel2.cuh Phase 6 (S_M_BLOCKS loop).
+    # Build a (CHUNK, CHUNK) reference for partition_A frag-shape derivation.
+    sKr_T_blk_for_frag = cute.flat_divide(sKr_T_view_s0, (CHUNK, CHUNK))[None, None, 0, 0]
+    tCrKrA6_blk = thr_mma6.make_fragment_A(thr_mma6.partition_A(sKr_T_blk_for_frag))
+    tCrKrA6_blk_cv = smem_thr_copy_A6.retile(tCrKrA6_blk)
+    # C operand per block: (CHUNK, D) shape, same as tCrU/tCrOut/tCrU3.
+    tCrUpd_blk = thr_mma6.make_fragment_C(tiled_mma6.partition_shape_C((CHUNK, D)))
+    # State-block reference for partition_C frag-shape.
+    sState_blk_tile = cute.flat_divide(sState, (CHUNK, D))  # ((CHUNK, D), M_BLOCKS_6, 1)
+    sState_blk_for_frag = sState_blk_tile[None, None, 0, 0]
+    coord_state_blk = cute.make_identity_tensor((CHUNK, D))
+    tCcState_blk = thr_mma6.partition_C(coord_state_blk)
+    # NOTE: per-iteration state_frag/gt_frag are allocated inside the loop so
+    # their lifetime is tightly scoped (compiler can reuse storage across mi
+    # iterations and with other transients). Shape: same as tCrUpd_blk.
+
     # Phase 3/4-epi B-frag layout: (N=D, K=CHUNK), tile (16, 32, 16).
     # No backing SMEM (register-resident). Use sKr_T_ref shape to derive
     # the partition_B layout (same shape (D, CHUNK)).
@@ -471,6 +492,8 @@ def k2_phaseN_kernel(
             # Per-stage transposed view of sKr for Phase 6 (no physical transpose).
             sKr_T_s = sKr_T_view[(None, None, s_dyn)]
             sKr_T_ref_s = cute.flat_divide(sKr_T_s, (D, CHUNK))[None, None, 0, 0]
+            # Per-stage M-blocked view: ((CHUNK, CHUNK), M_BLOCKS_6, 1).
+            sKr_T_blk_tile_s = cute.flat_divide(sKr_T_s, (CHUNK, CHUNK))
 
             # ============================================================
             # Phase 1+4-MAIN FUSED (TENSOR-CORE): both share same State B-load.
@@ -556,35 +579,42 @@ def k2_phaseN_kernel(
             # NOTE: no barrier here. Phase 6 reads disjoint SMEM (sKr,
             # sState) so it can run in parallel with sOut writes settling.
 
-            # ----- Phase 6 (TC MMA): state[m, n] = state*gt + (kr^T @ U)[m, n] -----
-            # Role-swap: A=sKr (D, CHUNK transposed view, LdMatrix.x4.trans),
-            # B=tCrU_T_post (register from MOVM_T).
-            # gt indexed by M (K_in axis) under normal-form sState convention.
-            # No cross-warp barrier needed: sKr was filled by TMA and we already
-            # mbarrier_wait'd it; LdMatrix.x4.trans reads it directly.
-            cute.copy(
-                smem_tiled_copy_A6,
-                smem_thr_copy_A6.partition_S(sKr_T_ref_s),
-                tCrKrA6_cv,
-            )
-            tCrUpd.fill(0.0)
-            cute.gemm(tiled_mma6, tCrUpd, tCrKrA6, tCrU_T_post, tCrUpd)
+            # ----- Phase 6 (TC MMA) BLOCKED: state[m, n] = state*gt + (kr^T @ U)[m, n] -----
+            # Decomposed into D/CHUNK = 4 M-block iterations of (CHUNK, D, CHUNK)
+            # GEMM each. Per-iteration accumulator (tCrUpd_blk) is only 8 fp32
+            # regs/thread vs 64 for the full (D, D) accumulator. state_frag /
+            # gt_frag are also block-sized (~8 bf16 + ~8 fp32 per iter) and
+            # allocated inside the loop so the compiler can reuse storage
+            # across iterations. Mirrors cpp baseline Phase 6 S_M_BLOCKS loop.
+            M_BLOCKS_6: cutlass.Constexpr[int] = D // CHUNK  # = 4
+            for mi in cutlass.range_constexpr(M_BLOCKS_6):
+                # Slice this M-block from the per-stage transposed sKr view
+                # (CHUNK rows of D-major K=CHUNK).
+                sKr_T_blk_s = sKr_T_blk_tile_s[None, None, mi, 0]
+                cute.copy(
+                    smem_tiled_copy_A6,
+                    smem_thr_copy_A6.partition_S(sKr_T_blk_s),
+                    tCrKrA6_blk_cv,
+                )
+                # Compute (kr_blk^T @ U_post) -> (CHUNK, D) accumulator.
+                tCrUpd_blk.fill(0.0)
+                cute.gemm(tiled_mma6, tCrUpd_blk, tCrKrA6_blk, tCrU_T_post, tCrUpd_blk)
 
-            # In-frag epilogue: sState = bf16(float(sState)*gt[N] + delta).
-            # NOTE: state_frag + gt_frag preload is CRITICAL — inline RMW
-            # regresses ~1.7× (verified). Allocated INSIDE the t-loop so the
-            # compiler can prove liveness ends with this scope and reuse the
-            # ~192 registers (128 bf16/2 + 128 fp32) for other work.
-            state_frag = cute.make_fragment_like(tCsState, cutlass.BFloat16)
-            gt_frag = cute.make_fragment_like(tCsState, cutlass.Float32)
-            for i in cutlass.range_constexpr(cute.size(state_frag)):
-                ii: cutlass.Constexpr[int] = i
-                state_frag[ii] = tCsState[ii]
-                gt_frag[ii] = sGt[tCcState[ii][0]]
-            for i in cutlass.range_constexpr(cute.size(tCrUpd)):
-                ii: cutlass.Constexpr[int] = i
-                old = cutlass.Float32(state_frag[ii]) * gt_frag[ii]
-                tCsState[ii] = cutlass.BFloat16(old + tCrUpd[ii])
+                # In-frag epilogue: state[mi-block] = bf16(float(state)*gt + delta).
+                # Slice sState rows for this mi block and partition_C.
+                sState_blk = sState_blk_tile[None, None, mi, 0]
+                tCsState_blk = thr_mma6.partition_C(sState_blk)
+                state_frag_blk = cute.make_fragment_like(tCsState_blk, cutlass.BFloat16)
+                gt_frag_blk = cute.make_fragment_like(tCsState_blk, cutlass.Float32)
+                m_off: cutlass.Constexpr[int] = mi * CHUNK
+                for i in cutlass.range_constexpr(cute.size(state_frag_blk)):
+                    ii: cutlass.Constexpr[int] = i
+                    state_frag_blk[ii] = tCsState_blk[ii]
+                    gt_frag_blk[ii] = sGt[m_off + tCcState_blk[ii][0]]
+                for i in cutlass.range_constexpr(cute.size(tCrUpd_blk)):
+                    ii: cutlass.Constexpr[int] = i
+                    old = cutlass.Float32(state_frag_blk[ii]) * gt_frag_blk[ii]
+                    tCsState_blk[ii] = cutlass.BFloat16(old + tCrUpd_blk[ii])
             # Combined barrier: syncs sOut (Phase 4) + sState (Phase 6) writes
             # across compute warps before signaling consumers. COMPUTE-ONLY.
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
