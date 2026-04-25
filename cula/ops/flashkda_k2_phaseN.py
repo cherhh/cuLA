@@ -134,16 +134,19 @@ def k2_phaseN_kernel(
     kd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
     # sQd K_INTER swizzled layout (consumed via cute.copy(LdMatrix...) only).
     qd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
-    # NOTE: sKr deliberately KEPT plain stride. Phase 6 builds a transposed
-    # view via cute.make_tensor(sKr.iterator, transposed_layout); that path
-    # would discard a K_INTER swizzle on sKr (swizzle lives in the layout, not
-    # the iterator), producing wrong addresses. K_INTER on sKr requires a
-    # swizzle-aware transpose view (future work).
+    # sKr K_INTER swizzled allocation. Same atom as sV/sKd/sQd. Phase 4-prelude
+    # B-load uses LDSM_N on this swizzled (CHUNK, D) view directly. Phase 6
+    # A-load uses LDSM_T on a MN_INTER-atom view of the SAME bytes (cpp
+    # baseline pattern: SMEM written via K_INTER is read via MN_INTER+.trans).
+    kr_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
+    # MN_INTER atom for the transposed view of sKr used by Phase 6 (D, CHUNK).
+    kr_mninter_atom = make_smem_layout_atom(SmemLayoutAtomKind.MN_INTER, cutlass.BFloat16)
+    kr_t_stage_layout = cute.tile_to_shape(kr_mninter_atom, (D, CHUNK, STAGES), order=(0, 1, 2))
 
     sV = smem.allocate_tensor(cutlass.BFloat16, v_stage_layout, 128)
     sKd = smem.allocate_tensor(cutlass.BFloat16, kd_stage_layout, 128)
     sQd = smem.allocate_tensor(cutlass.BFloat16, qd_stage_layout, 128)
-    sKr = smem.allocate_tensor(cutlass.BFloat16, qk_stage_layout, 128)
+    sKr = smem.allocate_tensor(cutlass.BFloat16, kr_stage_layout, 128)
     sINV = smem.allocate_tensor(cutlass.BFloat16, cc_stage_layout, 128)
     sMqk = smem.allocate_tensor(cutlass.BFloat16, cc_stage_layout, 128)
     sOut = smem.allocate_tensor(cutlass.BFloat16, out_stage_layout, 128)
@@ -337,10 +340,14 @@ def k2_phaseN_kernel(
     # physical transpose; LdMatrix.x4.trans handles per-8x8 transpose in regs.
     # Result[m, n] = sum_k sKr_T[m, k] * U_post[k, n] = (kr^T @ U)[m, n] —
     # directly stored as sState[m=K_in, n=D_out]. Eliminates sU_T SMEM trip.
-    sKr_T_view = cute.make_tensor(
-        sKr.iterator,
-        cute.make_layout((D, CHUNK, STAGES), stride=(1, D, CHUNK * D)),
-    )
+    #
+    # CRITICAL: sKr is K_INTER swizzled-allocated. We construct sKr_T as an
+    # MN_INTER-atom view of the SAME iterator (kr_t_stage_layout, shape
+    # (D, CHUNK, STAGES)). Both atoms map onto the same 1024-byte cosize,
+    # and ldmatrix.x4.trans + MN_INTER stride pattern yields the correct
+    # per-8x8 transposed bf16 data — matching the cpp baseline's
+    # MMALayout↔TransposedMMALayout dual-view pattern on `k_restored`.
+    sKr_T_view = cute.make_tensor(sKr.iterator, kr_t_stage_layout)
     sKr_T_view_s0 = sKr_T_view[(None, None, 0)]
     sKr_T_tile = cute.flat_divide(sKr_T_view_s0, (D, CHUNK))  # ((D, CHUNK), 1, 1)
     sKr_T_ref = sKr_T_tile[None, None, 0, 0]  # (D, CHUNK)
