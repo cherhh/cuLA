@@ -1286,6 +1286,14 @@ def k1_full_kernel(
 
     smem = cutlass.utils.SmemAllocator()
     qk_layout = cute.make_layout((CHUNK, D), stride=(D, 1))
+    # Padded variant of (CHUNK, D) bf16 — used only for sKI to break the
+    # SMEM bank conflict pattern in the L/Mqk scalar dot loop
+    # (sKI[j2, kk] with j2 varying across threads = 16-way row-strided
+    # access). Padding row stride from D=128 to D+8=136 lands consecutive
+    # rows on different banks. sQD/sKD/sKR cannot be padded because they
+    # are TMA-bulk-stored and TMA requires non-padded power-of-2 strides.
+    KI_PAD: cutlass.Constexpr[int] = 8
+    qk_layout_pad = cute.make_layout((CHUNK, D), stride=(D + KI_PAD, 1))
     cc_layout = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
     sQ = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sK = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
@@ -1294,7 +1302,7 @@ def k1_full_kernel(
     sGtot = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 128)
     sQD = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sKD = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
-    sKI = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    sKI = smem.allocate_tensor(cutlass.BFloat16, qk_layout_pad, 128)
     sKR = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sL = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
     sMqk = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
@@ -1522,6 +1530,7 @@ def run_k1_full(
     stream: cuda_drv.CUstream,
 ):
     smem_layout_qk = cute.make_layout((CHUNK, D), stride=(D, 1))
+    KI_PAD = 8
 
     def make_atom(t):
         view = cute.make_tensor(
@@ -1536,10 +1545,6 @@ def run_k1_full(
         )
 
     def make_ws_store_atom(t):
-        # Workspace tensors (ws_qd / ws_kd / ws_kr) are flat 1-D bf16
-        # buffers conceptually shaped as (CHUNK, D, total_tiles*H) with
-        # stride (D, 1, CHUNK*D). Slot index = head_idx * total_tiles + tile_idx
-        # matches K2's load-side view.
         view = cute.make_tensor(
             t.iterator,
             cute.make_layout((CHUNK, D, total_tiles * H), stride=(D, 1, CHUNK * D)),
@@ -1558,7 +1563,18 @@ def run_k1_full(
     tma_atom_ws_kd, tma_tensor_ws_kd = make_ws_store_atom(ws_kd)
     tma_atom_ws_kr, tma_tensor_ws_kr = make_ws_store_atom(ws_kr)
 
-    smem_bytes = 7 * (CHUNK * D * 2) + (CHUNK * D * 4) + (D * 4) + 5 * (CHUNK * CHUNK * 4) + 8 + 512
+    # SMEM byte budget: 6 unpadded qk bf16 (sQ/sK/sGbf/sQD/sKD/sKR) + 1 padded
+    # qk bf16 (sKI) + sGcs (fp32 unpadded qk) + sGtot (fp32, D) + 5 cc fp32
+    # + mbar.
+    smem_bytes = (
+        6 * (CHUNK * D * 2)
+        + (CHUNK * (D + KI_PAD) * 2)
+        + (CHUNK * D * 4)
+        + (D * 4)
+        + 5 * (CHUNK * CHUNK * 4)
+        + 8
+        + 512
+    )
 
     k1_full_kernel(
         tma_atom_q,
