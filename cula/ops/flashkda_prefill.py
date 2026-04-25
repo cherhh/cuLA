@@ -363,7 +363,16 @@ def _dispatch_cute(
     from cula.ops.flashkda_k1 import CHUNK as K1_CHUNK
     from cula.ops.flashkda_k1 import D as K1_D
     from cula.ops.flashkda_k1 import launch_k1_full
-    from cula.ops.flashkda_k2 import launch_k2_phaseB
+
+    # K2 variant selector (env CULA_FLASHKDA_K2_VARIANT).
+    # Default: phaseN (latest, matches/beats cpp baseline at T>=4096).
+    _k2_variant = os.environ.get("CULA_FLASHKDA_K2_VARIANT", "N").upper()
+    if _k2_variant == "N":
+        from cula.ops.flashkda_k2_phaseN import launch_k2_phaseN as _launch_k2
+    elif _k2_variant == "B":
+        from cula.ops.flashkda_k2 import launch_k2_phaseB as _launch_k2
+    else:
+        raise ValueError(f"unknown CULA_FLASHKDA_K2_VARIANT={_k2_variant!r}")
 
     if problem.has_state_in or problem.has_state_out or problem.is_varlen:
         raise NotImplementedError(
@@ -404,7 +413,7 @@ def _dispatch_cute(
         ws_inv,
         ws_mqk,
     )
-    launch_k2_phaseB(v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, out)
+    _launch_k2(v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, out)
 
 
 # ============================================================================

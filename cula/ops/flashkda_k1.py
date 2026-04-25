@@ -1263,12 +1263,15 @@ def k1_full_kernel(
     tma_tensor_k: cute.Tensor,
     tma_atom_g: cute.CopyAtom,
     tma_tensor_g: cute.Tensor,
+    tma_atom_ws_qd: cute.CopyAtom,
+    tma_tensor_ws_qd: cute.Tensor,
+    tma_atom_ws_kd: cute.CopyAtom,
+    tma_tensor_ws_kd: cute.Tensor,
+    tma_atom_ws_kr: cute.CopyAtom,
+    tma_tensor_ws_kr: cute.Tensor,
     a_log: cute.Tensor,
     dt_bias: cute.Tensor,
     beta: cute.Tensor,
-    ws_qd: cute.Tensor,
-    ws_kd: cute.Tensor,
-    ws_kr: cute.Tensor,
     ws_gt: cute.Tensor,
     ws_inv: cute.Tensor,
     ws_mqk: cute.Tensor,
@@ -1292,6 +1295,7 @@ def k1_full_kernel(
     sQD = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sKD = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sKI = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    sKR = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sL = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
     sMqk = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
     sINV = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
@@ -1331,6 +1335,33 @@ def k1_full_kernel(
         cute.group_modes(sGbf, 0, 2),
         cute.group_modes(gSrc_g, 0, 2),
     )
+
+    # ---- TMA store partitioning for ws_qd / ws_kd / ws_kr ----
+    gDst_qd = cute.local_tile(tma_tensor_ws_qd, (CHUNK, D), (None, None, None))
+    tQDws_s, tQDws_g = cpasync.tma_partition(
+        tma_atom_ws_qd,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sQD, 0, 2),
+        cute.group_modes(gDst_qd, 0, 2),
+    )
+    gDst_kd = cute.local_tile(tma_tensor_ws_kd, (CHUNK, D), (None, None, None))
+    tKDws_s, tKDws_g = cpasync.tma_partition(
+        tma_atom_ws_kd,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sKD, 0, 2),
+        cute.group_modes(gDst_kd, 0, 2),
+    )
+    gDst_kr = cute.local_tile(tma_tensor_ws_kr, (CHUNK, D), (None, None, None))
+    tKRws_s, tKRws_g = cpasync.tma_partition(
+        tma_atom_ws_kr,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sKR, 0, 2),
+        cute.group_modes(gDst_kr, 0, 2),
+    )
+    ws_slot = head_idx * total_tiles + tile_idx
 
     if warp_idx == 0:
         with cute.arch.elect_one():
@@ -1379,8 +1410,8 @@ def k1_full_kernel(
         sGtot[col_c] = cute.exp(s, fastmath=True)
     cute.arch.barrier()
 
-    # decay_apply: into SMEM (sQD, sKD, sKI) AND dump to workspace
-    ws_base = (head_idx * total_tiles + tile_idx) * (CHUNK * D)
+    # decay_apply: into SMEM (sQD, sKD, sKI, sKR); ws_qd/ws_kd/ws_kr will be
+    # bulk-stored via TMA at the end of the kernel.
     base = row * D + col
     for j in cutlass.range_constexpr(8):
         jj: cutlass.Constexpr[int] = j
@@ -1398,14 +1429,21 @@ def k1_full_kernel(
         sQD[row, col + jj] = qd_bf
         sKD[row, col + jj] = kd_bf
         sKI[row, col + jj] = ki_bf
-        ws_qd[ws_base + base + jj] = qd_bf
-        ws_kd[ws_base + base + jj] = kd_bf
-        ws_kr[ws_base + base + jj] = kr_bf
+        sKR[row, col + jj] = kr_bf
 
     if tidx < 128:
         gt_base = (head_idx * total_tiles + tile_idx) * D
         ws_gt[gt_base + tidx] = sGtot[tidx]
     cute.arch.barrier()
+
+    # ---- Issue TMA bulk stores for ws_qd / ws_kd / ws_kr (overlap with
+    # subsequent L/Mqk/Neumann compute that does not touch sQD/sKD/sKR). ----
+    if warp_idx == 0:
+        with cute.arch.elect_one():
+            cute.copy(tma_atom_ws_qd, tQDws_s[(None,)], tQDws_g[(None, 0, 0, ws_slot)])
+            cute.copy(tma_atom_ws_kd, tKDws_s[(None,)], tKDws_g[(None, 0, 0, ws_slot)])
+            cute.copy(tma_atom_ws_kr, tKRws_s[(None,)], tKRws_g[(None, 0, 0, ws_slot)])
+            cute.arch.cp_async_bulk_commit_group()
 
     # L = sKD @ sKI^T, Mqk = sQD @ sKI^T
     i = tidx // CHUNK
@@ -1455,6 +1493,12 @@ def k1_full_kernel(
     ws_inv[ws_base_cc + i * CHUNK + j2] = cutlass.BFloat16(sINV[i, j2])
     ws_mqk[ws_base_cc + i * CHUNK + j2] = cutlass.BFloat16(sMqk[i, j2])
 
+    # Wait for the TMA bulk stores (ws_qd / ws_kd / ws_kr) issued earlier to
+    # complete before kernel exit, so the next kernel (K2) sees the data.
+    if warp_idx == 0:
+        with cute.arch.elect_one():
+            cute.arch.cp_async_bulk_wait_group(0, read=False)
+
 
 @cute.jit
 def run_k1_full(
@@ -1491,11 +1535,30 @@ def run_k1_full(
             (CHUNK, D),
         )
 
+    def make_ws_store_atom(t):
+        # Workspace tensors (ws_qd / ws_kd / ws_kr) are flat 1-D bf16
+        # buffers conceptually shaped as (CHUNK, D, total_tiles*H) with
+        # stride (D, 1, CHUNK*D). Slot index = head_idx * total_tiles + tile_idx
+        # matches K2's load-side view.
+        view = cute.make_tensor(
+            t.iterator,
+            cute.make_layout((CHUNK, D, total_tiles * H), stride=(D, 1, CHUNK * D)),
+        )
+        return cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            view,
+            smem_layout_qk,
+            (CHUNK, D),
+        )
+
     tma_atom_q, tma_tensor_q = make_atom(q)
     tma_atom_k, tma_tensor_k = make_atom(k)
     tma_atom_g, tma_tensor_g = make_atom(g)
+    tma_atom_ws_qd, tma_tensor_ws_qd = make_ws_store_atom(ws_qd)
+    tma_atom_ws_kd, tma_tensor_ws_kd = make_ws_store_atom(ws_kd)
+    tma_atom_ws_kr, tma_tensor_ws_kr = make_ws_store_atom(ws_kr)
 
-    smem_bytes = 6 * (CHUNK * D * 2) + (CHUNK * D * 4) + (D * 4) + 5 * (CHUNK * CHUNK * 4) + 8 + 512
+    smem_bytes = 7 * (CHUNK * D * 2) + (CHUNK * D * 4) + (D * 4) + 5 * (CHUNK * CHUNK * 4) + 8 + 512
 
     k1_full_kernel(
         tma_atom_q,
@@ -1504,12 +1567,15 @@ def run_k1_full(
         tma_tensor_k,
         tma_atom_g,
         tma_tensor_g,
+        tma_atom_ws_qd,
+        tma_tensor_ws_qd,
+        tma_atom_ws_kd,
+        tma_tensor_ws_kd,
+        tma_atom_ws_kr,
+        tma_tensor_ws_kr,
         a_log,
         dt_bias,
         beta,
-        ws_qd,
-        ws_kd,
-        ws_kr,
         ws_gt,
         ws_inv,
         ws_mqk,
