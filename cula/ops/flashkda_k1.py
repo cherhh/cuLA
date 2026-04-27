@@ -1306,8 +1306,14 @@ def k1_full_kernel(
     sKD = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sKI = smem.allocate_tensor(cutlass.BFloat16, qk_layout_pad, 128)
     sKR = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
-    sL = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
-    sMqk = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
+    # cpp-faithful Phase 6: stacked C-frag output (32, 16) bf16. Top half
+    # (rows 0..15) = Mqk = sQD @ sKI^T. Bottom half (rows 16..31) = L =
+    # sKD @ sKI^T (with mask*sigmoid(beta) folded). Drops fp32 sL/sMqk.
+    sLMqk_layout = cute.make_layout((2 * CHUNK, CHUNK), stride=(CHUNK, 1))
+    sLMqk_bf16 = smem.allocate_tensor(cutlass.BFloat16, sLMqk_layout, 128)
+    # Sub-views: sMqk_bf16 = top 16 rows, sL_bf16 = bottom 16 rows.
+    # Per-row sigmoid(beta) prefetched once per CTA for branch-free mask fold.
+    sBetaSig = smem.allocate_tensor(cutlass.Float32, cute.make_layout((CHUNK,)), 128)
     # Neumann TC inputs (single-warp register-resident matmul à la cpp
     # neumann_inv_fused_1warp). Outputs stored in sINV_bf16 via STSM_N for
     # the per-thread workspace dump pattern below.
@@ -1423,6 +1429,14 @@ def k1_full_kernel(
         sGtot[col_c] = cute.exp(s, fastmath=True)
     cute.arch.barrier()
 
+    # Pre-compute per-row sigmoid(beta) into sBetaSig (16 elements). Used by
+    # the cpp-faithful TC L/Mqk path below to fold the L mask via branch-free
+    # multiply against an identity-coord factor.
+    if tidx < CHUNK:
+        bv = cutlass.Float32(beta[head_idx * T_total + tile_idx * CHUNK + tidx])
+        sBetaSig[tidx] = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
+    cute.arch.barrier()
+
     # decay_apply: into SMEM (sQD, sKD, sKI, sKR); ws_qd/ws_kd/ws_kr will be
     # bulk-stored via TMA at the end of the kernel.
     # Phase C: vectorized 128-bit (8 bf16) writes via cute.autovec_copy to
@@ -1483,34 +1497,102 @@ def k1_full_kernel(
             cute.copy(tma_atom_ws_kr, tKRws_s[(None,)], tKRws_g[(None, 0, 0, ws_slot)])
             cute.arch.cp_async_bulk_commit_group()
 
-    # L = sKD @ sKI^T, Mqk = sQD @ sKI^T
-    i = tidx // CHUNK
-    j2 = tidx % CHUNK
-    sum_l = cutlass.Float32(0.0)
-    sum_m = cutlass.Float32(0.0)
-    for kk in cutlass.range(D, unroll=8):
-        ki_v = cutlass.Float32(sKI[j2, kk])
-        sum_l = sum_l + cutlass.Float32(sKD[i, kk]) * ki_v
-        sum_m = sum_m + cutlass.Float32(sQD[i, kk]) * ki_v
-    beta_lin = head_idx * T_total + tile_idx * CHUNK + i
-    if i > j2:
-        bv = cutlass.Float32(beta[beta_lin])
-        sig_b = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
-        sL[i, j2] = sum_l * sig_b
-    else:
-        sL[i, j2] = cutlass.Float32(0.0)
-    if i >= j2:
-        sMqk[i, j2] = sum_m
-    else:
-        sMqk[i, j2] = cutlass.Float32(0.0)
+    # ===== L/Mqk via cpp-faithful Tensor Core MMA + STSM_N =====
+    # Replaces the prior 256-thread scalar dot loop (latency-bound,
+    # 65% Long Scoreboard per NCU) with a 2-warp register-resident path:
+    #   - Stacked A = [sQD; sKD] (32, D) (sQD/sKD are SMEM-adjacent in
+    #     the allocator). 2-warp tiled_mma atom_layout=(2,1,1)
+    #     permutation=(32, 16, 16). 8 K-iters of D//16=8 atoms each.
+    #   - C-frag (32, 16) fp32 -> branch-free identity-coord mask fold:
+    #       row m in [0,16):  Mqk: factor = float(m >= n)
+    #       row m in [16,32): L:   factor = float((m-16) > n) * sBetaSig[m-16]
+    #   - STSM_N writes the masked C-frag into sLMqk_bf16 (32, 16).
+    #     Top half = sMqk_bf16 view, bottom half = sL_bf16 view (consumed
+    #     by Neumann cast pass and ws_mqk dump below).
+    sStackedQDKD_layout = cute.make_layout((2 * CHUNK, D), stride=(D, 1))
+    sStackedQDKD = cute.make_tensor(sQD.iterator, sStackedQDKD_layout)
+    mma_atom_lm = warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))
+    tiled_mma_lm = cute.make_tiled_mma(
+        mma_atom_lm,
+        atom_layout_mnk=(2, 1, 1),
+        permutation_mnk=(32, 16, 16),
+    )
+    thr_mma_lm = tiled_mma_lm.get_slice(tidx)
+
+    copy_atom_AB_lm = cute.make_copy_atom(
+        warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+        cutlass.BFloat16,
+    )
+    smem_tiled_copy_A_lm = cute.make_tiled_copy_A(copy_atom_AB_lm, tiled_mma_lm)
+    smem_tiled_copy_B_lm = cute.make_tiled_copy_B(copy_atom_AB_lm, tiled_mma_lm)
+    smem_thr_copy_A_lm = smem_tiled_copy_A_lm.get_slice(tidx)
+    smem_thr_copy_B_lm = smem_tiled_copy_B_lm.get_slice(tidx)
+
+    # K-loop tiles: A=(32, K_BLK) over D, B=(16, K_BLK) over D.
+    sA_tile = cute.flat_divide(sStackedQDKD, (2 * CHUNK, 16))  # ((32,16), 1, D//16)
+    sB_tile_full = cute.flat_divide(sKI, (CHUNK, 16))  # ((16,16), 1, D//16)
+    sA_ref = sA_tile[None, None, 0, 0]
+    sB_ref = sB_tile_full[None, None, 0, 0]
+
+    tCrA_lm = thr_mma_lm.make_fragment_A(thr_mma_lm.partition_A(sA_ref))
+    tCrB_lm = thr_mma_lm.make_fragment_B(thr_mma_lm.partition_B(sB_ref))
+    tCrC_lm = thr_mma_lm.make_fragment_C(tiled_mma_lm.partition_shape_C((2 * CHUNK, CHUNK)))
+    tCrA_lm_cv = smem_thr_copy_A_lm.retile(tCrA_lm)
+    tCrB_lm_cv = smem_thr_copy_B_lm.retile(tCrB_lm)
+
+    tCrC_lm.fill(0.0)
+    if warp_idx < 2:
+        for k_blk in cutlass.range_constexpr(D // 16):
+            sA_k = sA_tile[None, None, 0, k_blk]
+            sB_k = sB_tile_full[None, None, 0, k_blk]
+            cute.copy(smem_tiled_copy_A_lm, smem_thr_copy_A_lm.partition_S(sA_k), tCrA_lm_cv)
+            cute.copy(smem_tiled_copy_B_lm, smem_thr_copy_B_lm.partition_S(sB_k), tCrB_lm_cv)
+            cute.gemm(tiled_mma_lm, tCrC_lm, tCrA_lm, tCrB_lm, tCrC_lm)
+
+        # Branch-free mask fold using identity-coord arithmetic.
+        coord_C = cute.make_identity_tensor((2 * CHUNK, CHUNK))
+        tCcC_lm = thr_mma_lm.partition_C(coord_C)
+        for ii in cutlass.range_constexpr(cute.size(tCrC_lm)):
+            crd = tCcC_lm[ii]
+            m = crd[0]
+            n = crd[1]
+            # m in [0,16) -> Mqk row, m in [16,32) -> L row.
+            m_is_l = cutlass.Float32(1.0) if m >= CHUNK else cutlass.Float32(0.0)
+            m_is_mqk = cutlass.Float32(1.0) - m_is_l
+            mr = m - CHUNK if m >= CHUNK else 0  # safe: only used when m_is_l=1
+            mqk_keep = cutlass.Float32(1.0) if m >= n else cutlass.Float32(0.0)
+            l_keep = cutlass.Float32(1.0) if mr > n else cutlass.Float32(0.0)
+            beta_factor = sBetaSig[mr]  # always-valid SMEM read
+            factor = m_is_mqk * mqk_keep + m_is_l * l_keep * beta_factor
+            tCrC_lm[ii] = tCrC_lm[ii] * factor
+
+        # In-frag fp32 -> bf16 cast then STSM_N to sLMqk_bf16 (32, 16).
+        tCrC_lm_bf16 = cute.make_fragment_like(tCrC_lm, cutlass.BFloat16)
+        for ii in cutlass.range_constexpr(cute.size(tCrC_lm)):
+            tCrC_lm_bf16[ii] = cutlass.BFloat16(tCrC_lm[ii])
+        copy_atom_stsm_lm = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2),
+            cutlass.BFloat16,
+        )
+        smem_tiled_store_lm = cute.make_tiled_copy_C_atom(copy_atom_stsm_lm, tiled_mma_lm)
+        smem_thr_store_lm = smem_tiled_store_lm.get_slice(tidx)
+        cute.copy(
+            smem_tiled_store_lm,
+            smem_thr_store_lm.retile(tCrC_lm_bf16),
+            smem_thr_store_lm.partition_D(sLMqk_bf16),
+        )
     cute.arch.barrier()
 
     # Neumann inverse — single-warp register-resident TC version
     # (mirrors cpp utils.cuh::neumann_inv_fused_1warp).
-    # Step 1: cast sL fp32 → sL_fp16 SMEM and init sINV_fp16 = (I - L) in
-    # fp16 SMEM. Each of the 256 threads handles exactly one (i, j2) elem.
-    sL_fp16[i, j2] = cutlass.Float16(sL[i, j2])
-    inv_init = cutlass.Float32(1.0 if i == j2 else 0.0) - sL[i, j2]
+    # Step 1: read sL_bf16 (bottom half of sLMqk_bf16, rows 16..31) and
+    # populate sL_fp16 + sINV_fp16 = (I - L) in fp16 SMEM. All 256 threads
+    # cooperate on the (CHUNK, CHUNK) cast.
+    i = tidx // CHUNK
+    j2 = tidx % CHUNK
+    l_bf = cutlass.Float32(sLMqk_bf16[i + CHUNK, j2])
+    sL_fp16[i, j2] = cutlass.Float16(l_bf)
+    inv_init = cutlass.Float32(1.0 if i == j2 else 0.0) - l_bf
     sINV_fp16[i, j2] = cutlass.Float16(inv_init)
     cute.arch.barrier()
 
@@ -1633,7 +1715,8 @@ def k1_full_kernel(
     # Dump INV, Mqk
     ws_base_cc = (head_idx * total_tiles + tile_idx) * (CHUNK * CHUNK)
     ws_inv[ws_base_cc + i * CHUNK + j2] = sINV_bf16[i, j2]
-    ws_mqk[ws_base_cc + i * CHUNK + j2] = cutlass.BFloat16(sMqk[i, j2])
+    # sMqk is the top half (rows 0..15) of sLMqk_bf16, already bf16 + masked.
+    ws_mqk[ws_base_cc + i * CHUNK + j2] = sLMqk_bf16[i, j2]
 
     # Wait for the TMA bulk stores (ws_qd / ws_kd / ws_kr) issued earlier to
     # complete before kernel exit, so the next kernel (K2) sees the data.
@@ -1698,14 +1781,16 @@ def run_k1_full(
     tma_atom_ws_kr, tma_tensor_ws_kr = make_ws_store_atom(ws_kr)
 
     # SMEM byte budget: 6 unpadded qk bf16 (sQ/sK/sGbf/sQD/sKD/sKR) + 1 padded
-    # qk bf16 (sKI) + sGcs (fp32 unpadded qk) + sGtot (fp32, D) + 2 cc fp32
-    # (sL/sMqk) + 2 cc fp16 (sL_fp16/sINV_fp16) + 1 cc bf16 (sINV_bf16) + mbar.
+    # qk bf16 (sKI) + sGcs (fp32 unpadded qk) + sGtot (fp32, D)
+    # + sLMqk_bf16 (32, 16) bf16 + sBetaSig (CHUNK,) fp32
+    # + 2 cc fp16 (sL_fp16/sINV_fp16) + 1 cc bf16 (sINV_bf16) + mbar.
     smem_bytes = (
         6 * (CHUNK * D * 2)
         + (CHUNK * (D + KI_PAD) * 2)
         + (CHUNK * D * 4)
         + (D * 4)
-        + 2 * (CHUNK * CHUNK * 4)
+        + (2 * CHUNK * CHUNK * 2)
+        + (CHUNK * 4)
         + 3 * (CHUNK * CHUNK * 2)
         + 8
         + 512
