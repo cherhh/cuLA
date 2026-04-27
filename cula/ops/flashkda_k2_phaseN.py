@@ -468,7 +468,7 @@ def k2_phaseN_kernel(
         s_out = cutlass.Int32(0)
         phase_se = cutlass.Int32(1)
 
-        for t in cutlass.range(t_tiles, unroll=2):
+        for t in cutlass.range(t_tiles, unroll=1):
             t_g = seq_idx * t_tiles + t
             ws_t = head_idx * total_tiles + t_g
             gt_off = ws_t * D
