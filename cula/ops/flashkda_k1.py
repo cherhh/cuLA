@@ -1420,7 +1420,31 @@ def k1_full_kernel(
 
     # decay_apply: into SMEM (sQD, sKD, sKI, sKR); ws_qd/ws_kd/ws_kr will be
     # bulk-stored via TMA at the end of the kernel.
-    base = row * D + col
+    # Phase C: vectorized 128-bit (8 bf16) writes via cute.autovec_copy to
+    # eliminate the 62% bank conflicts measured by NCU on the 8-elem scalar
+    # store loop. Per-thread mapping is identical (row=tidx/16, col_block=
+    # tidx%16) so adjacent threads still target adjacent 16-byte chunks
+    # (coalesced 128-bit transactions, no 2-way bank conflict between rows).
+    base = row * D + col  # noqa: F841 (kept for parity)
+
+    # Per-(row, col_block) (1, 8) tile views over each dest tensor.
+    sQD_tile = cute.flat_divide(sQD, (1, 8))  # ((1,8), CHUNK, D//8)
+    sKD_tile = cute.flat_divide(sKD, (1, 8))
+    sKI_tile = cute.flat_divide(sKI, (1, 8))  # padded layout still divisible
+    sKR_tile = cute.flat_divide(sKR, (1, 8))
+
+    cb = tidx % 16  # col block index (col_base = cb * 8)
+
+    sQD_my = sQD_tile[(None, None, row, cb)]
+    sKD_my = sKD_tile[(None, None, row, cb)]
+    sKI_my = sKI_tile[(None, None, row, cb)]
+    sKR_my = sKR_tile[(None, None, row, cb)]
+
+    r_qd = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
+    r_kd = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
+    r_ki = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
+    r_kr = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
+
     for j in cutlass.range_constexpr(8):
         jj: cutlass.Constexpr[int] = j
         g_cs = sGcs[row, col + jj]
@@ -1430,14 +1454,15 @@ def k1_full_kernel(
         rest = gt * inv_pos
         q_v = cutlass.Float32(sQ[row, col + jj])
         k_v = cutlass.Float32(sK[row, col + jj])
-        qd_bf = cutlass.BFloat16(q_v * exp_pos * cutlass.Float32(scale))
-        kd_bf = cutlass.BFloat16(k_v * exp_pos)
-        ki_bf = cutlass.BFloat16(k_v * inv_pos)
-        kr_bf = cutlass.BFloat16(k_v * rest)
-        sQD[row, col + jj] = qd_bf
-        sKD[row, col + jj] = kd_bf
-        sKI[row, col + jj] = ki_bf
-        sKR[row, col + jj] = kr_bf
+        r_qd[0, jj] = cutlass.BFloat16(q_v * exp_pos * cutlass.Float32(scale))
+        r_kd[0, jj] = cutlass.BFloat16(k_v * exp_pos)
+        r_ki[0, jj] = cutlass.BFloat16(k_v * inv_pos)
+        r_kr[0, jj] = cutlass.BFloat16(k_v * rest)
+
+    cute.autovec_copy(r_qd, sQD_my)
+    cute.autovec_copy(r_kd, sKD_my)
+    cute.autovec_copy(r_ki, sKI_my)
+    cute.autovec_copy(r_kr, sKR_my)
 
     if tidx < 128:
         gt_base = (head_idx * total_tiles + tile_idx) * D
@@ -1569,13 +1594,7 @@ def run_k1_full(
     # qk bf16 (sKI) + sGcs (fp32 unpadded qk) + sGtot (fp32, D) + 5 cc fp32
     # + mbar.
     smem_bytes = (
-        6 * (CHUNK * D * 2)
-        + (CHUNK * (D + KI_PAD) * 2)
-        + (CHUNK * D * 4)
-        + (D * 4)
-        + 5 * (CHUNK * CHUNK * 4)
-        + 8
-        + 512
+        6 * (CHUNK * D * 2) + (CHUNK * (D + KI_PAD) * 2) + (CHUNK * D * 4) + (D * 4) + 5 * (CHUNK * CHUNK * 4) + 8 + 512
     )
 
     k1_full_kernel(
