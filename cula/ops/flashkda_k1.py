@@ -42,8 +42,10 @@ import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack
+
+from cula.ops.flashkda_prefill import add_f16x2_u32, movm_t_b16
 
 # ---------------------------------------------------------------------------
 # Constants — must match cula.ops.flashkda_prefill
@@ -1306,9 +1308,12 @@ def k1_full_kernel(
     sKR = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sL = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
     sMqk = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
-    sINV = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
-    sLp = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
-    sTmp = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
+    # Neumann TC inputs (single-warp register-resident matmul à la cpp
+    # neumann_inv_fused_1warp). Outputs stored in sINV_bf16 via STSM_N for
+    # the per-thread workspace dump pattern below.
+    sL_fp16 = smem.allocate_tensor(cutlass.Float16, cc_layout, 128)
+    sINV_fp16 = smem.allocate_tensor(cutlass.Float16, cc_layout, 128)
+    sINV_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     sMbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((1,)), 8)
     sMbar_ptr = sMbar.iterator
 
@@ -1500,32 +1505,134 @@ def k1_full_kernel(
         sMqk[i, j2] = cutlass.Float32(0.0)
     cute.arch.barrier()
 
-    # Neumann inverse
-    inv_v = cutlass.Float32(1.0 if i == j2 else 0.0) - sL[i, j2]
-    sINV[i, j2] = inv_v
-    sLp[i, j2] = sL[i, j2]
+    # Neumann inverse — single-warp register-resident TC version
+    # (mirrors cpp utils.cuh::neumann_inv_fused_1warp).
+    # Step 1: cast sL fp32 → sL_fp16 SMEM and init sINV_fp16 = (I - L) in
+    # fp16 SMEM. Each of the 256 threads handles exactly one (i, j2) elem.
+    sL_fp16[i, j2] = cutlass.Float16(sL[i, j2])
+    inv_init = cutlass.Float32(1.0 if i == j2 else 0.0) - sL[i, j2]
+    sINV_fp16[i, j2] = cutlass.Float16(inv_init)
     cute.arch.barrier()
 
-    for _p in cutlass.range_constexpr(3):
-        s = cutlass.Float32(0.0)
-        for kk in cutlass.range_constexpr(CHUNK):
-            s = s + sLp[i, kk] * sLp[kk, j2]
-        # No barrier needed before writing sTmp[i,j2]: each thread writes
-        # its own private slot and no other thread reads sTmp until after
-        # the next barrier below.
-        sTmp[i, j2] = s
-        cute.arch.barrier()
-        s2 = cutlass.Float32(0.0)
-        for kk in cutlass.range_constexpr(CHUNK):
-            s2 = s2 + sINV[i, kk] * sTmp[kk, j2]
-        cute.arch.barrier()
-        sINV[i, j2] = sINV[i, j2] + s2
-        sLp[i, j2] = sTmp[i, j2]
-        cute.arch.barrier()
+    # Step 2: warp 0 runs the 6-MMA + 4-MOVM_T + 3-packed-add Neumann.
+    # Other warps wait at the barrier below.
+    if warp_idx == 0:
+        mma_atom_neu = warp.MmaF16BF16Op(cutlass.Float16, cutlass.Float16, (16, 8, 16))
+        tiled_mma_neu = cute.make_tiled_mma(
+            mma_atom_neu,
+            atom_layout_mnk=(1, 1, 1),
+            permutation_mnk=(16, 16, 16),
+        )
+        thr_mma_neu = tiled_mma_neu.get_slice(tidx)
+
+        copy_atom_A_neu = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            cutlass.Float16,
+        )
+        smem_tiled_copy_A_neu = cute.make_tiled_copy_A(copy_atom_A_neu, tiled_mma_neu)
+        smem_thr_copy_A_neu = smem_tiled_copy_A_neu.get_slice(tidx)
+
+        # Load L into A-frag (fp16) — used for both L²=L·L^T and the initial
+        # MOVM_T → B-frag.
+        tCrL = thr_mma_neu.make_fragment_A(thr_mma_neu.partition_A(sL_fp16))
+        tCrL_cv = smem_thr_copy_A_neu.retile(tCrL)
+        cute.copy(smem_tiled_copy_A_neu, smem_thr_copy_A_neu.partition_S(sL_fp16), tCrL_cv)
+
+        # Load INV0 = I - L into A-frag (fp16). INV is updated in-place via
+        # the fp16-acc m16n8k16 layout coincidence (A-frag and C-frag share
+        # the same per-thread u32 layout for a 16x16 square tile).
+        tCrInv = thr_mma_neu.make_fragment_A(thr_mma_neu.partition_A(sINV_fp16))
+        tCrInv_cv = smem_thr_copy_A_neu.retile(tCrInv)
+        cute.copy(smem_tiled_copy_A_neu, smem_thr_copy_A_neu.partition_S(sINV_fp16), tCrInv_cv)
+
+        # B-frag scratch (16, 16) — reused across MMAs for L^pow^T transpose.
+        tCrLpowB = thr_mma_neu.make_fragment_B(thr_mma_neu.partition_B(sL_fp16))
+        # C-frag accumulators (fp16). For m16n8k16 fp16-acc on 16x16 SQUARE
+        # tile, C-frag and A-frag share the same per-thread u32 layout.
+        tCrLpow = thr_mma_neu.make_fragment_C(tiled_mma_neu.partition_shape_C((CHUNK, CHUNK)))
+        tCrDelta = thr_mma_neu.make_fragment_C(tiled_mma_neu.partition_shape_C((CHUNK, CHUNK)))
+        # A-frag scratch for "L^pow as A operand" steps (L⁴=L²·L²^T, L⁸=L⁴·L⁴^T).
+        tCrLpowA = thr_mma_neu.make_fragment_A(thr_mma_neu.partition_A(sL_fp16))
+
+        # u32 views for MOVM_T and packed h2 add.
+        tCrL_u32 = cute.recast_tensor(tCrL, dtype=cutlass.Int32)
+        tCrInv_u32 = cute.recast_tensor(tCrInv, dtype=cutlass.Int32)
+        tCrLpowB_u32 = cute.recast_tensor(tCrLpowB, dtype=cutlass.Int32)
+        tCrLpow_u32 = cute.recast_tensor(tCrLpow, dtype=cutlass.Int32)
+        tCrDelta_u32 = cute.recast_tensor(tCrDelta, dtype=cutlass.Int32)
+        tCrLpowA_u32 = cute.recast_tensor(tCrLpowA, dtype=cutlass.Int32)
+
+        N_REGS_U32: cutlass.Constexpr[int] = 4  # 8 fp16 / thread = 4 u32
+
+        # ---- L² = L · L^T ----
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrLpowB_u32[ii] = movm_t_b16(cutlass.Int32(tCrL_u32[ii]))
+        tCrLpow.fill(0.0)
+        cute.gemm(tiled_mma_neu, tCrLpow, tCrL, tCrLpowB, tCrLpow)
+
+        # ---- INV += INV · L²^T ----
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrLpowB_u32[ii] = movm_t_b16(cutlass.Int32(tCrLpow_u32[ii]))
+        tCrDelta.fill(0.0)
+        cute.gemm(tiled_mma_neu, tCrDelta, tCrInv, tCrLpowB, tCrDelta)
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrInv_u32[ii] = add_f16x2_u32(cutlass.Int32(tCrInv_u32[ii]), cutlass.Int32(tCrDelta_u32[ii]))
+
+        # ---- L⁴ = L² · L²^T (B reused: still MOVM_T(L²)) ----
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrLpowA_u32[ii] = tCrLpow_u32[ii]
+        tCrLpow.fill(0.0)
+        cute.gemm(tiled_mma_neu, tCrLpow, tCrLpowA, tCrLpowB, tCrLpow)
+
+        # ---- INV += INV · L⁴^T ----
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrLpowB_u32[ii] = movm_t_b16(cutlass.Int32(tCrLpow_u32[ii]))
+        tCrDelta.fill(0.0)
+        cute.gemm(tiled_mma_neu, tCrDelta, tCrInv, tCrLpowB, tCrDelta)
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrInv_u32[ii] = add_f16x2_u32(cutlass.Int32(tCrInv_u32[ii]), cutlass.Int32(tCrDelta_u32[ii]))
+
+        # ---- L⁸ = L⁴ · L⁴^T (B reused: still MOVM_T(L⁴)) ----
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrLpowA_u32[ii] = tCrLpow_u32[ii]
+        tCrLpow.fill(0.0)
+        cute.gemm(tiled_mma_neu, tCrLpow, tCrLpowA, tCrLpowB, tCrLpow)
+
+        # ---- INV += INV · L⁸^T ----
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrLpowB_u32[ii] = movm_t_b16(cutlass.Int32(tCrLpow_u32[ii]))
+        tCrDelta.fill(0.0)
+        cute.gemm(tiled_mma_neu, tCrDelta, tCrInv, tCrLpowB, tCrDelta)
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrInv_u32[ii] = add_f16x2_u32(cutlass.Int32(tCrInv_u32[ii]), cutlass.Int32(tCrDelta_u32[ii]))
+
+        # Step 3: cast fp16 → bf16 in C-frag layout, STSM_N to sINV_bf16.
+        # The A-frag→C-frag u32 copy relies on the same fp16-acc 16x16 layout
+        # coincidence used for the += accumulator above.
+        tCrInvC = thr_mma_neu.make_fragment_C(tiled_mma_neu.partition_shape_C((CHUNK, CHUNK)))
+        tCrInvC_u32 = cute.recast_tensor(tCrInvC, dtype=cutlass.Int32)
+        for ii in cutlass.range_constexpr(N_REGS_U32):
+            tCrInvC_u32[ii] = tCrInv_u32[ii]
+        tCrInvC_bf16 = cute.make_fragment_like(tCrInvC, cutlass.BFloat16)
+        for ii in cutlass.range_constexpr(cute.size(tCrInvC)):
+            tCrInvC_bf16[ii] = cutlass.BFloat16(cutlass.Float32(tCrInvC[ii]))
+
+        copy_atom_stsm = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2),
+            cutlass.BFloat16,
+        )
+        smem_tiled_store_C = cute.make_tiled_copy_C_atom(copy_atom_stsm, tiled_mma_neu)
+        smem_thr_store_C = smem_tiled_store_C.get_slice(tidx)
+        cute.copy(
+            smem_tiled_store_C,
+            smem_thr_store_C.retile(tCrInvC_bf16),
+            smem_thr_store_C.partition_D(sINV_bf16),
+        )
+    cute.arch.barrier()
 
     # Dump INV, Mqk
     ws_base_cc = (head_idx * total_tiles + tile_idx) * (CHUNK * CHUNK)
-    ws_inv[ws_base_cc + i * CHUNK + j2] = cutlass.BFloat16(sINV[i, j2])
+    ws_inv[ws_base_cc + i * CHUNK + j2] = sINV_bf16[i, j2]
     ws_mqk[ws_base_cc + i * CHUNK + j2] = cutlass.BFloat16(sMqk[i, j2])
 
     # Wait for the TMA bulk stores (ws_qd / ws_kd / ws_kr) issued earlier to
@@ -1591,10 +1698,17 @@ def run_k1_full(
     tma_atom_ws_kr, tma_tensor_ws_kr = make_ws_store_atom(ws_kr)
 
     # SMEM byte budget: 6 unpadded qk bf16 (sQ/sK/sGbf/sQD/sKD/sKR) + 1 padded
-    # qk bf16 (sKI) + sGcs (fp32 unpadded qk) + sGtot (fp32, D) + 5 cc fp32
-    # + mbar.
+    # qk bf16 (sKI) + sGcs (fp32 unpadded qk) + sGtot (fp32, D) + 2 cc fp32
+    # (sL/sMqk) + 2 cc fp16 (sL_fp16/sINV_fp16) + 1 cc bf16 (sINV_bf16) + mbar.
     smem_bytes = (
-        6 * (CHUNK * D * 2) + (CHUNK * (D + KI_PAD) * 2) + (CHUNK * D * 4) + (D * 4) + 5 * (CHUNK * CHUNK * 4) + 8 + 512
+        6 * (CHUNK * D * 2)
+        + (CHUNK * (D + KI_PAD) * 2)
+        + (CHUNK * D * 4)
+        + (D * 4)
+        + 2 * (CHUNK * CHUNK * 4)
+        + 3 * (CHUNK * CHUNK * 2)
+        + 8
+        + 512
     )
 
     k1_full_kernel(

@@ -104,6 +104,33 @@ def movm_t_b16(src_u32: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(result)
 
 
+@cutlass.dsl_user_op
+def add_f16x2_u32(a_u32: Int32, b_u32: Int32, *, loc=None, ip=None) -> Int32:
+    """Packed ``add.f16x2`` — adds two pairs of fp16 packed in u32.
+
+    Used by the K1 Neumann register-resident accumulator path: when both
+    A-frag (current INV) and C-frag (delta from MMA) hold fp16 values with
+    the same per-thread u32 layout (a coincidence of m16n8k16 fp16-acc on a
+    16x16 square tile), this PTX folds the +=update into a single 2-way
+    SIMD packed add per u32 register.
+    """
+    result = _llvm.inline_asm(
+        _T.i32(),
+        [
+            Int32(a_u32).ir_value(loc=loc, ip=ip),
+            Int32(b_u32).ir_value(loc=loc, ip=ip),
+        ],
+        "add.f16x2 $0, $1, $2;",
+        "=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
 @cute.jit
 def sigmoid_fast(x: Float32) -> Float32:
     """``sigmoid(x)`` via ``tanh.approx.f32`` (single PTX instruction)."""
