@@ -43,6 +43,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import from_dlpack
 
 from cula.ops.flashkda_prefill import add_f16x2_u32, movm_t_b16
@@ -1288,31 +1289,44 @@ def k1_full_kernel(
 
     smem = cutlass.utils.SmemAllocator()
     qk_layout = cute.make_layout((CHUNK, D), stride=(D, 1))
-    # Padded variant of (CHUNK, D) bf16 — used only for sKI to break the
-    # SMEM bank conflict pattern in the L/Mqk scalar dot loop
-    # (sKI[j2, kk] with j2 varying across threads = 16-way row-strided
-    # access). Padding row stride from D=128 to D+8=136 lands consecutive
-    # rows on different banks. sQD/sKD/sKR cannot be padded because they
-    # are TMA-bulk-stored and TMA requires non-padded power-of-2 strides.
-    KI_PAD: cutlass.Constexpr[int] = 8
-    qk_layout_pad = cute.make_layout((CHUNK, D), stride=(D + KI_PAD, 1))
+    # K_INTER swizzled (CHUNK, D) bf16 layout — matches cpp MMALayout
+    # (tile_to_shape(GMMA::Layout_K_INTER_Atom<bf16>, ...)). Used for the
+    # decay_apply OUTPUTS (sQD/sKD/sKI/sKR) which are consumed by the
+    # L/Mqk/Neumann LDSM-driven MMAs as well as TMA-bulk-stored. The cpp
+    # writer pattern (diagonal row offset) makes K_INTER conflict-free.
+    kinter_atom_qk = make_smem_layout_atom(SmemLayoutAtomKind.K_INTER, cutlass.BFloat16)
+    kinter_qk_layout = cute.tile_to_shape(kinter_atom_qk, (CHUNK, D), order=(0, 1))
     cc_layout = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
+    # ----- INPUT-PHASE buffers (live during TMA load → L2 norm → cumsum →
+    # decay_apply Phase A reads). The 3 bf16 inputs sQ/sK/sGbf are aliased
+    # by the OUTPUT-PHASE buffers sQD/sKD/sKR via union (cpp SharedStorageK1
+    # union pattern — saves 12 KB SMEM, lifts occupancy from 5→8 CTA/SM).
     sQ = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sK = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sGbf = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sGcs = smem.allocate_tensor(cutlass.Float32, qk_layout, 128)
     sGtot = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 128)
-    sQD = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
-    sKD = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
-    sKI = smem.allocate_tensor(cutlass.BFloat16, qk_layout_pad, 128)
-    sKR = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    # sKI: K_INTER swizzled; consumed by both LDSM (MMA) and the diagonal
+    # writer below. No ±8 padding needed — swizzle takes care of conflicts.
+    sKI = smem.allocate_tensor(cutlass.BFloat16, kinter_qk_layout, 128)
+    sKR = smem.allocate_tensor(cutlass.BFloat16, kinter_qk_layout, 128)
+    # ----- OUTPUT-PHASE aliases over INPUT-PHASE bytes (cpp union).
+    # The barrier between Phase A (reads sQ/sK/sGbf into regs) and Phase B
+    # (writes sQD/sKD/sKR) makes this safe: by the time any thread writes
+    # through sQD, every thread has finished reading the same SMEM bytes
+    # through sQ.
+    sQD = cute.make_tensor(sQ.iterator, kinter_qk_layout)
+    sKD = cute.make_tensor(sK.iterator, kinter_qk_layout)
+    # NOTE: sGbf has no further consumer after decay_apply Phase A reads;
+    # we alias it as a 4th K_INTER swizzled output. (cpp aliases differently
+    # but the saving is the same.)
     # cpp-faithful L/Mqk outputs as TWO independent (CHUNK, CHUNK) bf16 tiles
     # (was a single stacked (2*CHUNK, CHUNK) sLMqk_bf16). Splitting unlocks
     # the cpp baseline pattern: two parallel single-warp MMAs
     #   Warp0: sL_bf16   = (sKD @ sKI^T) * mask(mr>n) * sigmoid(beta)
     #   Warp1: sMqk_bf16 = (sQD @ sKI^T) * mask(m>=n)
-    # Same total SMEM (2 * 16*16*2 = 1024B = stacked 32*16*2). No swizzle in
-    # this phase — that comes in Phase 4.
+    # (CHUNK, CHUNK)=(16,16) is too small for K_INTER atom (which is (8,64))
+    # so these stay plain — but they're only 1 KB total, not perf-critical.
     sL_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     sMqk_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     # Per-row sigmoid(beta) prefetched once per CTA for branch-free mask fold.
@@ -1396,7 +1410,6 @@ def k1_full_kernel(
 
     # L2 normalize
     row = tidx // 16
-    col = (tidx % 16) * 8
     # Vectorized 128-bit (8 bf16) load via cute.autovec_copy. Replaces a
     # scalar 8-iter loop that compiled to 8 separate LDS.U16 per thread and
     # produced ~74% bank-conflict rate on the SMEM load wavefronts (NCU).
@@ -1465,54 +1478,63 @@ def k1_full_kernel(
 
     # decay_apply: into SMEM (sQD, sKD, sKI, sKR); ws_qd/ws_kd/ws_kr will be
     # bulk-stored via TMA at the end of the kernel.
-    # Phase C: vectorized 128-bit (8 bf16) reads (sQ/sK) + writes
-    # (sQD/sKD/sKI/sKR) via cute.autovec_copy. The scalar 8-iter read loop on
-    # sQ/sK previously emitted 8 LDS.U16 per thread (74% bank-conflict rate);
-    # vectorizing collapses to one LDS.128. Write side already vectorized.
-    # Per-thread mapping: row=tidx/16, cb=tidx%16, col_base=cb*8.
+    # ----- DIRECT TRANSLATION of fwd_kernel1.cuh:341-465 (decay_apply) -----
+    # 256 threads = 8 warps × 32 lanes. lane = tidx%32, warp = tidx//32.
+    # g = lane // 4 (8 groups), t = lane % 4 (4 stripes within group).
+    # Each thread handles 2 bf16 per (m_blk, n_blk) tile, 4 tiles total
+    # (N_TILES = (CHUNK/8) * (D/64) = 2 * 2 = 4). The diagonal row offset
+    # row = m_blk + ((warp + g) % 8) is what makes K_INTER swizzle (used by
+    # sQD/sKD/sKI/sKR) bank-conflict-free on the writes, AND on the reads
+    # of sQ/sK/sGbf/sGcs/sGtot (whose layouts are plain — but the per-thread
+    # access pattern is identical, so the read side is also coalesced and
+    # not bank-conflicted by sheer luck of (8 warps × 8 g-groups × 4 lanes)
+    # mapping to 8 rows × 16 banks).
+    lane_d = tidx % 32
+    warp_d = tidx // 32
+    g_d = lane_d // 4
+    t_d = lane_d % 4
+    N_M: cutlass.Constexpr[int] = CHUNK // 8  # = 2
+    N_N: cutlass.Constexpr[int] = D // 64  # = 2
+    N_TILES: cutlass.Constexpr[int] = N_M * N_N  # = 4
 
-    # Per-(row, col_block) (1, 8) tile views over each dest tensor.
-    # NOTE: sQ_tile/sK_tile + sQ_my/sK_my + cb already defined in L2 phase
-    # above (we reuse them here for the read).
-    sQD_tile = cute.flat_divide(sQD, (1, 8))  # ((1,8), CHUNK, D//8)
-    sKD_tile = cute.flat_divide(sKD, (1, 8))
-    sKI_tile = cute.flat_divide(sKI, (1, 8))  # padded layout still divisible
-    sKR_tile = cute.flat_divide(sKR, (1, 8))
+    # Phase A: load g/q/k/g_total into per-thread regs.
+    reg_g_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.Float32)
+    reg_q_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
+    reg_k_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
+    reg_gt_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.Float32)
+    for m_blk in cutlass.range_constexpr(0, CHUNK, 8):
+        for n_blk in cutlass.range_constexpr(0, D, 64):
+            tile_idx_d: cutlass.Constexpr[int] = (m_blk // 8) * N_N + (n_blk // 64)
+            row_d = m_blk + ((warp_d + g_d) % 8)
+            col_d = n_blk + g_d * 8 + t_d * 2
+            for v in cutlass.range_constexpr(2):
+                vv: cutlass.Constexpr[int] = v
+                reg_g_da[tile_idx_d, vv] = sGcs[row_d, col_d + vv]
+                reg_q_da[tile_idx_d, vv] = sQ[row_d, col_d + vv]
+                reg_k_da[tile_idx_d, vv] = sK[row_d, col_d + vv]
+                reg_gt_da[tile_idx_d, vv] = sGtot[col_d + vv]
 
-    sQD_my = sQD_tile[(None, None, row, cb)]
-    sKD_my = sKD_tile[(None, None, row, cb)]
-    sKI_my = sKI_tile[(None, None, row, cb)]
-    sKR_my = sKR_tile[(None, None, row, cb)]
+    # Sync before writing to union'd SMEM (sQ→sQD, sK→sKD, sGbf→sKR alias).
+    cute.arch.barrier()
 
-    # Vectorized read of sQ/sK into registers (1 LDS.128 per thread).
-    r_q_in = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
-    r_k_in = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
-    cute.autovec_copy(sQ_my, r_q_in)
-    cute.autovec_copy(sK_my, r_k_in)
-
-    r_qd = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
-    r_kd = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
-    r_ki = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
-    r_kr = cute.make_rmem_tensor(cute.make_layout((1, 8)), cutlass.BFloat16)
-
-    for j in cutlass.range_constexpr(8):
-        jj: cutlass.Constexpr[int] = j
-        g_cs = sGcs[row, col + jj]
-        gt = sGtot[col + jj]
-        exp_pos = cute.exp(g_cs, fastmath=True)
-        inv_pos = cutlass.Float32(1.0) / exp_pos
-        rest = gt * inv_pos
-        q_v = cutlass.Float32(r_q_in[0, jj])
-        k_v = cutlass.Float32(r_k_in[0, jj])
-        r_qd[0, jj] = cutlass.BFloat16(q_v * exp_pos * cutlass.Float32(scale))
-        r_kd[0, jj] = cutlass.BFloat16(k_v * exp_pos)
-        r_ki[0, jj] = cutlass.BFloat16(k_v * inv_pos)
-        r_kr[0, jj] = cutlass.BFloat16(k_v * rest)
-
-    cute.autovec_copy(r_qd, sQD_my)
-    cute.autovec_copy(r_kd, sKD_my)
-    cute.autovec_copy(r_ki, sKI_my)
-    cute.autovec_copy(r_kr, sKR_my)
+    # Phase B: compute and store via swizzled sQD/sKD/sKI/sKR.
+    for m_blk in cutlass.range_constexpr(0, CHUNK, 8):
+        for n_blk in cutlass.range_constexpr(0, D, 64):
+            tile_idx_d: cutlass.Constexpr[int] = (m_blk // 8) * N_N + (n_blk // 64)
+            row_d = m_blk + ((warp_d + g_d) % 8)
+            col_d = n_blk + g_d * 8 + t_d * 2
+            for v in cutlass.range_constexpr(2):
+                vv: cutlass.Constexpr[int] = v
+                gv = reg_g_da[tile_idx_d, vv]
+                qv = cutlass.Float32(reg_q_da[tile_idx_d, vv])
+                kv = cutlass.Float32(reg_k_da[tile_idx_d, vv])
+                gtv = reg_gt_da[tile_idx_d, vv]
+                exp_pos = cute.exp(gv, fastmath=True)
+                inv_pos = cutlass.Float32(1.0) / exp_pos
+                sQD[row_d, col_d + vv] = cutlass.BFloat16(qv * exp_pos * cutlass.Float32(scale))
+                sKD[row_d, col_d + vv] = cutlass.BFloat16(kv * exp_pos)
+                sKI[row_d, col_d + vv] = cutlass.BFloat16(kv * inv_pos)
+                sKR[row_d, col_d + vv] = cutlass.BFloat16(kv * gtv * inv_pos)
 
     if tidx < 128:
         gt_base = (head_idx * total_tiles + tile_idx) * D
@@ -1804,7 +1826,11 @@ def run_k1_full(
     stream: cuda_drv.CUstream,
 ):
     smem_layout_qk = cute.make_layout((CHUNK, D), stride=(D, 1))
-    KI_PAD = 8
+    # K_INTER swizzled (CHUNK, D) bf16 layout for ws_qd/ws_kd/ws_kr TMA
+    # bulk stores. Must MATCH the kernel-side sQD/sKD/sKR layout (the one
+    # written by decay_apply Phase B), otherwise TMA reads garbage.
+    kinter_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_INTER, cutlass.BFloat16)
+    smem_layout_qk_kinter = cute.tile_to_shape(kinter_atom, (CHUNK, D), order=(0, 1))
 
     def make_atom(t):
         view = cute.make_tensor(
@@ -1826,7 +1852,7 @@ def run_k1_full(
         return cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
             view,
-            smem_layout_qk,
+            smem_layout_qk_kinter,
             (CHUNK, D),
         )
 
@@ -1837,21 +1863,19 @@ def run_k1_full(
     tma_atom_ws_kd, tma_tensor_ws_kd = make_ws_store_atom(ws_kd)
     tma_atom_ws_kr, tma_tensor_ws_kr = make_ws_store_atom(ws_kr)
 
-    # SMEM byte budget: 6 unpadded qk bf16 (sQ/sK/sGbf/sQD/sKD/sKR) + 1 padded
-    # qk bf16 (sKI) + sGcs (fp32 unpadded qk) + sGtot (fp32, D)
-    # + sL_bf16 + sMqk_bf16 (each CHUNK*CHUNK bf16) + sBetaSig (CHUNK,) fp32
-    # + 2 cc fp16 (sL_fp16/sINV_fp16) + 1 cc bf16 (sINV_bf16) + mbar.
-    smem_bytes = (
-        6 * (CHUNK * D * 2)
-        + (CHUNK * (D + KI_PAD) * 2)
-        + (CHUNK * D * 4)
-        + (D * 4)
-        + (2 * CHUNK * CHUNK * 2)
-        + (CHUNK * 4)
-        + 3 * (CHUNK * CHUNK * 2)
-        + 8
-        + 512
-    )
+    # SMEM byte budget after cpp-faithful union:
+    #   3 plain qk bf16  (sQ/sK/sGbf — UNION'd with sQD/sKD/sKR), 0 extra
+    #   2 swizzled qk bf16 (sKI/sKR; sKR aliases sGbf via cute.make_tensor)
+    #   sGcs (fp32 unpadded qk) + sGtot (fp32, D)
+    #   sL_bf16 + sMqk_bf16 (each CHUNK*CHUNK bf16)
+    #   sBetaSig (CHUNK,) fp32
+    #   2 cc fp16 (sL_fp16/sINV_fp16) + 1 cc bf16 (sINV_bf16) + mbar
+    #   + per-allocation 128B alignment padding from the bump allocator
+    # Empirically the kernel-side allocator needs 31880 bytes (vs 28232 of
+    # the naive sum) — give a small extra slack for safety. 32 KB still
+    # leaves room for 7 CTAs/SM on sm_100a (228 KB SMEM / SM), vs the
+    # Phase 1 baseline 41.8 KB which capped at 5 CTAs/SM.
+    smem_bytes = 32 * 1024
 
     k1_full_kernel(
         tma_atom_q,
@@ -1882,6 +1906,11 @@ def run_k1_full(
         block=[THREADS_PER_CTA, 1, 1],
         smem=smem_bytes,
         stream=stream,
+        # cpp __launch_bounds__(256, 8): hint compiler to fit 8 CTAs/SM.
+        # With 256 thr that caps regs at 65536/(8*256)=32 reg/thr. Combined
+        # with SMEM union (~28 KB/CTA → 8×28=224 KB ≤ 228 KB SM cap) this
+        # is what gets us to ~96% achieved occupancy like cpp.
+        min_blocks_per_mp=8,
     )
 
 
