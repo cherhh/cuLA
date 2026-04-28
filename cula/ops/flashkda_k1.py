@@ -1272,6 +1272,10 @@ def k1_full_kernel(
     tma_tensor_ws_kd: cute.Tensor,
     tma_atom_ws_kr: cute.CopyAtom,
     tma_tensor_ws_kr: cute.Tensor,
+    tma_atom_ws_inv: cute.CopyAtom,
+    tma_tensor_ws_inv: cute.Tensor,
+    tma_atom_ws_mqk: cute.CopyAtom,
+    tma_tensor_ws_mqk: cute.Tensor,
     a_log: cute.Tensor,
     dt_bias: cute.Tensor,
     beta: cute.Tensor,
@@ -1306,10 +1310,14 @@ def k1_full_kernel(
     sGbf = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sGcs = smem.allocate_tensor(cutlass.Float32, qk_layout, 128)
     sGtot = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 128)
-    # sKI: K_INTER swizzled; consumed by both LDSM (MMA) and the diagonal
-    # writer below. No ±8 padding needed — swizzle takes care of conflicts.
-    sKI = smem.allocate_tensor(cutlass.BFloat16, kinter_qk_layout, 128)
-    sKR = smem.allocate_tensor(cutlass.BFloat16, kinter_qk_layout, 128)
+    # sKI: K_INTER swizzled; aliased over the FIRST 4 KB of sGcs's 8 KB
+    # region. sGcs is dead after Phase A barrier (Phase A reads sGcs but
+    # writes nothing else through it). sKI is first written in Phase B
+    # (after the Phase A barrier) → lifetimes don't overlap. Saves 4 KB.
+    sKI = cute.make_tensor(
+        cute.recast_ptr(sGcs.iterator, dtype=cutlass.BFloat16),
+        kinter_qk_layout,
+    )
     # ----- OUTPUT-PHASE aliases over INPUT-PHASE bytes (cpp union).
     # The barrier between Phase A (reads sQ/sK/sGbf into regs) and Phase B
     # (writes sQD/sKD/sKR) makes this safe: by the time any thread writes
@@ -1317,9 +1325,10 @@ def k1_full_kernel(
     # through sQ.
     sQD = cute.make_tensor(sQ.iterator, kinter_qk_layout)
     sKD = cute.make_tensor(sK.iterator, kinter_qk_layout)
-    # NOTE: sGbf has no further consumer after decay_apply Phase A reads;
-    # we alias it as a 4th K_INTER swizzled output. (cpp aliases differently
-    # but the saving is the same.)
+    # sKR aliases sGbf: sGbf is dead after the cumsum loop (Phase A reads
+    # only sGcs, not sGbf). Saves another 4 KB SMEM (mirrors cpp
+    # g_bf16 / k_restored union). Lifts occupancy further.
+    sKR = cute.make_tensor(sGbf.iterator, kinter_qk_layout)
     # cpp-faithful L/Mqk outputs as TWO independent (CHUNK, CHUNK) bf16 tiles
     # (was a single stacked (2*CHUNK, CHUNK) sLMqk_bf16). Splitting unlocks
     # the cpp baseline pattern: two parallel single-warp MMAs
@@ -1334,9 +1343,22 @@ def k1_full_kernel(
     # Neumann TC inputs (single-warp register-resident matmul à la cpp
     # neumann_inv_fused_1warp). Outputs stored in sINV_bf16 via STSM_N for
     # the per-thread workspace dump pattern below.
-    sL_fp16 = smem.allocate_tensor(cutlass.Float16, cc_layout, 128)
-    sINV_fp16 = smem.allocate_tensor(cutlass.Float16, cc_layout, 128)
-    sINV_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
+    # ALIAS over sGcs (8 KB fp32 dead after Phase A barrier). The 3 (16,16)
+    # buffers (sL_fp16 + sINV_fp16 + sINV_bf16 = 1.5 KB) all live in the
+    # MMA / Neumann phase which executes AFTER the decay_apply Phase A
+    # barrier, by which time sGcs's last reader (Phase A reg loads) is done.
+    # Saves 1.5 KB SMEM (could save more if we also alias sBetaSig but that
+    # one is written BEFORE decay_apply, so we leave it standalone).
+    # Pack 3 cc-shaped buffers contiguously (offsets in fp16 / bf16 elements
+    # over the same 8 KB physical region):
+    #   sL_fp16   @ fp16 offset 0
+    #   sINV_fp16 @ fp16 offset 256 (= CHUNK*CHUNK fp16 = 512 B)
+    #   sINV_bf16 @ bf16 offset 512 (= 2*CHUNK*CHUNK bf16 = 1024 B from base)
+    sGcs_fp16_ptr = cute.recast_ptr(sGcs.iterator, dtype=cutlass.Float16)
+    sGcs_bf16_ptr = cute.recast_ptr(sGcs.iterator, dtype=cutlass.BFloat16)
+    sL_fp16 = cute.make_tensor(sGcs_fp16_ptr, cc_layout)
+    sINV_fp16 = cute.make_tensor(sGcs_fp16_ptr + (CHUNK * CHUNK), cc_layout)
+    sINV_bf16 = cute.make_tensor(sGcs_bf16_ptr + (2 * CHUNK * CHUNK), cc_layout)
     sMbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((1,)), 8)
     sMbar_ptr = sMbar.iterator
 
@@ -1396,6 +1418,26 @@ def k1_full_kernel(
         cute.make_layout(1),
         cute.group_modes(sKR, 0, 2),
         cute.group_modes(gDst_kr, 0, 2),
+    )
+    # ws_inv / ws_mqk TMA bulk store partitioning. Source SMEM tiles are
+    # the (CHUNK, CHUNK)=(16,16) bf16 plain-layout tiles sINV_bf16 / sMqk_bf16
+    # (512 B each). Replaces the previous per-thread STG.U16 dump pattern
+    # (256 STG/CTA → 1 TMA bulk/CTA).
+    gDst_inv = cute.local_tile(tma_tensor_ws_inv, (CHUNK, CHUNK), (None, None, None))
+    tINVws_s, tINVws_g = cpasync.tma_partition(
+        tma_atom_ws_inv,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sINV_bf16, 0, 2),
+        cute.group_modes(gDst_inv, 0, 2),
+    )
+    gDst_mqk = cute.local_tile(tma_tensor_ws_mqk, (CHUNK, CHUNK), (None, None, None))
+    tMQKws_s, tMQKws_g = cpasync.tma_partition(
+        tma_atom_ws_mqk,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sMqk_bf16, 0, 2),
+        cute.group_modes(gDst_mqk, 0, 2),
     )
     ws_slot = head_idx * total_tiles + tile_idx
 
@@ -1497,27 +1539,47 @@ def k1_full_kernel(
     N_N: cutlass.Constexpr[int] = D // 64  # = 2
     N_TILES: cutlass.Constexpr[int] = N_M * N_N  # = 4
 
-    # Phase A: load g/q/k/g_total into per-thread regs.
+    # Phase A: load g/q/k/g_total into per-thread regs via packed (1,2)
+    # autovec_copy. sQ/sK/sGcs are (CHUNK, D) plain or K_INTER tiles, so
+    # 2 contiguous bf16 / fp32 reads collapse to 1 LDS.U32 / LDS.U64.
     reg_g_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.Float32)
     reg_q_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
     reg_k_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
     reg_gt_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.Float32)
+    sGcs_zipped = cute.zipped_divide(sGcs, (1, 2))
+    sQ_zipped = cute.zipped_divide(sQ, (1, 2))
+    sK_zipped = cute.zipped_divide(sK, (1, 2))
+    sGtot_zipped = cute.zipped_divide(sGtot, (2,))
     for m_blk in cutlass.range_constexpr(0, CHUNK, 8):
         for n_blk in cutlass.range_constexpr(0, D, 64):
             tile_idx_d: cutlass.Constexpr[int] = (m_blk // 8) * N_N + (n_blk // 64)
             row_d = m_blk + ((warp_d + g_d) % 8)
             col_d = n_blk + g_d * 8 + t_d * 2
-            for v in cutlass.range_constexpr(2):
-                vv: cutlass.Constexpr[int] = v
-                reg_g_da[tile_idx_d, vv] = sGcs[row_d, col_d + vv]
-                reg_q_da[tile_idx_d, vv] = sQ[row_d, col_d + vv]
-                reg_k_da[tile_idx_d, vv] = sK[row_d, col_d + vv]
-                reg_gt_da[tile_idx_d, vv] = sGtot[col_d + vv]
+            cute.autovec_copy(sGcs_zipped[None, (row_d, col_d // 2)], reg_g_da[tile_idx_d, None])
+            cute.autovec_copy(sQ_zipped[None, (row_d, col_d // 2)], reg_q_da[tile_idx_d, None])
+            cute.autovec_copy(sK_zipped[None, (row_d, col_d // 2)], reg_k_da[tile_idx_d, None])
+            cute.autovec_copy(sGtot_zipped[None, col_d // 2], reg_gt_da[tile_idx_d, None])
 
     # Sync before writing to union'd SMEM (sQ→sQD, sK→sKD, sGbf→sKR alias).
     cute.arch.barrier()
 
     # Phase B: compute and store via swizzled sQD/sKD/sKI/sKR.
+    # Build (2,) bf16 packed rmem fragments per (m_blk, n_blk) tile and
+    # autovec_copy into a (1,2) sub-tile of each dest. cute lowers this to
+    # a single STS.U32 (2 bf16 = 4 contiguous bytes), replacing the prior
+    # 2-stride scalar STS.U16 pair. Cuts SMEM-store inst count by ~2× for
+    # decay_apply and removes the 2.84× sst-bank-conflict pressure observed
+    # in the prior NCU report.
+    r_qd_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
+    r_kd_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
+    r_ki_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
+    r_kr_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
+    # zipped_divide gives a tensor of shape ((1,2), (CHUNK, D//2)) — outer
+    # mode is the static (1,2) sub-tile, inner is the per-thread coord.
+    sQD_zipped = cute.zipped_divide(sQD, (1, 2))
+    sKD_zipped = cute.zipped_divide(sKD, (1, 2))
+    sKI_zipped = cute.zipped_divide(sKI, (1, 2))
+    sKR_zipped = cute.zipped_divide(sKR, (1, 2))
     for m_blk in cutlass.range_constexpr(0, CHUNK, 8):
         for n_blk in cutlass.range_constexpr(0, D, 64):
             tile_idx_d: cutlass.Constexpr[int] = (m_blk // 8) * N_N + (n_blk // 64)
@@ -1531,10 +1593,14 @@ def k1_full_kernel(
                 gtv = reg_gt_da[tile_idx_d, vv]
                 exp_pos = cute.exp(gv, fastmath=True)
                 inv_pos = cutlass.Float32(1.0) / exp_pos
-                sQD[row_d, col_d + vv] = cutlass.BFloat16(qv * exp_pos * cutlass.Float32(scale))
-                sKD[row_d, col_d + vv] = cutlass.BFloat16(kv * exp_pos)
-                sKI[row_d, col_d + vv] = cutlass.BFloat16(kv * inv_pos)
-                sKR[row_d, col_d + vv] = cutlass.BFloat16(kv * gtv * inv_pos)
+                r_qd_pack[0, vv] = cutlass.BFloat16(qv * exp_pos * cutlass.Float32(scale))
+                r_kd_pack[0, vv] = cutlass.BFloat16(kv * exp_pos)
+                r_ki_pack[0, vv] = cutlass.BFloat16(kv * inv_pos)
+                r_kr_pack[0, vv] = cutlass.BFloat16(kv * gtv * inv_pos)
+            cute.autovec_copy(r_qd_pack, sQD_zipped[None, (row_d, col_d // 2)])
+            cute.autovec_copy(r_kd_pack, sKD_zipped[None, (row_d, col_d // 2)])
+            cute.autovec_copy(r_ki_pack, sKI_zipped[None, (row_d, col_d // 2)])
+            cute.autovec_copy(r_kr_pack, sKR_zipped[None, (row_d, col_d // 2)])
 
     if tidx < 128:
         gt_base = (head_idx * total_tiles + tile_idx) * D
@@ -1791,14 +1857,17 @@ def k1_full_kernel(
         )
     cute.arch.barrier()
 
-    # Dump INV, Mqk
-    ws_base_cc = (head_idx * total_tiles + tile_idx) * (CHUNK * CHUNK)
-    ws_inv[ws_base_cc + i * CHUNK + j2] = sINV_bf16[i, j2]
-    # sMqk_bf16 is the dedicated Phase-1 tile written by warp1 above.
-    ws_mqk[ws_base_cc + i * CHUNK + j2] = sMqk_bf16[i, j2]
+    # Dump INV, Mqk via TMA bulk store (replaces 2 × 256 STG.U16/CTA = 512
+    # global stores per CTA with 2 TMA bulk store ops issued by warp0).
+    if warp_idx == 0:
+        with cute.arch.elect_one():
+            cute.copy(tma_atom_ws_inv, tINVws_s[(None,)], tINVws_g[(None, 0, 0, ws_slot)])
+            cute.copy(tma_atom_ws_mqk, tMQKws_s[(None,)], tMQKws_g[(None, 0, 0, ws_slot)])
+            cute.arch.cp_async_bulk_commit_group()
 
-    # Wait for the TMA bulk stores (ws_qd / ws_kd / ws_kr) issued earlier to
-    # complete before kernel exit, so the next kernel (K2) sees the data.
+    # Wait for ALL prior TMA bulk stores (ws_qd / ws_kd / ws_kr issued earlier
+    # AND ws_inv / ws_mqk issued just above) before kernel exit, so the next
+    # kernel (K2) sees the data.
     if warp_idx == 0:
         with cute.arch.elect_one():
             cute.arch.cp_async_bulk_wait_group(0, read=False)
@@ -1856,26 +1925,51 @@ def run_k1_full(
             (CHUNK, D),
         )
 
+    # (CHUNK, CHUNK) bf16 plain layout for ws_inv / ws_mqk TMA bulk store.
+    # Source SMEM tiles sINV_bf16 / sMqk_bf16 are non-swizzled (CHUNK*CHUNK
+    # too small for K_INTER atom), and TMA bulk works fine with linear
+    # (16,16):(16,1) bf16 = 512 bytes per CTA.
+    smem_layout_cc = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
+
+    def make_ws_cc_store_atom(t):
+        view = cute.make_tensor(
+            t.iterator,
+            cute.make_layout(
+                (CHUNK, CHUNK, total_tiles * H),
+                stride=(CHUNK, 1, CHUNK * CHUNK),
+            ),
+        )
+        return cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            view,
+            smem_layout_cc,
+            (CHUNK, CHUNK),
+        )
+
     tma_atom_q, tma_tensor_q = make_atom(q)
     tma_atom_k, tma_tensor_k = make_atom(k)
     tma_atom_g, tma_tensor_g = make_atom(g)
     tma_atom_ws_qd, tma_tensor_ws_qd = make_ws_store_atom(ws_qd)
     tma_atom_ws_kd, tma_tensor_ws_kd = make_ws_store_atom(ws_kd)
     tma_atom_ws_kr, tma_tensor_ws_kr = make_ws_store_atom(ws_kr)
+    tma_atom_ws_inv, tma_tensor_ws_inv = make_ws_cc_store_atom(ws_inv)
+    tma_atom_ws_mqk, tma_tensor_ws_mqk = make_ws_cc_store_atom(ws_mqk)
 
     # SMEM byte budget after cpp-faithful union:
     #   3 plain qk bf16  (sQ/sK/sGbf — UNION'd with sQD/sKD/sKR), 0 extra
-    #   2 swizzled qk bf16 (sKI/sKR; sKR aliases sGbf via cute.make_tensor)
-    #   sGcs (fp32 unpadded qk) + sGtot (fp32, D)
-    #   sL_bf16 + sMqk_bf16 (each CHUNK*CHUNK bf16)
-    #   sBetaSig (CHUNK,) fp32
-    #   2 cc fp16 (sL_fp16/sINV_fp16) + 1 cc bf16 (sINV_bf16) + mbar
+    #   sKI K_INTER swizzled (4 KB)
+    #   sKR aliases sGbf (free)
+    #   sGcs (fp32 qk = 8 KB) — has Neumann/MMA buffers (sL_fp16/sINV_fp16/
+    #     sINV_bf16, ~1.5 KB) ALIASED into it via cute.make_tensor
+    #   sGtot (fp32, D = 0.5 KB)
+    #   sL_bf16 + sMqk_bf16 (each CHUNK*CHUNK bf16 = 0.5 KB each)
+    #   sBetaSig (CHUNK fp32 = 64 B)
+    #   sMbar (8 B)
     #   + per-allocation 128B alignment padding from the bump allocator
-    # Empirically the kernel-side allocator needs 31880 bytes (vs 28232 of
-    # the naive sum) — give a small extra slack for safety. 32 KB still
-    # leaves room for 7 CTAs/SM on sm_100a (228 KB SMEM / SM), vs the
-    # Phase 1 baseline 41.8 KB which capped at 5 CTAs/SM.
-    smem_bytes = 32 * 1024
+    # After all unions allocator needs ~ 22 KB. Round up to 24 KB for safety.
+    # 24 KB → ~9 CTA/SM on sm_100a (228 KB SMEM / SM); cpp uses 21 KB at
+    # 8 CTA/SM (97% occ). This brings cute occupancy parity with cpp.
+    smem_bytes = 24 * 1024
 
     k1_full_kernel(
         tma_atom_q,
@@ -1890,6 +1984,10 @@ def run_k1_full(
         tma_tensor_ws_kd,
         tma_atom_ws_kr,
         tma_tensor_ws_kr,
+        tma_atom_ws_inv,
+        tma_tensor_ws_inv,
+        tma_atom_ws_mqk,
+        tma_tensor_ws_mqk,
         a_log,
         dt_bias,
         beta,
@@ -1969,6 +2067,7 @@ def launch_k1_full(
             scale=scale,
             gate_scale=gate_scale,
             stream=stream,
+            options="--opt-level=3",
         )
 
     stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
