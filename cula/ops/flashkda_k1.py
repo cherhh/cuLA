@@ -1428,7 +1428,12 @@ def k1_full_kernel(
         r_k_bf[0, j] = cutlass.BFloat16(k_vals[j] * k_inv)
     cute.autovec_copy(r_q_bf, sQ_my)
     cute.autovec_copy(r_k_bf, sK_my)
-    cute.arch.barrier()
+    # No barrier needed here: cumsum below reads sGbf (TMA-loaded, made
+    # visible by mbarrier_wait above) and dt_bias (gmem); it does NOT
+    # consume sQ or sK. Each thread's sQ/sK writes here are observed by
+    # the same thread in decay_apply below (after the cumsum barrier),
+    # and decay's read of sQ/sK is partitioned identically per-thread —
+    # so no cross-thread visibility of sQ/sK writes is required.
 
     # Gate cumsum
     a_log_exp = cute.exp(cutlass.Float32(a_log[head_idx]), fastmath=True)
@@ -1448,10 +1453,12 @@ def k1_full_kernel(
     # Pre-compute per-row sigmoid(beta) into sBetaSig (16 elements). Used by
     # the cpp-faithful TC L/Mqk path below to fold the L mask via branch-free
     # multiply against an identity-coord factor.
+    # No barrier needed here: sBetaSig is consumed only by the L/Mqk MMA
+    # path (after the decay_apply barrier below), and decay_apply itself
+    # does not read sBetaSig.
     if tidx < CHUNK:
         bv = cutlass.Float32(beta[head_idx * T_total + tile_idx * CHUNK + tidx])
         sBetaSig[tidx] = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
-    cute.arch.barrier()
 
     # decay_apply: into SMEM (sQD, sKD, sKI, sKR); ws_qd/ws_kd/ws_kr will be
     # bulk-stored via TMA at the end of the kernel.
