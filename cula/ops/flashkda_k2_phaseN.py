@@ -96,8 +96,10 @@ def k2_phaseN_kernel(
     tma_tensor_mqk: cute.Tensor,
     tma_atom_out: cute.CopyAtom,
     tma_tensor_out: cute.Tensor,
-    beta: cute.Tensor,
-    ws_gt: cute.Tensor,
+    tma_atom_gt: cute.CopyAtom,
+    tma_tensor_gt: cute.Tensor,
+    tma_atom_beta: cute.CopyAtom,
+    tma_tensor_beta: cute.Tensor,
     H: cutlass.Constexpr[int],
     total_tiles: cutlass.Constexpr[int],
     T_total: cutlass.Constexpr[int],
@@ -153,8 +155,10 @@ def k2_phaseN_kernel(
     sState = smem.allocate_tensor(cutlass.BFloat16, state_layout, 128)
     # NOTE: sU_T removed (U is now register-resident via MOVM_T inline PTX).
     # NOTE: sKr_T removed (Phase 6 uses LdMatrix.x4.trans on sKr directly).
-    sGt = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 128)
-    sBeta = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((CHUNK,)), 128)
+    sGt = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D, 1, STAGES), stride=(1, D, D)), 128)
+    # sBeta padded to 128 bytes (64 bf16 elements) per stage so each TMA-tile
+    # destination is 128-byte aligned (CHUNK=16 bf16 = 32B is too small).
+    sBeta = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((CHUNK, 1, STAGES), stride=(1, 64, 64)), 128)
     # ---- mbarriers (Int64 each) ----
     # Load pipeline: full (TMA producer arrival) / empty (compute consumer arrival).
     sMbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((STAGES,)), 16)
@@ -242,6 +246,23 @@ def k2_phaseN_kernel(
         cute.make_layout(1),
         cute.group_modes(sOut, 0, 2),
         cute.group_modes(gDst_o, 0, 2),
+    )
+    # 1D-style TMA loads for ws_gt and beta (modeled as (X, 1) tiles).
+    gSrc_gt = cute.local_tile(tma_tensor_gt, (D, 1), (None, None, None))
+    tGTs, tGTg = cpasync.tma_partition(
+        tma_atom_gt,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sGt, 0, 2),
+        cute.group_modes(gSrc_gt, 0, 2),
+    )
+    gSrc_beta = cute.local_tile(tma_tensor_beta, (CHUNK, 1), (None, None, None))
+    tBs, tBg = cpasync.tma_partition(
+        tma_atom_beta,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sBeta, 0, 2),
+        cute.group_modes(gSrc_beta, 0, 2),
     )
 
     # Init state to zero (each thread handles one row; D=128, only first 128 threads)
@@ -404,9 +425,9 @@ def k2_phaseN_kernel(
     tCcState = thr_mma6.partition_C(coord_state)
     tCsState = thr_mma6.partition_C(sState)
 
-    bos = seq_idx * seq_len
+    bos = seq_idx * seq_len  # noqa: F841 (kept for symmetry; beta indexing now via TMA)
     t_tiles: cutlass.Constexpr[int] = (seq_len + CHUNK - 1) // CHUNK
-    TMA_BYTES: cutlass.Constexpr[int] = 4 * CHUNK * D * 2 + 2 * CHUNK * CHUNK * 2
+    TMA_BYTES: cutlass.Constexpr[int] = 4 * CHUNK * D * 2 + 2 * CHUNK * CHUNK * 2 + D * 4 + CHUNK * 2
 
     # ---- Helper: warp-issued TMA load for chunk t_g into stage `s_idx`.
     # `s_idx` may be Constexpr (prologue) or Int32 (steady-state). The
@@ -436,6 +457,8 @@ def k2_phaseN_kernel(
             cute.copy(tma_atom_kr, tKRg[(None, 0, 0, wt_l)], tKRs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_inv, tIg[(None, 0, 0, wt_l)], tIs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_mqk, tMg[(None, 0, 0, wt_l)], tMs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
+            cute.copy(tma_atom_gt, tGTg[(None, 0, 0, wt_l)], tGTs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
+            cute.copy(tma_atom_beta, tBg[(None, 0, 0, wt_l)], tBs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             s_dyn_l = s_dyn_l + cutlass.Int32(1)
             if s_dyn_l == cutlass.Int32(STAGES):
                 s_dyn_l = cutlass.Int32(0)
@@ -469,9 +492,9 @@ def k2_phaseN_kernel(
         phase_se = cutlass.Int32(1)
 
         for t in cutlass.range(t_tiles, unroll=1):
-            t_g = seq_idx * t_tiles + t
-            ws_t = head_idx * total_tiles + t_g
-            gt_off = ws_t * D
+            t_g = seq_idx * t_tiles + t  # noqa: F841 (kept for clarity; consumed via TMA stage)
+            ws_t = head_idx * total_tiles + t_g  # noqa: F841
+            gt_off = ws_t * D  # noqa: F841
 
             # Per-stage SMEM views (dynamic stage indexing).
             sV_s = sV[(None, None, s_dyn)]
@@ -480,11 +503,9 @@ def k2_phaseN_kernel(
             sQd_tile = cute.flat_divide(sQd[(None, None, s_dyn)], (CHUNK, 16))
             sINV_ref_s = cute.flat_divide(sINV[(None, None, s_dyn)], (CHUNK, CHUNK))[None, None, 0, 0]
             sMqk_ref_s = cute.flat_divide(sMqk[(None, None, s_dyn)], (CHUNK, CHUNK))[None, None, 0, 0]
-
-            if tidx < D:
-                sGt[tidx] = ws_gt[gt_off + tidx]
-            if tidx < CHUNK:
-                sBeta[tidx] = beta[head_idx * T_total + bos + t * CHUNK + tidx]
+            # Per-stage 1D views of TMA-loaded sGt / sBeta.
+            sGt_s = sGt[(None, 0, s_dyn)]
+            sBeta_s = sBeta[(None, 0, s_dyn)]
 
             # Wait for TMA into stage s_dyn (single rotating phase).
             cute.arch.mbarrier_wait(sMbar_ptr + s_dyn, phase_full)
@@ -518,8 +539,8 @@ def k2_phaseN_kernel(
             lane_in_warp = tidx % 32
             Rrow0 = lane_in_warp // 4
             Rrow1 = Rrow0 + 8
-            b0 = cutlass.Float32(sBeta[Rrow0])
-            b1 = cutlass.Float32(sBeta[Rrow1])
+            b0 = cutlass.Float32(sBeta_s[Rrow0])
+            b1 = cutlass.Float32(sBeta_s[Rrow1])
             sig0 = cutlass.Float32(0.5) * (cute.tanh(b0 * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
             sig1 = cutlass.Float32(0.5) * (cute.tanh(b1 * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
             tCsV = thr_mma.partition_C(sV_s)
@@ -610,7 +631,7 @@ def k2_phaseN_kernel(
                 for i in cutlass.range_constexpr(cute.size(state_frag_blk)):
                     ii: cutlass.Constexpr[int] = i
                     state_frag_blk[ii] = tCsState_blk[ii]
-                    gt_frag_blk[ii] = sGt[m_off + tCcState_blk[ii][0]]
+                    gt_frag_blk[ii] = sGt_s[m_off + tCcState_blk[ii][0]]
                 for i in cutlass.range_constexpr(cute.size(tCrUpd_blk)):
                     ii: cutlass.Constexpr[int] = i
                     old = cutlass.Float32(state_frag_blk[ii]) * gt_frag_blk[ii]
@@ -697,6 +718,42 @@ def run_k2_phaseN(
     tma_atom_inv, tma_tensor_inv = make_ws_cc_atom(ws_inv)
     tma_atom_mqk, tma_tensor_mqk = make_ws_cc_atom(ws_mqk)
 
+    # 1D-style TMA atoms for ws_gt (D fp32 per slot) and beta (CHUNK bf16 per slot).
+    # Modeled as (X, 1, total_tiles*H) gmem with stride (1, X, X) so partition has
+    # one outer "slot" mode indexed by (head*total_tiles + tg).
+    # sBeta tile padded to 64 bf16 elements (128B) per stage in SMEM for TMA dst alignment.
+    gt_smem = cute.make_layout((D, 1), stride=(1, D))
+    beta_smem = cute.make_layout((CHUNK, 1), stride=(1, 64))
+
+    def make_gt_atom(t):
+        view = cute.make_tensor(
+            t.iterator,
+            cute.make_layout((D, 1, total_tiles * H), stride=(1, D, D)),
+        )
+        return cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            view,
+            gt_smem,
+            (D, 1),
+        )
+
+    def make_beta_atom(t):
+        # beta is laid out as (H, B, T) flat — i.e. h*T_total + b*T + t_pos + c.
+        # Slot s = h*total_tiles + (b*t_tiles + t) maps directly.
+        view = cute.make_tensor(
+            t.iterator,
+            cute.make_layout((CHUNK, 1, total_tiles * H), stride=(1, CHUNK, CHUNK)),
+        )
+        return cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            view,
+            beta_smem,
+            (CHUNK, 1),
+        )
+
+    tma_atom_gt, tma_tensor_gt = make_gt_atom(ws_gt)
+    tma_atom_beta, tma_tensor_beta = make_beta_atom(beta)
+
     # SMEM layout (warp-specialized, double-buffered output):
     #   sState (D*D bf16) + InputStages * (4 QK + 2 CC) + OutputStages * sOut
     #   + sKr_T (padded) + sGt + sBeta + 4 mbarrier rings + slack.
@@ -708,8 +765,8 @@ def run_k2_phaseN(
         + STAGES_LOCAL * 2 * (CHUNK * CHUNK * 2)  # sINV/sMqk staged
         + OUT_STAGES_LOCAL * (CHUNK * D * 2)  # sOut staged
         + (CHUNK * D * 2)  # sKr_T (padded conservatively to (D*CHUNK))
-        + (D * 4)  # sGt
-        + (CHUNK * 2)  # sBeta
+        + STAGES_LOCAL * (D * 4)  # sGt staged
+        + STAGES_LOCAL * (64 * 2)  # sBeta staged (padded to 128B/stage)
         + STAGES_LOCAL * 8  # load-full mbarriers
         + STAGES_LOCAL * 8  # load-empty mbarriers
         + OUT_STAGES_LOCAL * 8  # store-full mbarriers
@@ -732,8 +789,10 @@ def run_k2_phaseN(
         tma_tensor_mqk,
         tma_atom_out,
         tma_tensor_out,
-        beta,
-        ws_gt,
+        tma_atom_gt,
+        tma_tensor_gt,
+        tma_atom_beta,
+        tma_tensor_beta,
         H,
         total_tiles,
         T_total,
