@@ -322,6 +322,26 @@ def _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_stat
 
 _USE_CUTE = os.environ.get("CULA_FLASHKDA_USE_CUTE", "0") == "1"
 
+# ---- Cached scratch workspaces for K1+K2 ----
+# Reused across calls when shape/device match; avoids allocator + zero-fill.
+_WS_CACHE: dict = {}
+
+
+def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, device):
+    key = (n_qk, n_cc, n_gt, str(device))
+    cached = _WS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ws_qd = torch.empty(n_qk, dtype=torch.bfloat16, device=device)
+    ws_kd = torch.empty_like(ws_qd)
+    ws_kr = torch.empty_like(ws_qd)
+    ws_gt = torch.empty(n_gt, dtype=torch.float32, device=device)
+    ws_inv = torch.empty(n_cc, dtype=torch.bfloat16, device=device)
+    ws_mqk = torch.empty_like(ws_inv)
+    cached = (ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk)
+    _WS_CACHE[key] = cached
+    return cached
+
 
 def flash_kda_prefill(
     q: torch.Tensor,
@@ -414,12 +434,12 @@ def _dispatch_cute(
     # Allocate K2-shaped workspaces (separate buffers per tensor).
     n_qk = total_tiles * H * K1_CHUNK * K1_D
     n_cc = total_tiles * H * K1_CHUNK * K1_CHUNK
-    ws_qd = torch.zeros(n_qk, dtype=torch.bfloat16, device=q.device)
-    ws_kd = torch.zeros_like(ws_qd)
-    ws_kr = torch.zeros_like(ws_qd)
-    ws_gt = torch.zeros(total_tiles * H * K1_D, dtype=torch.float32, device=q.device)
-    ws_inv = torch.zeros(n_cc, dtype=torch.bfloat16, device=q.device)
-    ws_mqk = torch.zeros_like(ws_inv)
+    # K1 writes every element of these workspaces before K2 reads them, so
+    # ``torch.empty`` is sufficient and avoids the 5 zero-fill kernels per call
+    # (these buffers total ~200 MB at H=64,T=8192). Workspaces are cached per
+    # (n_qk,n_cc,total_tiles*H,device) key so repeated calls with the same
+    # shape skip the cudaMalloc as well as the zero-fill.
+    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk = _get_or_alloc_workspaces(n_qk, n_cc, total_tiles * H * K1_D, q.device)
 
     # Beta arrives as [B, T, H]; K1/K2 expect head-major [H, B*T] flat.
     beta_flat = beta.view(T_total, H).permute(1, 0).contiguous().view(-1)
