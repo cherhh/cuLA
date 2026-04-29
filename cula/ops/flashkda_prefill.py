@@ -327,8 +327,8 @@ _USE_CUTE = os.environ.get("CULA_FLASHKDA_USE_CUTE", "0") == "1"
 _WS_CACHE: dict = {}
 
 
-def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, device):
-    key = (n_qk, n_cc, n_gt, str(device))
+def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, device, dtype):
+    key = (n_qk, n_cc, n_gt, n_beta, str(device), dtype)
     cached = _WS_CACHE.get(key)
     if cached is not None:
         return cached
@@ -338,7 +338,9 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, device):
     ws_gt = torch.empty(n_gt, dtype=torch.float32, device=device)
     ws_inv = torch.empty(n_cc, dtype=torch.bfloat16, device=device)
     ws_mqk = torch.empty_like(ws_inv)
-    cached = (ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk)
+    # Persistent beta-flat scratch [H, B*T] reused across calls (same shape).
+    beta_flat = torch.empty(n_beta, dtype=dtype, device=device)
+    cached = (ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat)
     _WS_CACHE[key] = cached
     return cached
 
@@ -421,14 +423,28 @@ def _dispatch_cute(
     else:
         raise ValueError(f"unknown CULA_FLASHKDA_K2_VARIANT={_k2_variant!r}")
 
-    if problem.has_state_in or problem.has_state_out or problem.is_varlen:
-        raise NotImplementedError(
-            "CuteDSL flashkda currently supports fixed-len, no-state inputs only. "
-            "Use the torch reference (unset CULA_FLASHKDA_USE_CUTE) for state/varlen."
-        )
+    if problem.has_state_in or problem.has_state_out:
+        if _k2_variant != "N":
+            raise NotImplementedError("State inputs/outputs require K2 variant N (CULA_FLASHKDA_K2_VARIANT=N).")
 
-    B, T, H, _ = q.shape
-    T_total = B * T
+    B, T, H = problem.B, problem.T, problem.H
+
+    # Determine T_total and cu_seqlens_tiles for K2.
+    if problem.is_varlen:
+        # Varlen: B=1, q.shape=(1, T_total, H, D); cu_seqlens is provided.
+        # Require all sequence lengths to be multiples of K1_CHUNK (CHUNK=16).
+        assert cu_seqlens is not None
+        assert B == 1
+        T_total = T  # T is already T_total for B=1
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        assert (seq_lens % K1_CHUNK == 0).all(), f"All varlen sequence lengths must be multiples of CHUNK={K1_CHUNK}"
+        # cu_seqlens_tiles: prefix sum of per-sequence tile counts (int32).
+        cu_seqlens_tiles = (cu_seqlens // K1_CHUNK).to(torch.int32).contiguous()
+        k2_cu_seqlens_tiles = cu_seqlens_tiles
+    else:
+        T_total = B * T
+        k2_cu_seqlens_tiles = None  # launch_k2_phaseN builds uniform tiles internally
+
     total_tiles = T_total // K1_CHUNK
 
     # Allocate K2-shaped workspaces (separate buffers per tensor).
@@ -439,10 +455,14 @@ def _dispatch_cute(
     # (these buffers total ~200 MB at H=64,T=8192). Workspaces are cached per
     # (n_qk,n_cc,total_tiles*H,device) key so repeated calls with the same
     # shape skip the cudaMalloc as well as the zero-fill.
-    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk = _get_or_alloc_workspaces(n_qk, n_cc, total_tiles * H * K1_D, q.device)
+    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat = _get_or_alloc_workspaces(
+        n_qk, n_cc, total_tiles * H * K1_D, T_total * H, q.device, beta.dtype
+    )
 
     # Beta arrives as [B, T, H]; K1/K2 expect head-major [H, B*T] flat.
-    beta_flat = beta.view(T_total, H).permute(1, 0).contiguous().view(-1)
+    # Reuse cached destination buffer (same shape across calls) and emit a
+    # single transpose kernel into it instead of allocating a fresh tensor.
+    beta_flat.view(H, T_total).copy_(beta.view(T_total, H).transpose(0, 1))
 
     launch_k1_full(
         q,
@@ -460,7 +480,42 @@ def _dispatch_cute(
         ws_inv,
         ws_mqk,
     )
-    _launch_k2(v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, out)
+    if _k2_variant == "N":
+        # Prepare fp32 state tensors for K2 (bhvk layout: [N, H, V, K]).
+        # initial_state may be bf16; convert to fp32 (K2 kernel uses fp32 for state).
+        k2_initial_state = None
+        k2_final_state = None
+        if problem.has_state_in:
+            k2_initial_state = (
+                initial_state.to(torch.float32).contiguous() if initial_state.dtype != torch.float32 else initial_state
+            )
+        if problem.has_state_out:
+            # final_state is pre-allocated by the caller; use fp32 scratch if bf16.
+            if final_state.dtype == torch.float32:
+                k2_final_state = final_state
+            else:
+                k2_final_state = torch.empty_like(final_state, dtype=torch.float32)
+        _launch_k2(
+            v,
+            beta_flat,
+            ws_qd,
+            ws_kd,
+            ws_kr,
+            ws_gt,
+            ws_inv,
+            ws_mqk,
+            out,
+            k2_cu_seqlens_tiles,
+            initial_state=k2_initial_state,
+            final_state=k2_final_state,
+        )
+        # Copy fp32 scratch back to caller's bf16 final_state tensor.
+        if problem.has_state_out and final_state.dtype != torch.float32:
+            final_state.copy_(k2_final_state.to(final_state.dtype))
+    else:
+        if problem.is_varlen:
+            raise NotImplementedError("Varlen requires K2 variant N (CULA_FLASHKDA_K2_VARIANT=N)")
+        _launch_k2(v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, out)
 
 
 # ============================================================================
