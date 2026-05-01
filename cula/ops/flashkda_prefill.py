@@ -364,6 +364,8 @@ _WS_CACHE: dict = {}
 _VARLEN_PACK_CACHE: dict = {}
 _VARLEN_LAYOUT_CACHE: dict = {}
 _LAST_VARLEN_REPACK_KEY = None
+_K1_SYMBOLS = None
+_K2_LAUNCHERS: dict[str, object] = {}
 
 
 def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, device, dtype):
@@ -434,6 +436,31 @@ def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
     cached = (idx, valid_dst, pad_idx, cu_pad, tuple(out_offsets))
     _VARLEN_LAYOUT_CACHE[key] = cached
     return cached
+
+
+def _get_k1_symbols():
+    global _K1_SYMBOLS
+    if _K1_SYMBOLS is None:
+        from cula.ops.flashkda_k1 import CHUNK as k1_chunk
+        from cula.ops.flashkda_k1 import D as k1_d
+        from cula.ops.flashkda_k1 import launch_k1_full as k1_launch
+
+        _K1_SYMBOLS = (k1_chunk, k1_d, k1_launch)
+    return _K1_SYMBOLS
+
+
+def _get_k2_launcher(variant: str):
+    launcher = _K2_LAUNCHERS.get(variant)
+    if launcher is not None:
+        return launcher
+    if variant == "N":
+        from cula.ops.flashkda_k2_phaseN import launch_k2_phaseN as launcher
+    elif variant == "B":
+        from cula.ops.flashkda_k2 import launch_k2_phaseB as launcher
+    else:
+        raise ValueError(f"unknown CULA_FLASHKDA_K2_VARIANT={variant!r}")
+    _K2_LAUNCHERS[variant] = launcher
+    return launcher
 
 
 def flash_kda_prefill(
@@ -530,9 +557,7 @@ def _dispatch_cute(
     ``tests/test_flashkda_k1_phases.py`` which validate each K1 phase against
     a torch reference by reading the per-tile workspace dump.
     """
-    from cula.ops.flashkda_k1 import CHUNK as K1_CHUNK
-    from cula.ops.flashkda_k1 import D as K1_D
-    from cula.ops.flashkda_k1 import launch_k1_full
+    K1_CHUNK, K1_D, launch_k1_full = _get_k1_symbols()
 
     # Native arbitrary-varlen support path:
     # Existing K1/K2 kernels require per-sequence CHUNK alignment. For arbitrary
@@ -629,12 +654,7 @@ def _dispatch_cute(
     # K2 variant selector (env CULA_FLASHKDA_K2_VARIANT).
     # Default: phaseN (latest, matches/beats cpp baseline at T>=4096).
     _k2_variant = os.environ.get("CULA_FLASHKDA_K2_VARIANT", "N").upper()
-    if _k2_variant == "N":
-        from cula.ops.flashkda_k2_phaseN import launch_k2_phaseN as _launch_k2
-    elif _k2_variant == "B":
-        from cula.ops.flashkda_k2 import launch_k2_phaseB as _launch_k2
-    else:
-        raise ValueError(f"unknown CULA_FLASHKDA_K2_VARIANT={_k2_variant!r}")
+    _launch_k2 = _get_k2_launcher(_k2_variant)
 
     if problem.has_state_in or problem.has_state_out:
         if _k2_variant != "N":
