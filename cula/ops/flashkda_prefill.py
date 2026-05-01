@@ -36,6 +36,7 @@ Status:
 from __future__ import annotations
 
 import os
+import weakref
 import warnings
 from dataclasses import dataclass
 
@@ -366,6 +367,7 @@ _VARLEN_LAYOUT_CACHE: dict = {}
 _LAST_VARLEN_REPACK_KEY = None
 _K1_SYMBOLS = None
 _K2_LAUNCHERS: dict[str, object] = {}
+_SEQ_LENS_OBJ_CACHE: dict[int, tuple[weakref.ReferenceType, int, tuple[int, ...]]] = {}
 
 
 def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, device, dtype):
@@ -436,6 +438,19 @@ def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
     cached = (idx, valid_dst, pad_idx, cu_pad, tuple(out_offsets))
     _VARLEN_LAYOUT_CACHE[key] = cached
     return cached
+
+
+def _get_or_build_seq_lens(cu_seqlens: torch.Tensor) -> tuple[int, ...]:
+    obj_id = id(cu_seqlens)
+    ver = int(cu_seqlens._version)
+    cached = _SEQ_LENS_OBJ_CACHE.get(obj_id)
+    if cached is not None:
+        ref_obj, cached_ver, cached_seq = cached
+        if ref_obj() is cu_seqlens and cached_ver == ver:
+            return cached_seq
+    seq_lens = tuple((cu_seqlens[1:] - cu_seqlens[:-1]).to("cpu").tolist())
+    _SEQ_LENS_OBJ_CACHE[obj_id] = (weakref.ref(cu_seqlens), ver, seq_lens)
+    return seq_lens
 
 
 def _get_k1_symbols():
@@ -565,7 +580,7 @@ def _dispatch_cute(
     # padded tokens, then scatter outputs back to original ranges.
     if problem.is_varlen:
         assert cu_seqlens is not None
-        seq_lens_list = (cu_seqlens[1:] - cu_seqlens[:-1]).to("cpu").tolist()
+        seq_lens_list = _get_or_build_seq_lens(cu_seqlens)
         if any((sl % K1_CHUNK) != 0 for sl in seq_lens_list):
             assert problem.B == 1, "varlen path expects packed B=1"
 
