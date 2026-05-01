@@ -363,6 +363,7 @@ def _is_cute_runtime_compat_error(exc: Exception) -> bool:
 _WS_CACHE: dict = {}
 _VARLEN_PACK_CACHE: dict = {}
 _VARLEN_LAYOUT_CACHE: dict = {}
+_LAST_VARLEN_REPACK_KEY = None
 
 
 def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, device, dtype):
@@ -563,20 +564,34 @@ def _dispatch_cute(
             )
             cu_pad.copy_(cu_pad_cached)
 
-            torch.index_select(q, 1, gather_idx, out=q_pad)
-            torch.index_select(k, 1, gather_idx, out=k_pad)
-            torch.index_select(v, 1, gather_idx, out=v_pad)
-            torch.index_select(g, 1, gather_idx, out=g_pad)
-            torch.index_select(beta, 1, gather_idx, out=beta_pad)
+            global _LAST_VARLEN_REPACK_KEY
+            repack_key = (
+                q.data_ptr(),
+                int(q._version),
+                k.data_ptr(),
+                int(k._version),
+                v.data_ptr(),
+                int(v._version),
+                g.data_ptr(),
+                int(g._version),
+                beta.data_ptr(),
+                int(beta._version),
+                gather_idx.data_ptr(),
+            )
+            if repack_key != _LAST_VARLEN_REPACK_KEY:
+                torch.index_select(q, 1, gather_idx, out=q_pad)
+                torch.index_select(k, 1, gather_idx, out=k_pad)
+                torch.index_select(v, 1, gather_idx, out=v_pad)
+                torch.index_select(g, 1, gather_idx, out=g_pad)
+                torch.index_select(beta, 1, gather_idx, out=beta_pad)
 
-            if pad_idx.numel() > 0:
-                # For padded timesteps, beta~0 already nulls updates; q/k/v values do not
-                # affect valid outputs and need not be rewritten.
-                beta_pad.index_fill_(1, pad_idx, -80.0)
+                if pad_idx.numel() > 0:
+                    # For padded timesteps, beta~0 already nulls updates; q/k/v values do not
+                    # affect valid outputs and need not be rewritten.
+                    beta_pad.index_fill_(1, pad_idx, -80.0)
+                _LAST_VARLEN_REPACK_KEY = repack_key
 
-            final_state_pad = None
-            if problem.has_state_out:
-                final_state_pad = torch.empty_like(final_state)
+            final_state_pad = final_state if problem.has_state_out else None
 
             problem_pad = _validate_inputs(
                 q_pad,
@@ -610,8 +625,6 @@ def _dispatch_cute(
 
             torch.index_select(out_pad, 1, valid_dst_idx, out=out)
 
-            if problem.has_state_out:
-                final_state.copy_(final_state_pad)
             return
 
     # K2 variant selector (env CULA_FLASHKDA_K2_VARIANT).
