@@ -593,17 +593,16 @@ def _dispatch_cute(
 
             final_state_pad = final_state if problem.has_state_out else None
 
-            problem_pad = _validate_inputs(
-                q_pad,
-                k_pad,
-                v_pad,
-                g_pad,
-                beta_pad,
-                A_log,
-                dt_bias,
-                initial_state,
-                final_state_pad,
-                cu_pad,
+            problem_pad = _PrefillProblem(
+                B=1,
+                T=total_aligned,
+                H=problem.H,
+                N=problem.N,
+                total_tiles=total_aligned // K1_CHUNK,
+                is_varlen=True,
+                has_state_in=problem.has_state_in,
+                has_state_out=problem.has_state_out,
+                state_fp32=problem.state_fp32,
             )
 
             _dispatch_cute(
@@ -651,7 +650,6 @@ def _dispatch_cute(
         assert B == 1
         T_total = T  # T is already T_total for B=1
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        assert (seq_lens % K1_CHUNK == 0).all(), f"All varlen sequence lengths must be multiples of CHUNK={K1_CHUNK}"
         # cu_seqlens_tiles: prefix sum of per-sequence tile counts (int32).
         cu_seqlens_tiles = (cu_seqlens // K1_CHUNK).to(torch.int32).contiguous()
         k2_cu_seqlens_tiles = cu_seqlens_tiles
