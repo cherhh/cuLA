@@ -388,8 +388,8 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
     return cached
 
 
-def _get_or_alloc_varlen_pack_buffers(total_aligned: int, H: int, N: int, device, q_dtype, beta_dtype, cu_dtype):
-    key = (total_aligned, H, N, str(device), q_dtype, beta_dtype, cu_dtype)
+def _get_or_alloc_varlen_pack_buffers(total_aligned: int, H: int, N: int, device, q_dtype, beta_dtype):
+    key = (total_aligned, H, N, str(device), q_dtype, beta_dtype)
     cached = _VARLEN_PACK_CACHE.get(key)
     if cached is not None:
         return cached
@@ -400,9 +400,7 @@ def _get_or_alloc_varlen_pack_buffers(total_aligned: int, H: int, N: int, device
     g_pad = torch.empty_like(q_pad)
     beta_pad = torch.empty((1, total_aligned, H), dtype=beta_dtype, device=device)
     out_pad = torch.empty_like(q_pad)
-    cu_pad = torch.empty((N + 1,), dtype=cu_dtype, device=device)
-
-    cached = (q_pad, k_pad, v_pad, g_pad, beta_pad, out_pad, cu_pad)
+    cached = (q_pad, k_pad, v_pad, g_pad, beta_pad, out_pad)
     _VARLEN_PACK_CACHE[key] = cached
     return cached
 
@@ -587,14 +585,13 @@ def _dispatch_cute(
             aligned_lens = [((sl + K1_CHUNK - 1) // K1_CHUNK) * K1_CHUNK for sl in seq_lens_list]
             total_aligned = sum(aligned_lens)
 
-            q_pad, k_pad, v_pad, g_pad, beta_pad, out_pad, cu_pad = _get_or_alloc_varlen_pack_buffers(
+            q_pad, k_pad, v_pad, g_pad, beta_pad, out_pad = _get_or_alloc_varlen_pack_buffers(
                 total_aligned,
                 problem.H,
                 problem.N,
                 q.device,
                 q.dtype,
                 beta.dtype,
-                cu_seqlens.dtype,
             )
 
             gather_idx, valid_dst_idx, pad_idx, cu_pad_cached, _out_offsets = _get_or_build_varlen_layout(
@@ -602,7 +599,7 @@ def _dispatch_cute(
                 q.device,
                 cu_seqlens.dtype,
             )
-            cu_pad.copy_(cu_pad_cached)
+            cu_pad = cu_pad_cached
 
             global _LAST_VARLEN_REPACK_KEY
             repack_key = (
