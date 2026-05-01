@@ -363,7 +363,6 @@ def _is_cute_runtime_compat_error(exc: Exception) -> bool:
 _WS_CACHE: dict = {}
 _VARLEN_PACK_CACHE: dict = {}
 _VARLEN_LAYOUT_CACHE: dict = {}
-_INERT_G_CACHE: dict = {}
 
 
 def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, device, dtype):
@@ -427,22 +426,12 @@ def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
         dst_cursor += aligned
         out_offsets.append(dst_cursor)
 
-    idx = torch.tensor(idx_list, dtype=torch.int64, device=device)
-    valid_dst = torch.tensor(valid_dst_list, dtype=torch.int64, device=device)
+    idx = torch.tensor(idx_list, dtype=torch.int32, device=device)
+    valid_dst = torch.tensor(valid_dst_list, dtype=torch.int32, device=device)
     pad_idx = torch.tensor(pad_idx_list, dtype=torch.int64, device=device)
     cu_pad = torch.tensor(out_offsets, dtype=cu_dtype, device=device)
     cached = (idx, valid_dst, pad_idx, cu_pad, tuple(out_offsets))
     _VARLEN_LAYOUT_CACHE[key] = cached
-    return cached
-
-
-def _get_or_build_inert_g(dt_bias: torch.Tensor, g_dtype: torch.dtype) -> torch.Tensor:
-    key = (str(dt_bias.device), g_dtype, dt_bias.data_ptr(), int(dt_bias._version))
-    cached = _INERT_G_CACHE.get(key)
-    if cached is not None:
-        return cached
-    cached = (-80.0 - dt_bias.float()).to(g_dtype).unsqueeze(0).unsqueeze(0).contiguous()
-    _INERT_G_CACHE[key] = cached
     return cached
 
 
@@ -567,12 +556,6 @@ def _dispatch_cute(
                 cu_seqlens.dtype,
             )
 
-            # Inert pad tokens:
-            #   - beta logits very negative => sigmoid(beta) ~ 0
-            #   - g raw chosen so A*(g+dt_bias) is very negative => sigmoid ~ 0
-            #     therefore gate contribution ~ 0 and decay factor exp(0)=1.
-            inert_g = _get_or_build_inert_g(dt_bias, g.dtype)
-
             gather_idx, valid_dst_idx, pad_idx, cu_pad_cached, _out_offsets = _get_or_build_varlen_layout(
                 tuple(seq_lens_list),
                 q.device,
@@ -590,7 +573,6 @@ def _dispatch_cute(
                 # For padded timesteps, beta~0 already nulls updates; q/k/v values do not
                 # affect valid outputs and need not be rewritten.
                 beta_pad.index_fill_(1, pad_idx, -80.0)
-                g_pad[:, pad_idx].copy_(inert_g.expand(1, pad_idx.numel(), problem.H, K1_D))
 
             final_state_pad = None
             if problem.has_state_out:
