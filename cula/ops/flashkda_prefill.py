@@ -36,6 +36,7 @@ Status:
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 
 import cutlass
@@ -321,10 +322,48 @@ def _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_stat
 
 
 _USE_CUTE = os.environ.get("CULA_FLASHKDA_USE_CUTE", "0") == "1"
+_STRICT_CUTE = os.environ.get("CULA_FLASHKDA_STRICT_CUTE", "0") == "1"
+_WARNED_CUTE_FALLBACK = False
+
+
+def _ensure_cute_arch_for_device(device: torch.device) -> None:
+    """Best-effort default for CuteDSL target arch.
+
+    CuteDSL defaults target arch to "unknown" if ``CUTE_DSL_ARCH`` is unset,
+    which can fail at runtime on Hopper. We set a safe default for SM90 here.
+    """
+    if os.environ.get("CUTE_DSL_ARCH"):
+        return
+    if not torch.cuda.is_available():
+        return
+    if device.type != "cuda":
+        return
+    major, _minor = torch.cuda.get_device_capability(device)
+    if major == 9:
+        os.environ["CUTE_DSL_ARCH"] = "sm_90a"
+
+
+def _is_cute_runtime_compat_error(exc: Exception) -> bool:
+    """Return True if exception indicates CuteDSL runtime/env mismatch.
+
+    These failures are not math/kernel correctness issues and should fall back
+    to the torch reference path so prefill remains usable.
+    """
+    msg = repr(exc)
+    markers = (
+        "DSLCudaRuntimeError",
+        "cudaErrorInsufficientDriver",
+        "Target SM ARCH",
+        "CUTE_DSL_ARCH",
+    )
+    return any(m in msg for m in markers)
 
 # ---- Cached scratch workspaces for K1+K2 ----
 # Reused across calls when shape/device match; avoids allocator + zero-fill.
 _WS_CACHE: dict = {}
+_VARLEN_PACK_CACHE: dict = {}
+_VARLEN_LAYOUT_CACHE: dict = {}
+_INERT_G_CACHE: dict = {}
 
 
 def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, device, dtype):
@@ -342,6 +381,68 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
     beta_flat = torch.empty(n_beta, dtype=dtype, device=device)
     cached = (ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat)
     _WS_CACHE[key] = cached
+    return cached
+
+
+def _get_or_alloc_varlen_pack_buffers(total_aligned: int, H: int, N: int, device, q_dtype, beta_dtype, cu_dtype):
+    key = (total_aligned, H, N, str(device), q_dtype, beta_dtype, cu_dtype)
+    cached = _VARLEN_PACK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    q_pad = torch.empty((1, total_aligned, H, D), dtype=q_dtype, device=device)
+    k_pad = torch.empty_like(q_pad)
+    v_pad = torch.empty_like(q_pad)
+    g_pad = torch.empty_like(q_pad)
+    beta_pad = torch.empty((1, total_aligned, H), dtype=beta_dtype, device=device)
+    out_pad = torch.empty_like(q_pad)
+    cu_pad = torch.empty((N + 1,), dtype=cu_dtype, device=device)
+
+    cached = (q_pad, k_pad, v_pad, g_pad, beta_pad, out_pad, cu_pad)
+    _VARLEN_PACK_CACHE[key] = cached
+    return cached
+
+
+def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
+    key = (seq_lens, str(device), cu_dtype)
+    cached = _VARLEN_LAYOUT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    idx_list: list[int] = []
+    valid_dst_list: list[int] = []
+    pad_idx_list: list[int] = []
+    out_offsets = [0]
+
+    src_cursor = 0
+    dst_cursor = 0
+    for sl in seq_lens:
+        aligned = ((sl + CHUNK - 1) // CHUNK) * CHUNK
+        idx_list.extend(range(src_cursor, src_cursor + sl))
+        valid_dst_list.extend(range(dst_cursor, dst_cursor + sl))
+        if aligned > sl:
+            idx_list.extend([src_cursor] * (aligned - sl))
+            pad_idx_list.extend(range(dst_cursor + sl, dst_cursor + aligned))
+        src_cursor += sl
+        dst_cursor += aligned
+        out_offsets.append(dst_cursor)
+
+    idx = torch.tensor(idx_list, dtype=torch.int64, device=device)
+    valid_dst = torch.tensor(valid_dst_list, dtype=torch.int64, device=device)
+    pad_idx = torch.tensor(pad_idx_list, dtype=torch.int64, device=device)
+    cu_pad = torch.tensor(out_offsets, dtype=cu_dtype, device=device)
+    cached = (idx, valid_dst, pad_idx, cu_pad, tuple(out_offsets))
+    _VARLEN_LAYOUT_CACHE[key] = cached
+    return cached
+
+
+def _get_or_build_inert_g(dt_bias: torch.Tensor, g_dtype: torch.dtype) -> torch.Tensor:
+    key = (str(dt_bias.device), g_dtype, dt_bias.data_ptr(), int(dt_bias._version))
+    cached = _INERT_G_CACHE.get(key)
+    if cached is not None:
+        return cached
+    cached = (-80.0 - dt_bias.float()).to(g_dtype).unsqueeze(0).unsqueeze(0).contiguous()
+    _INERT_G_CACHE[key] = cached
     return cached
 
 
@@ -365,13 +466,43 @@ def flash_kda_prefill(
     Args mirror ``flash_kda.fwd``. ``out`` and ``final_state`` are written
     in-place. Currently only ``head_dim_k = head_dim_v = 128`` is supported.
     """
+    global _WARNED_CUTE_FALLBACK
     problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens)
 
     if _USE_CUTE:
-        _dispatch_cute(
-            q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state, final_state, cu_seqlens, problem
-        )
-        return
+        _ensure_cute_arch_for_device(q.device)
+        try:
+            _dispatch_cute(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                out,
+                A_log,
+                dt_bias,
+                lower_bound,
+                initial_state,
+                final_state,
+                cu_seqlens,
+                problem,
+            )
+            return
+        except Exception as exc:
+            if _STRICT_CUTE:
+                raise
+            if not _is_cute_runtime_compat_error(exc):
+                raise
+            if not _WARNED_CUTE_FALLBACK:
+                warnings.warn(
+                    "CuteDSL prefill dispatch failed due to runtime compatibility; "
+                    "falling back to torch reference. "
+                    f"Error: {exc!r}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                _WARNED_CUTE_FALLBACK = True
 
     # Reference fallback
     ref_out, ref_final = _flashkda_torch_reference(
@@ -412,6 +543,94 @@ def _dispatch_cute(
     from cula.ops.flashkda_k1 import CHUNK as K1_CHUNK
     from cula.ops.flashkda_k1 import D as K1_D
     from cula.ops.flashkda_k1 import launch_k1_full
+
+    # Native arbitrary-varlen support path:
+    # Existing K1/K2 kernels require per-sequence CHUNK alignment. For arbitrary
+    # varlen, repack each sequence to an aligned length with mathematically inert
+    # padded tokens, then scatter outputs back to original ranges.
+    if problem.is_varlen:
+        assert cu_seqlens is not None
+        seq_lens_list = (cu_seqlens[1:] - cu_seqlens[:-1]).to("cpu").tolist()
+        if any((sl % K1_CHUNK) != 0 for sl in seq_lens_list):
+            assert problem.B == 1, "varlen path expects packed B=1"
+
+            aligned_lens = [((sl + K1_CHUNK - 1) // K1_CHUNK) * K1_CHUNK for sl in seq_lens_list]
+            total_aligned = sum(aligned_lens)
+
+            q_pad, k_pad, v_pad, g_pad, beta_pad, out_pad, cu_pad = _get_or_alloc_varlen_pack_buffers(
+                total_aligned,
+                problem.H,
+                problem.N,
+                q.device,
+                q.dtype,
+                beta.dtype,
+                cu_seqlens.dtype,
+            )
+
+            # Inert pad tokens:
+            #   - beta logits very negative => sigmoid(beta) ~ 0
+            #   - g raw chosen so A*(g+dt_bias) is very negative => sigmoid ~ 0
+            #     therefore gate contribution ~ 0 and decay factor exp(0)=1.
+            inert_g = _get_or_build_inert_g(dt_bias, g.dtype)
+
+            gather_idx, valid_dst_idx, pad_idx, cu_pad_cached, _out_offsets = _get_or_build_varlen_layout(
+                tuple(seq_lens_list),
+                q.device,
+                cu_seqlens.dtype,
+            )
+            cu_pad.copy_(cu_pad_cached)
+
+            torch.index_select(q, 1, gather_idx, out=q_pad)
+            torch.index_select(k, 1, gather_idx, out=k_pad)
+            torch.index_select(v, 1, gather_idx, out=v_pad)
+            torch.index_select(g, 1, gather_idx, out=g_pad)
+            torch.index_select(beta, 1, gather_idx, out=beta_pad)
+
+            if pad_idx.numel() > 0:
+                # For padded timesteps, beta~0 already nulls updates; q/k/v values do not
+                # affect valid outputs and need not be rewritten.
+                beta_pad.index_fill_(1, pad_idx, -80.0)
+                g_pad[:, pad_idx].copy_(inert_g.expand(1, pad_idx.numel(), problem.H, K1_D))
+
+            final_state_pad = None
+            if problem.has_state_out:
+                final_state_pad = torch.empty_like(final_state)
+
+            problem_pad = _validate_inputs(
+                q_pad,
+                k_pad,
+                v_pad,
+                g_pad,
+                beta_pad,
+                A_log,
+                dt_bias,
+                initial_state,
+                final_state_pad,
+                cu_pad,
+            )
+
+            _dispatch_cute(
+                q_pad,
+                k_pad,
+                v_pad,
+                g_pad,
+                beta_pad,
+                scale,
+                out_pad,
+                A_log,
+                dt_bias,
+                lower_bound,
+                initial_state,
+                final_state_pad,
+                cu_pad,
+                problem_pad,
+            )
+
+            torch.index_select(out_pad, 1, valid_dst_idx, out=out)
+
+            if problem.has_state_out:
+                final_state.copy_(final_state_pad)
+            return
 
     # K2 variant selector (env CULA_FLASHKDA_K2_VARIANT).
     # Default: phaseN (latest, matches/beats cpp baseline at T>=4096).
