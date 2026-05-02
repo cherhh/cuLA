@@ -852,6 +852,17 @@ def run_k2_phaseN(
 
 _compiled_cache_k2N: dict = {}
 _DUMMY_FP32_CACHE: dict[str, torch.Tensor] = {}
+_CU_STREAM_CACHE: dict[int, object] = {}
+
+
+def _get_current_custream():
+    stream_ptr = int(torch.cuda.current_stream().cuda_stream)
+    cached = _CU_STREAM_CACHE.get(stream_ptr)
+    if cached is not None:
+        return cached
+    cached = cuda_drv.CUstream(stream_ptr)
+    _CU_STREAM_CACHE[stream_ptr] = cached
+    return cached
 
 
 def _get_dummy_fp32(device: torch.device) -> torch.Tensor:
@@ -942,7 +953,7 @@ def launch_k2_phaseN(
 
     key = (N_seqs, H, total_tiles, has_initial_state_flag, has_final_state_flag)
     if key not in _compiled_cache_k2N:
-        stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = _get_current_custream()
         v_flat = v.view(T_total, H, D)
         out_flat = out.view(T_total, H, D)
         _compiled_cache_k2N[key] = cute.compile(
@@ -968,7 +979,7 @@ def launch_k2_phaseN(
             stream=stream,
         )
 
-    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = _get_current_custream()
     v_flat = v.view(T_total, H, D)
     out_flat = out.view(T_total, H, D)
     _compiled_cache_k2N[key](

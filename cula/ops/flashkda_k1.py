@@ -2621,6 +2621,17 @@ def run_k1_full(
 
 
 _compiled_cache_full: dict = {}
+_CU_STREAM_CACHE: dict[int, object] = {}
+
+
+def _get_current_custream():
+    stream_ptr = int(torch.cuda.current_stream().cuda_stream)
+    cached = _CU_STREAM_CACHE.get(stream_ptr)
+    if cached is not None:
+        return cached
+    cached = cuda_drv.CUstream(stream_ptr)
+    _CU_STREAM_CACHE[stream_ptr] = cached
+    return cached
 
 
 def launch_k1_full(
@@ -2651,7 +2662,7 @@ def launch_k1_full(
 
     key = (T_total, H, total_tiles, scale, gate_scale)
     if key not in _compiled_cache_full:
-        stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = _get_current_custream()
         q_flat = q.view(T_total, H, D)
         k_flat = k.view(T_total, H, D)
         g_flat = g.view(T_total, H, D)
@@ -2678,7 +2689,7 @@ def launch_k1_full(
             options="--opt-level=3",
         )
 
-    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = _get_current_custream()
     q_flat = q.view(T_total, H, D)
     k_flat = k.view(T_total, H, D)
     g_flat = g.view(T_total, H, D)
