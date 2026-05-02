@@ -289,7 +289,7 @@ def _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_stat
         assert B == 1, f"varlen requires B=1, got B={B}"
         assert cu_seqlens.dtype in (torch.int32, torch.int64)
         N = cu_seqlens.numel() - 1
-        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        seq_lens = _get_or_build_seq_lens(cu_seqlens)
         total_tiles = _compute_total_tiles(seq_lens)
     else:
         N = B
