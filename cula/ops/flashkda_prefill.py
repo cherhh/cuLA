@@ -672,7 +672,6 @@ def _dispatch_cute(
         assert cu_seqlens is not None
         assert B == 1
         T_total = T  # T is already T_total for B=1
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         # cu_seqlens_tiles: prefix sum of per-sequence tile counts (int32).
         cu_seqlens_tiles = (cu_seqlens // K1_CHUNK).to(torch.int32).contiguous()
         k2_cu_seqlens_tiles = cu_seqlens_tiles
