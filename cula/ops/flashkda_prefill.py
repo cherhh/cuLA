@@ -365,6 +365,7 @@ _WS_CACHE: dict = {}
 _VARLEN_PACK_CACHE: dict = {}
 _VARLEN_LAYOUT_CACHE: dict = {}
 _LAST_VARLEN_REPACK_KEY = None
+_LAST_BETA_FLAT_COPY_KEY = None
 _K1_SYMBOLS = None
 _K2_LAUNCHERS: dict[str, object] = {}
 _SEQ_LENS_OBJ_CACHE: dict[int, tuple[weakref.ReferenceType, int, tuple[int, ...]]] = {}
@@ -597,7 +598,6 @@ def _dispatch_cute(
                 q.dtype,
                 beta.dtype,
             )
-
             gather_idx, valid_dst_idx, pad_idx, cu_pad_cached, cu_tiles_cached, _out_offsets = _get_or_build_varlen_layout(
                 tuple(seq_lens_list),
                 q.device,
@@ -702,7 +702,11 @@ def _dispatch_cute(
     # Beta arrives as [B, T, H]; K1/K2 expect head-major [H, B*T] flat.
     # Reuse cached destination buffer (same shape across calls) and emit a
     # single transpose kernel into it instead of allocating a fresh tensor.
-    beta_flat.view(H, T_total).copy_(beta.view(T_total, H).transpose(0, 1))
+    global _LAST_BETA_FLAT_COPY_KEY
+    beta_copy_key = (beta.data_ptr(), int(beta._version), H, T_total)
+    if beta_copy_key != _LAST_BETA_FLAT_COPY_KEY:
+        beta_flat.view(H, T_total).copy_(beta.view(T_total, H).transpose(0, 1))
+        _LAST_BETA_FLAT_COPY_KEY = beta_copy_key
 
     launch_k1_full(
         q,
