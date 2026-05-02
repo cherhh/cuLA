@@ -576,6 +576,8 @@ def _dispatch_cute(
     # Existing K1/K2 kernels require per-sequence CHUNK alignment. For arbitrary
     # varlen, repack each sequence to an aligned length with mathematically inert
     # padded tokens, then scatter outputs back to original ranges.
+    scatter_back_target = None
+    scatter_back_idx = None
     if problem.is_varlen:
         assert cu_seqlens is not None
         seq_lens_list = _get_or_build_seq_lens(cu_seqlens)
@@ -628,8 +630,6 @@ def _dispatch_cute(
                     beta_pad.index_fill_(1, pad_idx, -80.0)
                 _LAST_VARLEN_REPACK_KEY = repack_key
 
-            final_state_pad = final_state if problem.has_state_out else None
-
             problem_pad = _PrefillProblem(
                 B=1,
                 T=total_aligned,
@@ -641,27 +641,18 @@ def _dispatch_cute(
                 has_state_out=problem.has_state_out,
                 state_fp32=problem.state_fp32,
             )
-
-            _dispatch_cute(
+            scatter_back_target = out
+            scatter_back_idx = valid_dst_idx
+            q, k, v, g, beta, out, cu_seqlens, problem = (
                 q_pad,
                 k_pad,
                 v_pad,
                 g_pad,
                 beta_pad,
-                scale,
                 out_pad,
-                A_log,
-                dt_bias,
-                lower_bound,
-                initial_state,
-                final_state_pad,
                 cu_pad,
                 problem_pad,
             )
-
-            torch.index_select(out_pad, 1, valid_dst_idx, out=out)
-
-            return
 
     # K2 variant selector (env CULA_FLASHKDA_K2_VARIANT).
     # Default: phaseN (latest, matches/beats cpp baseline at T>=4096).
@@ -760,6 +751,9 @@ def _dispatch_cute(
         if problem.is_varlen:
             raise NotImplementedError("Varlen requires K2 variant N (CULA_FLASHKDA_K2_VARIANT=N)")
         _launch_k2(v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, out)
+
+    if scatter_back_target is not None:
+        torch.index_select(out, 1, scatter_back_idx, out=scatter_back_target)
 
 
 # ============================================================================
