@@ -519,8 +519,6 @@ def flash_kda_prefill(
     problem_key = (
         id(q),
         int(q._version),
-        q.shape,
-        q.dtype,
         id(k),
         int(k._version),
         id(v),
@@ -533,7 +531,7 @@ def flash_kda_prefill(
         int(A_log._version),
         id(dt_bias),
         int(dt_bias._version),
-        None if cu_seqlens is None else (id(cu_seqlens), int(cu_seqlens._version), cu_seqlens.shape, cu_seqlens.dtype),
+        None if cu_seqlens is None else (id(cu_seqlens), int(cu_seqlens._version)),
         None if initial_state is None else (initial_state.shape, initial_state.dtype),
         None if final_state is None else (final_state.shape, final_state.dtype),
     )
