@@ -433,7 +433,8 @@ def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
     valid_dst = torch.tensor(valid_dst_list, dtype=torch.int32, device=device)
     pad_idx = torch.tensor(pad_idx_list, dtype=torch.int64, device=device)
     cu_pad = torch.tensor(out_offsets, dtype=cu_dtype, device=device)
-    cached = (idx, valid_dst, pad_idx, cu_pad, tuple(out_offsets))
+    cu_tiles = torch.tensor([off // CHUNK for off in out_offsets], dtype=torch.int32, device=device)
+    cached = (idx, valid_dst, pad_idx, cu_pad, cu_tiles, tuple(out_offsets))
     _VARLEN_LAYOUT_CACHE[key] = cached
     return cached
 
@@ -578,6 +579,7 @@ def _dispatch_cute(
     # padded tokens, then scatter outputs back to original ranges.
     scatter_back_target = None
     scatter_back_idx = None
+    k2_cu_seqlens_tiles_cached = None
     if problem.is_varlen:
         assert cu_seqlens is not None
         seq_lens_list = _get_or_build_seq_lens(cu_seqlens)
@@ -596,12 +598,13 @@ def _dispatch_cute(
                 beta.dtype,
             )
 
-            gather_idx, valid_dst_idx, pad_idx, cu_pad_cached, _out_offsets = _get_or_build_varlen_layout(
+            gather_idx, valid_dst_idx, pad_idx, cu_pad_cached, cu_tiles_cached, _out_offsets = _get_or_build_varlen_layout(
                 tuple(seq_lens_list),
                 q.device,
                 cu_seqlens.dtype,
             )
             cu_pad = cu_pad_cached
+            k2_cu_seqlens_tiles_cached = cu_tiles_cached
 
             global _LAST_VARLEN_REPACK_KEY
             repack_key = (
@@ -673,8 +676,11 @@ def _dispatch_cute(
         assert B == 1
         T_total = T  # T is already T_total for B=1
         # cu_seqlens_tiles: prefix sum of per-sequence tile counts (int32).
-        cu_seqlens_tiles = (cu_seqlens // K1_CHUNK).to(torch.int32).contiguous()
-        k2_cu_seqlens_tiles = cu_seqlens_tiles
+        if k2_cu_seqlens_tiles_cached is not None:
+            k2_cu_seqlens_tiles = k2_cu_seqlens_tiles_cached
+        else:
+            cu_seqlens_tiles = (cu_seqlens // K1_CHUNK).to(torch.int32).contiguous()
+            k2_cu_seqlens_tiles = cu_seqlens_tiles
     else:
         T_total = B * T
         k2_cu_seqlens_tiles = None  # launch_k2_phaseN builds uniform tiles internally
