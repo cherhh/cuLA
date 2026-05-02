@@ -851,6 +851,17 @@ def run_k2_phaseN(
 
 
 _compiled_cache_k2N: dict = {}
+_DUMMY_FP32_CACHE: dict[str, torch.Tensor] = {}
+
+
+def _get_dummy_fp32(device: torch.device) -> torch.Tensor:
+    key = str(device)
+    cached = _DUMMY_FP32_CACHE.get(key)
+    if cached is not None:
+        return cached
+    cached = torch.zeros(1, dtype=torch.float32, device=device)
+    _DUMMY_FP32_CACHE[key] = cached
+    return cached
 
 
 def launch_k2_phaseN(
@@ -909,7 +920,7 @@ def launch_k2_phaseN(
 
     # Convert state tensors to fp32 flat 1-D for kernel access.
     # Dummy 1-element tensor when state is not used.
-    _dummy = torch.zeros(1, dtype=torch.float32, device=v.device)
+    _dummy = _get_dummy_fp32(v.device)
     if has_initial_state_flag:
         assert initial_state.shape == (N_seqs, H, D, D), (
             f"initial_state shape must be ({N_seqs}, {H}, {D}, {D}), got {initial_state.shape}"
