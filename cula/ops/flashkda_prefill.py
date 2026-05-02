@@ -366,6 +366,8 @@ _VARLEN_PACK_CACHE: dict = {}
 _VARLEN_LAYOUT_CACHE: dict = {}
 _LAST_VARLEN_REPACK_KEY = None
 _LAST_BETA_FLAT_COPY_KEY = None
+_LAST_PROBLEM_KEY = None
+_LAST_PROBLEM: _PrefillProblem | None = None
 _K1_SYMBOLS = None
 _K2_LAUNCHERS: dict[str, object] = {}
 _SEQ_LENS_OBJ_CACHE: dict[int, tuple[weakref.ReferenceType, int, tuple[int, ...]]] = {}
@@ -512,8 +514,35 @@ def flash_kda_prefill(
     Args mirror ``flash_kda.fwd``. ``out`` and ``final_state`` are written
     in-place. Currently only ``head_dim_k = head_dim_v = 128`` is supported.
     """
-    global _WARNED_CUTE_FALLBACK
-    problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens)
+    global _WARNED_CUTE_FALLBACK, _LAST_PROBLEM_KEY, _LAST_PROBLEM
+
+    problem_key = (
+        id(q),
+        int(q._version),
+        q.shape,
+        q.dtype,
+        id(k),
+        int(k._version),
+        id(v),
+        int(v._version),
+        id(g),
+        int(g._version),
+        id(beta),
+        int(beta._version),
+        id(A_log),
+        int(A_log._version),
+        id(dt_bias),
+        int(dt_bias._version),
+        None if cu_seqlens is None else (id(cu_seqlens), int(cu_seqlens._version), cu_seqlens.shape, cu_seqlens.dtype),
+        None if initial_state is None else (initial_state.shape, initial_state.dtype),
+        None if final_state is None else (final_state.shape, final_state.dtype),
+    )
+    if problem_key == _LAST_PROBLEM_KEY and _LAST_PROBLEM is not None:
+        problem = _LAST_PROBLEM
+    else:
+        problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens)
+        _LAST_PROBLEM_KEY = problem_key
+        _LAST_PROBLEM = problem
 
     if _USE_CUTE:
         _ensure_cute_arch_for_device(q.device)
