@@ -518,22 +518,23 @@ def flash_kda_prefill(
 
     problem_key = (
         id(q),
-        int(q._version),
         id(k),
-        int(k._version),
         id(v),
-        int(v._version),
         id(g),
-        int(g._version),
         id(beta),
-        int(beta._version),
         id(A_log),
-        int(A_log._version),
         id(dt_bias),
-        int(dt_bias._version),
-        None if cu_seqlens is None else (id(cu_seqlens), int(cu_seqlens._version)),
-        None if initial_state is None else (initial_state.shape, initial_state.dtype),
-        None if final_state is None else (final_state.shape, final_state.dtype),
+        q.shape,
+        q.dtype,
+        q.device,
+        beta.shape,
+        A_log.shape,
+        A_log.dtype,
+        dt_bias.shape,
+        dt_bias.dtype,
+        None if cu_seqlens is None else (id(cu_seqlens), int(cu_seqlens._version), cu_seqlens.dtype, cu_seqlens.device),
+        None if initial_state is None else (initial_state.shape, initial_state.dtype, initial_state.device),
+        None if final_state is None else (final_state.shape, final_state.dtype, final_state.device),
     )
     if problem_key == _LAST_PROBLEM_KEY and _LAST_PROBLEM is not None:
         problem = _LAST_PROBLEM
