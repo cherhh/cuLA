@@ -369,6 +369,7 @@ _LAST_BETA_FLAT_COPY_KEY = None
 _K1_SYMBOLS = None
 _K2_LAUNCHERS: dict[str, object] = {}
 _SEQ_LENS_OBJ_CACHE: dict[int, tuple[weakref.ReferenceType, int, tuple[int, ...]]] = {}
+_CU_TILES_OBJ_CACHE: dict[int, tuple[weakref.ReferenceType, int, torch.Tensor]] = {}
 
 
 def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, device, dtype):
@@ -451,6 +452,19 @@ def _get_or_build_seq_lens(cu_seqlens: torch.Tensor) -> tuple[int, ...]:
     seq_lens = tuple((cu_seqlens[1:] - cu_seqlens[:-1]).to("cpu").tolist())
     _SEQ_LENS_OBJ_CACHE[obj_id] = (weakref.ref(cu_seqlens), ver, seq_lens)
     return seq_lens
+
+
+def _get_or_build_cu_tiles(cu_seqlens: torch.Tensor, chunk: int) -> torch.Tensor:
+    obj_id = id(cu_seqlens)
+    ver = int(cu_seqlens._version)
+    cached = _CU_TILES_OBJ_CACHE.get(obj_id)
+    if cached is not None:
+        ref_obj, cached_ver, cached_tiles = cached
+        if ref_obj() is cu_seqlens and cached_ver == ver:
+            return cached_tiles
+    cu_tiles = (cu_seqlens // chunk).to(torch.int32).contiguous()
+    _CU_TILES_OBJ_CACHE[obj_id] = (weakref.ref(cu_seqlens), ver, cu_tiles)
+    return cu_tiles
 
 
 def _get_k1_symbols():
@@ -679,8 +693,7 @@ def _dispatch_cute(
         if k2_cu_seqlens_tiles_cached is not None:
             k2_cu_seqlens_tiles = k2_cu_seqlens_tiles_cached
         else:
-            cu_seqlens_tiles = (cu_seqlens // K1_CHUNK).to(torch.int32).contiguous()
-            k2_cu_seqlens_tiles = cu_seqlens_tiles
+            k2_cu_seqlens_tiles = _get_or_build_cu_tiles(cu_seqlens, K1_CHUNK)
     else:
         T_total = B * T
         k2_cu_seqlens_tiles = None  # launch_k2_phaseN builds uniform tiles internally
