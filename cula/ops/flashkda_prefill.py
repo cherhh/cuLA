@@ -366,6 +366,10 @@ _VARLEN_PACK_CACHE: dict = {}
 _VARLEN_LAYOUT_CACHE: dict = {}
 _LAST_VARLEN_REPACK_KEY = None
 _LAST_BETA_FLAT_COPY_KEY = None
+_LAST_VARLEN_GRAPH_KEY = None
+_LAST_VARLEN_GRAPH = None
+_LAST_VARLEN_GRAPH_OUT = None
+_LAST_VARLEN_GRAPH_STATE = None
 _LAST_PROBLEM_KEY = None
 _LAST_PROBLEM: _PrefillProblem | None = None
 _K1_SYMBOLS = None
@@ -749,58 +753,117 @@ def _dispatch_cute(
         beta_flat.view(H, T_total).copy_(beta.view(T_total, H).transpose(0, 1))
         _LAST_BETA_FLAT_COPY_KEY = beta_copy_key
 
-    launch_k1_full(
-        q,
-        k,
-        g,
-        A_log,
-        dt_bias,
-        beta_flat,
-        scale,
-        lower_bound,
-        ws_qd,
-        ws_kd,
-        ws_kr,
-        ws_gt,
-        ws_inv,
-        ws_mqk,
-    )
-    if _k2_variant == "N":
-        # Prepare fp32 state tensors for K2 (bhvk layout: [N, H, V, K]).
-        # initial_state may be bf16; convert to fp32 (K2 kernel uses fp32 for state).
-        k2_initial_state = None
-        k2_final_state = None
-        if problem.has_state_in:
-            k2_initial_state = (
-                initial_state.to(torch.float32).contiguous() if initial_state.dtype != torch.float32 else initial_state
-            )
-        if problem.has_state_out:
-            # final_state is pre-allocated by the caller; use fp32 scratch if bf16.
-            if final_state.dtype == torch.float32:
-                k2_final_state = final_state
-            else:
-                k2_final_state = torch.empty_like(final_state, dtype=torch.float32)
-        _launch_k2(
-            v,
+    k2_initial_state = None
+    if problem.has_state_in:
+        # K2 state path uses fp32; keep conversion outside graph replay.
+        k2_initial_state = initial_state.to(torch.float32).contiguous() if initial_state.dtype != torch.float32 else initial_state
+
+    def _run_k1k2(out_tensor: torch.Tensor, k2_final_state_tensor: torch.Tensor | None) -> None:
+        launch_k1_full(
+            q,
+            k,
+            g,
+            A_log,
+            dt_bias,
             beta_flat,
+            scale,
+            lower_bound,
             ws_qd,
             ws_kd,
             ws_kr,
             ws_gt,
             ws_inv,
             ws_mqk,
-            out,
-            k2_cu_seqlens_tiles,
-            initial_state=k2_initial_state,
-            final_state=k2_final_state,
         )
+        if _k2_variant == "N":
+            _launch_k2(
+                v,
+                beta_flat,
+                ws_qd,
+                ws_kd,
+                ws_kr,
+                ws_gt,
+                ws_inv,
+                ws_mqk,
+                out_tensor,
+                k2_cu_seqlens_tiles,
+                initial_state=k2_initial_state,
+                final_state=k2_final_state_tensor,
+            )
+        else:
+            if problem.is_varlen:
+                raise NotImplementedError("Varlen requires K2 variant N (CULA_FLASHKDA_K2_VARIANT=N)")
+            _launch_k2(v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, out_tensor)
+
+    use_varlen_graph = (
+        problem.is_varlen
+        and _k2_variant == "N"
+        and (not problem.has_state_in)
+        and os.environ.get("CULA_FLASHKDA_VARLEN_CUDAGRAPH", "1") != "0"
+    )
+    if use_varlen_graph:
+        global _LAST_VARLEN_GRAPH_KEY, _LAST_VARLEN_GRAPH, _LAST_VARLEN_GRAPH_OUT, _LAST_VARLEN_GRAPH_STATE
+        graph_key = (
+            q.data_ptr(), int(q._version),
+            k.data_ptr(), int(k._version),
+            v.data_ptr(), int(v._version),
+            g.data_ptr(), int(g._version),
+            beta.data_ptr(), int(beta._version),
+            A_log.data_ptr(), int(A_log._version),
+            dt_bias.data_ptr(), int(dt_bias._version),
+            cu_seqlens.data_ptr() if cu_seqlens is not None else 0,
+            int(cu_seqlens._version) if cu_seqlens is not None else -1,
+            out.shape,
+            out.dtype,
+            out.device,
+            problem.has_state_out,
+            problem.N,
+            scale,
+            lower_bound,
+        )
+        if graph_key != _LAST_VARLEN_GRAPH_KEY:
+            graph_out = torch.empty_like(out)
+            graph_state = (
+                torch.empty((problem.N, H, D, D), dtype=torch.float32, device=out.device)
+                if problem.has_state_out
+                else None
+            )
+            # Warmup once so allocations and JITed kernels are outside capture.
+            _run_k1k2(graph_out, graph_state)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                _run_k1k2(graph_out, graph_state)
+            _LAST_VARLEN_GRAPH_KEY = graph_key
+            _LAST_VARLEN_GRAPH = graph
+            _LAST_VARLEN_GRAPH_OUT = graph_out
+            _LAST_VARLEN_GRAPH_STATE = graph_state
+
+        _LAST_VARLEN_GRAPH.replay()
+        if scatter_back_target is not None:
+            torch.index_select(_LAST_VARLEN_GRAPH_OUT, 1, scatter_back_idx, out=scatter_back_target)
+        else:
+            out.copy_(_LAST_VARLEN_GRAPH_OUT)
+        if problem.has_state_out:
+            if final_state.dtype == torch.float32:
+                final_state.copy_(_LAST_VARLEN_GRAPH_STATE)
+            else:
+                final_state.copy_(_LAST_VARLEN_GRAPH_STATE.to(final_state.dtype))
+        return
+
+    if _k2_variant == "N":
+        k2_final_state = None
+        if problem.has_state_out:
+            # final_state is pre-allocated by the caller; use fp32 scratch if bf16.
+            if final_state.dtype == torch.float32:
+                k2_final_state = final_state
+            else:
+                k2_final_state = torch.empty_like(final_state, dtype=torch.float32)
+        _run_k1k2(out, k2_final_state)
         # Copy fp32 scratch back to caller's bf16 final_state tensor.
         if problem.has_state_out and final_state.dtype != torch.float32:
             final_state.copy_(k2_final_state.to(final_state.dtype))
     else:
-        if problem.is_varlen:
-            raise NotImplementedError("Varlen requires K2 variant N (CULA_FLASHKDA_K2_VARIANT=N)")
-        _launch_k2(v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, out)
+        _run_k1k2(out, None)
 
     if scatter_back_target is not None:
         torch.index_select(out, 1, scatter_back_idx, out=scatter_back_target)
