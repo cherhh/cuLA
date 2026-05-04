@@ -122,7 +122,7 @@ def k2_phaseN_kernel(
     # cross-warp barrier.
 
     # Input pipeline (TMA load): InputStages slot ring.
-    STAGES: cutlass.Constexpr[int] = 3
+    STAGES: cutlass.Constexpr[int] = 2
     # Output pipeline (TMA store): OutputStages slot ring of sOut tiles.
     OUT_STAGES: cutlass.Constexpr[int] = 2
     _ = cute.make_layout((CHUNK, D, STAGES), stride=(D, 1, CHUNK * D))  # noqa: F841 (qk_stage_layout)
