@@ -117,6 +117,7 @@ def chunk_kda_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
 
     if cp_context is not None:
