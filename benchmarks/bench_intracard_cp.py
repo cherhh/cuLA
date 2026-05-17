@@ -141,35 +141,29 @@ def predict_cp(seq_lens, H, num_sms):
 
 # ============================== configs ==============================
 
-# Each group: list of (tag, seq_lens, H)
-CONFIGS_H4 = [
-    # --- CP expected to trigger ---
-    ("T=32K", [32768], 4),
-    ("T=64K", [65536], 4),
-    ("T=128K", [131072], 4),
-    ("32K+256+256", [32768, 256, 256], 4),
-    ("64K+512+256+128", [65536, 512, 256, 128], 4),
-    ("128K+1K", [131072, 1024], 4),
+# (tag, seq_lens) — each entry is tested at every H in H_VALUES
+CONFIGS = [
+    # --- single seq (ascending length) ---
+    ("T=4K", [4096]),
+    ("T=8K", [8192]),
+    ("T=32K", [32768]),
+    ("T=64K", [65536]),
+    ("T=128K", [131072]),
+    # --- equal-length batches (~32K total) ---
+    ("8x4K", [4096] * 8),
+    ("4x8K", [8192] * 4),
+    ("2x16K", [16384] * 2),
+    # --- asymmetric multi-seq ---
+    ("16K+16K", [16384, 16384]),
+    ("24K+8K", [24576, 8192]),
+    ("28K+4K", [28672, 4096]),
+    ("32K+256+256", [32768, 256, 256]),
+    ("40K+1K+8K", [40960, 1024, 8192]),
+    ("64K+512+256+128", [65536, 512, 256, 128]),
+    ("128K+1K", [131072, 1024]),
 ]
 
-CONFIGS_H8 = [
-    # --- CP expected to trigger ---
-    ("T=64K", [65536], 8),
-    ("28K+4K", [28672, 4096], 8),
-    ("40K+1K+8K", [40960, 1024, 8192], 8),
-    # --- CP expected to bypass: equal-length batches (Guard 0) ---
-    ("8x4K", [4096] * 8, 8),
-    ("4x8K", [8192] * 4, 8),
-    ("2x16K", [16384] * 2, 8),
-    # --- CP expected to bypass: short seqs (Guard 1) ---
-    ("T=8K", [8192], 8),
-    ("T=4K", [4096], 8),
-    # --- CP expected to bypass: high Be·H (Guard 2) ---
-    ("24K+8K", [24576, 8192], 8),
-    ("16K+16K", [16384, 16384], 8),
-]
-
-GROUPS = [("H=4", CONFIGS_H4), ("H=8", CONFIGS_H8)]
+H_VALUES = [4, 8]
 
 
 # ============================== row + report ==============================
@@ -215,11 +209,11 @@ def main():
     sep = "-" * len(hdr)
 
     all_rows: list[Row] = []
-    for group_name, configs in GROUPS:
-        print(f"--- {group_name} ---")
+    for H in H_VALUES:
+        print(f"--- H={H} ---")
         print(hdr)
         print(sep)
-        for tag, seq_lens, H in configs:
+        for tag, seq_lens in CONFIGS:
             pred, n_sub = predict_cp(seq_lens, H, num_sms)
             q, k, v, g, beta, cu = make_inputs(seq_lens, H)
             ms_off = time_kernel(lambda: run_chunk_kda(q, k, v, g, beta, cu, enable_cp=False), warmup, n_iters)
