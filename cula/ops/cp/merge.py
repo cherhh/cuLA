@@ -16,7 +16,6 @@ Output: h  [num_non_first, H, K, V] fp32
 
 from __future__ import annotations
 
-import collections
 import functools
 
 import cuda.bindings.driver as cuda
@@ -484,35 +483,6 @@ def _get_compiled_merge(H: int, K: int, V: int, has_h0: int):
 
 
 # ---------------------------------------------------------------------------
-# Metadata tensor cache
-# ---------------------------------------------------------------------------
-_merge_meta_cache: collections.OrderedDict = collections.OrderedDict()
-
-
-def _get_meta_tensors(seq_starts, seq_counts, init_offsets, split_seq_ids, device):
-    cache_key = (
-        tuple(seq_starts),
-        tuple(seq_counts),
-        tuple(init_offsets),
-        tuple(split_seq_ids),
-        device.index if device.index is not None else 0,
-    )
-    cached = _merge_meta_cache.get(cache_key)
-    if cached is not None:
-        _merge_meta_cache.move_to_end(cache_key)
-        return cached
-    starts_gpu = torch.tensor(seq_starts, dtype=torch.int32, device=device)
-    counts_gpu = torch.tensor(seq_counts, dtype=torch.int32, device=device)
-    init_off_gpu = torch.tensor(init_offsets, dtype=torch.int32, device=device)
-    sid_gpu = torch.tensor(split_seq_ids, dtype=torch.int32, device=device)
-    result = (starts_gpu, counts_gpu, init_off_gpu, sid_gpu)
-    _merge_meta_cache[cache_key] = result
-    if len(_merge_meta_cache) > 32:
-        _merge_meta_cache.popitem(last=False)
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 def merge_fwd(
@@ -533,13 +503,10 @@ def merge_fwd(
 
     h_out = hm.new_empty(num_non_first, H, K, V)
 
-    starts_gpu, counts_gpu, init_off_gpu, sid_gpu = _get_meta_tensors(
-        seq_starts,
-        seq_counts,
-        init_offsets,
-        split_seq_ids,
-        device,
-    )
+    starts_gpu = torch.tensor(seq_starts, dtype=torch.int32, device=device)
+    counts_gpu = torch.tensor(seq_counts, dtype=torch.int32, device=device)
+    init_off_gpu = torch.tensor(init_offsets, dtype=torch.int32, device=device)
+    sid_gpu = torch.tensor(split_seq_ids, dtype=torch.int32, device=device)
 
     if h0 is not None:
         h0_arg = h0
