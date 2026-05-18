@@ -545,7 +545,7 @@ def merge_fwd(
         h0_arg = h0
         has_h0 = 1
     else:
-        h0_arg = hm.new_empty(1, H, K, V)
+        h0_arg = hm.new_zeros(1, H, K, V)
         has_h0 = 0
 
     compiled_fn = _get_compiled_merge(H, K, V, has_h0)
