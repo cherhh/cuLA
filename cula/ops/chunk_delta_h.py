@@ -2060,7 +2060,6 @@ def chunk_gated_delta_rule_fwd_h(
             _cu_seqlens_cpu,
             get_device_sm_count(k.device),
             k.shape[2],
-            k.shape[1],
             chunk_size,
         ):
             return intracard_fwd_h(

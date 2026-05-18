@@ -130,8 +130,7 @@ def predict_cp(seq_lens, H, num_sms):
         [0] + list(torch.tensor(seq_lens).cumsum(0).tolist()),
         dtype=torch.int32,
     )
-    total_T = int(cu[-1].item())
-    if not should_use_intracard_cp(cu, num_sms, H, total_T, BT):
+    if not should_use_intracard_cp(cu, num_sms, H, BT):
         return False, 0
     max_len = int(torch.diff(cu).max().item())
     subseq_len = compute_subseq_len(max_len, num_sms, H, BT, num_seqs=len(seq_lens))

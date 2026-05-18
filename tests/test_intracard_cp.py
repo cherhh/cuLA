@@ -225,7 +225,7 @@ def assert_cp_splits(cu, H, total_T):
     """
     cu_cpu = cu.cpu()
     num_sms = get_device_sm_count(torch.device(DEVICE))
-    assert should_use_intracard_cp(cu_cpu, num_sms, H, total_T, BT), (
+    assert should_use_intracard_cp(cu_cpu, num_sms, H, BT), (
         "should_use_intracard_cp returned False — config does not trigger CP"
     )
     max_seq = int(torch.diff(cu_cpu).max().item())

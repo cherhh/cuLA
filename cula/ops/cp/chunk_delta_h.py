@@ -31,6 +31,7 @@ Reference:
 
 from __future__ import annotations
 
+import math
 import weakref
 from collections import OrderedDict
 from typing import NamedTuple
@@ -109,7 +110,6 @@ def should_use_intracard_cp(
     cu_seqlens_cpu: torch.Tensor,
     num_sms: int,
     H: int,
-    T_total: int = None,
     chunk_size: int = 64,
 ) -> bool:
     """Pure-Python predicate: should we dispatch to intracard CP?
@@ -162,9 +162,6 @@ def compute_subseq_len(
 
     subseq_chunks = (seq_chunks + target_splits - 1) // target_splits
     subseq_chunks = max(subseq_chunks, MIN_SUBSEQ_CHUNKS)
-
-    # Snap to nearest power of 2 — matches B200 sweep optima.
-    import math
 
     subseq_chunks = 2 ** round(math.log2(subseq_chunks))
 
@@ -416,8 +413,7 @@ def intracard_fwd_h(
     if cu_seqlens_cpu is None:
         cu_seqlens_cpu = cu_seqlens.cpu()
 
-    T_total = k.shape[1]
-    if not should_use_intracard_cp(cu_seqlens_cpu, num_sms, H, T_total, chunk_size):
+    if not should_use_intracard_cp(cu_seqlens_cpu, num_sms, H, chunk_size):
         return _get_fwd_h()(
             k=k,
             w=w,
