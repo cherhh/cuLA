@@ -2054,8 +2054,10 @@ def chunk_gated_delta_rule_fwd_h(
         from cula.ops.cp.chunk_delta_h import intracard_fwd_h, should_use_intracard_cp
         from cula.utils import get_device_sm_count
 
-        if cu_seqlens_cpu is None or should_use_intracard_cp(
-            cu_seqlens_cpu,
+        # Materialize cu_seqlens_cpu once here to avoid repeated D2H sync inside intracard_fwd_h.
+        _cu_seqlens_cpu = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.cpu()
+        if should_use_intracard_cp(
+            _cu_seqlens_cpu,
             get_device_sm_count(k.device),
             k.shape[2],
             k.shape[1],
@@ -2072,7 +2074,7 @@ def chunk_gated_delta_rule_fwd_h(
                 save_new_value=save_new_value,
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices,
-                cu_seqlens_cpu=cu_seqlens_cpu,
+                cu_seqlens_cpu=_cu_seqlens_cpu,
             )
 
     B, T, H, K_dim = k.shape
