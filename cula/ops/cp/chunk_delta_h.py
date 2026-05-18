@@ -96,7 +96,10 @@ def _prepare_chunk_indices(
         nc = (cu_seqlens_values[i + 1] - cu_seqlens_values[i] + chunk_size - 1) // chunk_size
         seq_ids.extend([i] * nc)
         chunk_ids.extend(range(nc))
-    return torch.tensor(list(zip(seq_ids, chunk_ids)), dtype=torch.int32, device=device)
+    return torch.stack([
+        torch.tensor(seq_ids, dtype=torch.int32, device=device),
+        torch.tensor(chunk_ids, dtype=torch.int32, device=device)
+    ], dim=1)
 
 
 # Tunable thresholds — empirically calibrated on B200 SM100 (SM=152).
