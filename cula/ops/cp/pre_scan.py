@@ -1086,7 +1086,7 @@ def chunk_delta_rule_pre_scan(
     u_kern = u[0]
 
     use_gk_flag = 1 if gk is not None else 0
-    gk_kern = gk[0] if gk is not None else torch.empty(1, H, K, device=device, dtype=torch.float32)
+    gk_kern = gk[0] if gk is not None else torch.zeros(1, H, K, device=device, dtype=torch.float32)
 
     # Ensure cu_seqlens is int32
     cu_seqlens_i32 = cu_seqlens_split.int() if cu_seqlens_split.dtype != torch.int32 else cu_seqlens_split
