@@ -968,6 +968,8 @@ class ChunkDeltaRulePreScanFused:
         # EMPTY WARP
         # =========================================================================
         else:
+            cute.arch.setmaxregister_decrease(self.num_regs_others)
+            # Empty warp idle
             pass
 
         # ===================== TMEM dealloc =====================
