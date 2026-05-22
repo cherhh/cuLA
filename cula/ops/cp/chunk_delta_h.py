@@ -31,7 +31,6 @@ Reference:
 
 from __future__ import annotations
 
-import math
 import weakref
 from collections import OrderedDict
 from typing import NamedTuple
@@ -96,10 +95,10 @@ def _prepare_chunk_indices(
         nc = (cu_seqlens_values[i + 1] - cu_seqlens_values[i] + chunk_size - 1) // chunk_size
         seq_ids.extend([i] * nc)
         chunk_ids.extend(range(nc))
-    return torch.stack([
-        torch.tensor(seq_ids, dtype=torch.int32, device=device),
-        torch.tensor(chunk_ids, dtype=torch.int32, device=device)
-    ], dim=1)
+    return torch.stack(
+        [torch.tensor(seq_ids, dtype=torch.int32, device=device), torch.tensor(chunk_ids, dtype=torch.int32, device=device)],
+        dim=1,
+    )
 
 
 # Tunable thresholds — empirically calibrated on B200 SM100 (SM=152).
@@ -107,6 +106,7 @@ NUM_V_BLOCKS = 2  # fwd_h grid V-tile factor: grid = (NUM_V_BLOCKS, N*H)
 MIN_SUBSEQ_CHUNKS = 16  # min chunks per sub-sequence
 MIN_LONG_SEQ_CHUNKS = 256  # min chunks of the longest seq to consider CP
 MAX_BE_H = 10  # max Be*H; above this CP gain < overhead (~3%)
+MIN_SUBSEQ_CHUNKS_PER_HEAD = 12  # min expected sub-seq chunks per head (H-scaled Guard 3)
 
 
 def should_use_intracard_cp(
@@ -117,10 +117,11 @@ def should_use_intracard_cp(
 ) -> bool:
     """Pure-Python predicate: should we dispatch to intracard CP?
 
-    Three cheap CPU-only guards (a fourth post-split guard lives in intracard_fwd_h):
+    Four cheap CPU-only guards (a fifth post-split guard lives in intracard_fwd_h):
       Guard 0: baseline already saturates SMs.
       Guard 1: longest sequence too short to amortize CP overhead.
       Guard 2: Be*H > MAX_BE_H — other seqs already provide enough parallelism.
+      Guard 3: expected sub-seq too short — CP merge overhead exceeds gain.
     """
     cu_list = cu_seqlens_cpu.tolist()
     num_seqs = len(cu_list) - 1
@@ -138,7 +139,16 @@ def should_use_intracard_cp(
 
     # Guard 2: Be = effective batch size (as if every seq were max_c chunks long)
     Be = sum(chunks) / max_c
-    return Be * H <= MAX_BE_H
+    if Be * H > MAX_BE_H:
+        return False
+
+    # Guard 3: expected sub-seq length must be long enough to amortise CP overhead.
+    # CP merge work scales with H, so the minimum is proportional to H.
+    per_seq_units = NUM_V_BLOCKS * H
+    sm_budget = max(num_sms - per_seq_units * max(num_seqs - 1, 0), per_seq_units)
+    target_splits = max(2, sm_budget // per_seq_units)
+    expected_subseq_c = max((max_c + target_splits - 1) // target_splits, MIN_SUBSEQ_CHUNKS)
+    return expected_subseq_c >= MIN_SUBSEQ_CHUNKS_PER_HEAD * H
 
 
 def compute_subseq_len(
@@ -151,8 +161,11 @@ def compute_subseq_len(
     """Compute target sub-sequence length for intracard splitting.
 
     Targets enough splits to saturate remaining SMs after other sequences
-    in the batch occupy their share. Result is snapped to a power-of-2
-    number of chunks, floored at MIN_SUBSEQ_CHUNKS * chunk_size.
+    in the batch occupy their share. Uses floor division so that
+    actual sub-seqs never exceed target_splits, guaranteeing Guard 3
+    (total_subseqs * NUM_V_BLOCKS * H <= num_sms) is always satisfied
+    for a single split sequence in the batch.
+    Result is floored at MIN_SUBSEQ_CHUNKS * chunk_size.
     """
     seq_chunks = (seq_len + chunk_size - 1) // chunk_size
 
@@ -161,12 +174,10 @@ def compute_subseq_len(
 
     per_seq_units = NUM_V_BLOCKS * num_heads
     sm_budget = max(num_sms - per_seq_units * max(num_seqs - 1, 0), per_seq_units)
-    target_splits = max(2, (sm_budget + per_seq_units - 1) // per_seq_units)
+    target_splits = max(2, sm_budget // per_seq_units)
 
     subseq_chunks = (seq_chunks + target_splits - 1) // target_splits
     subseq_chunks = max(subseq_chunks, MIN_SUBSEQ_CHUNKS)
-
-    subseq_chunks = 2 ** round(math.log2(subseq_chunks))
 
     return subseq_chunks * chunk_size
 

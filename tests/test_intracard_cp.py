@@ -308,14 +308,14 @@ def test_cp_autodispatch_vs_fla(T, H):
 # Direct entry intracard_fwd_h, ground truth = pure-PyTorch fp32.
 
 ACCURACY_CONFIGS = [
-    ([32768], 4, False, False),
-    ([32768], 4, True, True),
-    ([32768, 512], 4, True, True),
-    ([32768, 256, 32768], 4, True, False),
+    ([65536], 4, False, False),
+    ([65536], 4, True, True),
+    ([65536, 512], 4, True, True),
+    ([65536, 256, 32768], 4, True, False),
     ([65536, 128], 4, False, True),
     ([131072], 4, True, True),
     ([65536, 512, 256, 128], 4, True, False),
-    ([40960, 1024, 8192], 8, True, True),
+    ([65536, 1024, 8192], 8, True, True),
 ]
 
 
@@ -353,11 +353,11 @@ def test_intracard_cp_vs_pytorch_ref(seq_lens, H, use_gk, use_h0):
 # Per-sequence ht must be independently correct for prefill→decode handoff.
 
 FINAL_STATE_CONFIGS = [
-    ([32768], 4, False, False),
-    ([32768], 4, True, True),
+    ([65536], 4, False, False),
+    ([65536], 4, True, True),
     ([65536], 8, True, True),
-    ([32768, 16384], 4, True, True),
-    ([32768, 512, 16384], 4, True, False),
+    ([65536, 16384], 4, True, True),
+    ([65536, 512, 16384], 4, True, False),
 ]
 
 
@@ -407,8 +407,8 @@ STRESS_ITERS = 100
 @pytest.mark.parametrize(
     "seq_lens,H,use_gk,use_h0",
     [
-        pytest.param([32768], 4, True, True, id="single-32K-H4-gk-h0"),
-        pytest.param([32768, 4096], 4, True, True, id="multi-32K+4K-H4-gk-h0"),
+        pytest.param([65536], 4, True, True, id="single-64K-H4-gk-h0"),
+        pytest.param([65536, 4096], 4, True, True, id="multi-64K+4K-H4-gk-h0"),
     ],
 )
 def test_intracard_cp_stress_repeat(seq_lens, H, use_gk, use_h0):
@@ -438,7 +438,7 @@ def test_intracard_cp_stress_repeat(seq_lens, H, use_gk, use_h0):
 
 def test_intracard_cp_h0_none_equiv_h0_zeros():
     """h0=None must produce identical ht to h0=zeros (no implicit init)."""
-    seq_lens, H = [32768, 4096], 4
+    seq_lens, H = [65536, 4096], 4
     k, w, u, gk, _, cu = make_varlen_inputs(seq_lens, H, use_gk=True, seed=20260501)
     assert_cp_splits(cu, H, k.shape[1])
     h0_zeros = torch.zeros(len(seq_lens), H, K, V, dtype=torch.float32, device=DEVICE)
