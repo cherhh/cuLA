@@ -1095,17 +1095,19 @@ def chunk_delta_rule_pre_scan(
     hm = torch.empty(S_split, H, K, V + K, device=device, dtype=torch.float32)
 
     # Single fused kernel: he + m via grid-level dispatch
-    BV = 64
-    num_v_tiles = (V + BV - 1) // BV
-
     # SM-version dispatch: Hopper (sm_90) → pre_scan_sm90, Blackwell (sm_100) → SM100 variant here.
     major, minor = torch.cuda.get_device_capability(device)
     if major == 9:
         from cula.ops.cp.pre_scan_sm90 import get_compiled_pre_scan_sm90
 
-        compiled_fn = get_compiled_pre_scan_sm90(H, K, V, chunk_size)
+        BV_sm90 = 64
+        compiled_fn = get_compiled_pre_scan_sm90(H, K, V, chunk_size, block_v=BV_sm90)
+        num_v_tiles = (V + BV_sm90 - 1) // BV_sm90
     elif major == 10:
         compiled_fn = _get_compiled_pre_scan(H, K, V, chunk_size)
+        # SM100 kernel uses BV=64.
+        BV_sm100 = 64
+        num_v_tiles = (V + BV_sm100 - 1) // BV_sm100
     else:
         raise RuntimeError(f"pre_scan requires sm_90 or sm_100, got sm_{major}{minor}")
 

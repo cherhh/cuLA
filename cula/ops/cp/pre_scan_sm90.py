@@ -11,9 +11,8 @@ machinery is:
   * **1 producer warpgroup** (4 warps, 128 threads) — only warp 0 actually
     issues TMA loads for ``W``, ``K^T``, ``U`` and ``gk``.  The remaining
     warps in this warpgroup are idle and run with reduced register count.
-  * **2 consumer (math) warpgroups** (2 × 128 = 256 threads) — together
-    handle ``BV = 128`` rows of the V dimension via ``atom_layout = (2,1,1)``;
-    each warpgroup MMA tile is ``M = 64``.
+  * **1 consumer (math) warpgroup** (128 threads) — handles ``BV = 64``
+    rows of the V dimension via ``atom_layout = (1,1,1)``.
   * **RS-WGMMA** on both WH and KV — the FMHA trick:
       * State lives in registers in **KV accumulator** layout (fp32).
       * Before WH MMA, we cast state to bf16 via ``make_acc_into_op`` —
@@ -21,18 +20,12 @@ machinery is:
       * After WH MMA, ``v_new = U - WH`` (he) / pre-negated WH (m) sits in
         registers in **WH accumulator** layout, again converted in-place to
         a KV A-fragment view.
-      * Alignment: WH (M=BV, N=BT, K=BK) and KV (M=BV, N=BK, K=BT) share
-        ``M`` and have ``WH.K == KV.N == BK`` and ``WH.N == KV.K == BT``,
-        so the WGMMA accumulator-output / A-fragment-input layouts line up.
       * gk decay is a register-only element-wise multiply applied *before*
         the KV MMA; the KV MMA itself accumulates into ``state`` via
-        ``ACCUMULATE=True`` so the entire ``state ± v_new @ K^T`` is one MMA
-        (for m mode we pre-negate ``v_new`` so ``state - v_new @ K^T``
-        becomes ``state + (-v_new) @ K^T``).
+        ``ACCUMULATE=True``.
 
 Tile sizes:
-  * BV = 128 (CTA-level V tile, requires head_dim_v >= 128)
-  * BV_per_wg = 64 (MMA M per consumer warpgroup)
+  * BV = 64 (CTA-level V tile; V=128 → 2 V-tiles per (subseq, head))
   * BT = chunk_size (= 64 by default)
   * BK = head_dim_k (= 128)
   * BS = 64 (K-tile for m mode)
@@ -61,18 +54,26 @@ def _coop_grp(size: int):
 
 
 class ChunkDeltaRulePreScanFusedSm90:
-    """Hopper (sm_90a) warp-specialized pre-scan kernel."""
+    """Hopper (sm_90a) warp-specialized pre-scan kernel.
+
+    Uses BV=64 (1 math WG, 256 threads per CTA) with state in persistent
+    WGMMA KV accumulator registers.  Before each WH MMA the state is cast
+    to bf16 via ``_make_acc_into_op`` (non-destructive copy); gk decay and
+    KV MMA accumulate directly into the state registers.
+    """
 
     def __init__(
         self,
         chunk_size: int = 64,
         head_dim_k: int = 128,
         head_dim_v: int = 128,
+        block_v: int = 64,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
         use_fast_math: bool = True,
     ):
         assert head_dim_k == 128 and head_dim_v == 128, "SM90 pre_scan only supports K=V=128"
+        assert block_v == 64, "BV=64 required for 1-WG design"
         assert_hopper()
 
         self.use_fast_math = use_fast_math
@@ -86,36 +87,33 @@ class ChunkDeltaRulePreScanFusedSm90:
         self.BT = chunk_size  # 64
         self.BK = head_dim_k  # 128
         self.BV_per_wg = 64  # MMA M per consumer warpgroup
-        self.num_mma_wgs = 2
-        self.BV = self.BV_per_wg * self.num_mma_wgs  # 128 — CTA V tile
-        self.BS = 64
+        self.num_mma_wgs = 1  # 1 math WG for BV=64
+        self.BV = block_v  # 64
+        self.BS = block_v  # 64, K-tile for m mode
 
         # ── Warp / thread layout ──
         self.threads_per_warp = 32
         self.threads_per_wg = 128
         self.num_load_wgs = 1
-        self.threads_per_cta = (self.num_load_wgs + self.num_mma_wgs) * self.threads_per_wg
+        self.threads_per_cta = (self.num_load_wgs + self.num_mma_wgs) * self.threads_per_wg  # 256
 
         self.load_wg_id = 0
         self.compute_wg_id_0 = 1
-        self.compute_wg_id_1 = 2
 
         self.num_regs_load = 40
         self.num_regs_mma = 232
 
         # ── MMA tilers ──
-        # WH MMA: state(BV, BK) @ W(BT, BK) → acc(BV, BT)
-        # KV MMA: vnew (BV, BT) @ K^T(BK, BT) → acc(BV, BK)
-        self.wh_mma_tiler_mn = (self.BV, self.BT)  # (128, 64)
-        self.kv_mma_tiler_mn = (self.BV, self.BK)  # (128, 128)
-        self.atom_layout_mnk = (self.num_mma_wgs, 1, 1)  # split M between 2 WGs
-        self.wh_mma_tiler_mnk = (*self.wh_mma_tiler_mn, self.BK)  # K = 128
-        self.kv_mma_tiler_mnk = (*self.kv_mma_tiler_mn, self.BT)  # K = 64
+        self.wh_mma_tiler_mn = (self.BV_per_wg, self.BT)  # (64, 64)
+        self.kv_mma_tiler_mn = (self.BV_per_wg, self.BK)  # (64, 128)
+        self.atom_layout_mnk = (1, 1, 1)
+        self.wh_mma_tiler_mnk = (*self.wh_mma_tiler_mn, self.BK)  # (64, 64, 128)
+        self.kv_mma_tiler_mnk = (*self.kv_mma_tiler_mn, self.BT)  # (64, 128, 64)
 
-        # Pipeline stages
-        self.w_stage = 3
-        self.k_stage = 3
-        self.u_stage = 2
+        # Pipeline stages (reduced for SMEM budget — 2 CTAs target)
+        self.w_stage = 2
+        self.k_stage = 2
+        self.u_stage = 1
         self.gk_stage = 2
 
         self.buffer_align_bytes = 1024
@@ -167,22 +165,30 @@ class ChunkDeltaRulePreScanFusedSm90:
         operand_as_acc.store(acc.load().to(dtype))
         return operand
 
-    def _tma_partition_B(self, tma_atom, tma_tensor, smem, tile_shape_mnk, tiled_mma, hidx):
-        """Partition B operand TMA tensors (mirror of SM100 helper)."""
-        coord = (0, None, None)
-        gX = cute.local_tile(
-            tma_tensor,
-            cute.slice_(tile_shape_mnk, coord),
-            (None, None, (hidx, Int32(0))),
-        )
-        thr_mma = tiled_mma.get_slice(0)
-        tCgX = thr_mma.partition_B(gX)
+    def _tma_partition_B(self, tma_atom, tma_tensor, smem, tile_shape_nk, hidx):
+        """Partition B operand TMA tensors for SM90.
+
+        For SM90, ``cpasync.make_tiled_tma_atom`` produces an atom whose
+        ``tma_partition`` expects the raw (grouped) GMEM tile, NOT the
+        thread-partitioned view.  We pass the global NK tile directly, mirroring
+        the hopper dense_gemm ``_make_tma_atoms_and_tensors`` / kernel pattern.
+
+        tile_shape_nk: (N, K) sizes (no M dimension).
+        """
+        # Select the head and seq-split coordinate from the TMA tensor.
+        # tma_tensor shape: (dim0, dim1, (H, S_split_1)) — slice head h.
+        gX = tma_tensor[None, None, (hidx, Int32(0))]
+        # Tile into (N, K, num_tiles) chunks.
+        gX_tiled = cute.flat_divide(gX, tile_shape_nk)
+        # Group the NK modes for tma_partition.
+        sX_g = cute.group_modes(smem, 0, 2)
+        gX_g = cute.group_modes(gX_tiled, 0, 2)
         tXsX, tXgX = cpasync.tma_partition(
             tma_atom,
             0,
             cute.make_layout(1),
-            cute.group_modes(smem, 0, 3),
-            cute.group_modes(tCgX, 0, 3),
+            sX_g,
+            gX_g,
         )
         return tXsX, tXgX
 
@@ -310,24 +316,25 @@ class ChunkDeltaRulePreScanFusedSm90:
         )
 
         # ===================== TMA atoms =====================
-        cluster_shape = (1, 1, 1)
-        w_smem_one = cute.select(w_smem_staged, mode=[0, 1, 2])
-        tma_atom_w, tma_tensor_w = cute.nvgpu.make_tiled_tma_atom_B(
+        # Use cpasync.make_tiled_tma_atom (not make_tiled_tma_atom_B) for SM90.
+        # make_tiled_tma_atom_B is a Blackwell-specific helper that does a CTA V-map
+        # equivalence check which fails on Hopper.  For SM90, we build the TMA atom
+        # directly with the one-stage SMEM layout (sliced to stage 0) and the (N, K) tile.
+        w_smem_one = cute.slice_(w_smem_staged, (None, None, 0))
+        # W is K-major B: tile shape = (N=BT, K=BK)
+        tma_atom_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
             tma_load_op,
             w,
             w_smem_one,
-            self.wh_mma_tiler_mnk,
-            wh_tiled_mma,
-            cluster_shape,
+            (self.wh_mma_tiler_mnk[1], self.wh_mma_tiler_mnk[2]),  # (BT, BK)
         )
-        kt_smem_one = cute.select(kt_smem_staged, mode=[0, 1, 2])
-        tma_atom_kt, tma_tensor_kt = cute.nvgpu.make_tiled_tma_atom_B(
+        kt_smem_one = cute.slice_(kt_smem_staged, (None, None, 0))
+        # K^T is MN-major B: tile shape = (N=BK, K=BT)
+        tma_atom_kt, tma_tensor_kt = cpasync.make_tiled_tma_atom(
             tma_load_op,
             kt,
             kt_smem_one,
-            self.kv_mma_tiler_mnk,
-            kv_tiled_mma,
-            cluster_shape,
+            (self.kv_mma_tiler_mnk[1], self.kv_mma_tiler_mnk[2]),  # (BK, BT)
         )
         u_smem_one = cute.select(u_epi_staged, mode=[0, 1])
         tma_atom_u, tma_tensor_u = cpasync.make_tiled_tma_atom(
@@ -446,8 +453,12 @@ class ChunkDeltaRulePreScanFusedSm90:
         sGK_smem = storage.sGK.get_tensor(cute.make_layout((self.BK, self.gk_stage)))
 
         # ===================== Pipelines =====================
+        # For PipelineTmaAsync the consumer "empty" mbarrier is signalled by ONE
+        # thread per warp (lane 0, see init_empty_barrier_arrive_signal), so its
+        # arrive_count must equal the number of CONSUMER WARPS, not threads.
+        num_consumer_warps = self.num_mma_wgs * (self.threads_per_wg // self.threads_per_warp)
         load_prod_grp = _coop_grp(1)  # 1 effective producer thread
-        compute_cons_grp = _coop_grp(self.num_mma_wgs * self.threads_per_wg)
+        compute_cons_grp = _coop_grp(num_consumer_warps)  # = 4 (1 warpgroup × 4 warps)
 
         w_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.w_stage,
@@ -503,8 +514,21 @@ class ChunkDeltaRulePreScanFusedSm90:
                 tma_tensor_u_v = cute.domain_offset((0, bos, (0, 0)), tma_tensor_u)
                 tma_tensor_gk_v = cute.domain_offset((0, bos, (0, 0)), tma_tensor_gk)
 
-                tWsW, tWgW = self._tma_partition_B(tma_atom_w, tma_tensor_w_v, sW, self.wh_mma_tiler_mnk, wh_tiled_mma, i_h)
-                tKsK, tKgK = self._tma_partition_B(tma_atom_kt, tma_tensor_kt_v, sKt, self.kv_mma_tiler_mnk, kv_tiled_mma, i_h)
+                # W tile: (N=BT, K=BK); K^T tile: (N=BK, K=BT)
+                tWsW, tWgW = self._tma_partition_B(
+                    tma_atom_w,
+                    tma_tensor_w_v,
+                    sW,
+                    (self.wh_mma_tiler_mnk[1], self.wh_mma_tiler_mnk[2]),
+                    i_h,
+                )
+                tKsK, tKgK = self._tma_partition_B(
+                    tma_atom_kt,
+                    tma_tensor_kt_v,
+                    sKt,
+                    (self.kv_mma_tiler_mnk[1], self.kv_mma_tiler_mnk[2]),
+                    i_h,
+                )
 
                 # U epilogue-style partition.
                 gU = tma_tensor_u_v[None, None, (i_h, Int32(0))]
@@ -555,11 +579,12 @@ class ChunkDeltaRulePreScanFusedSm90:
                     w_prod.advance()
 
                     # Load U[v, t=chunk*BT..(chunk+1)*BT] — only used in he-mode.
+                    # tile_idx selects which V-tile of U to load (BV=64 → 2 tiles).
                     if is_he_mode:
                         u_pipeline.producer_acquire(u_prod)
                         cute.copy(
                             tma_atom_u,
-                            bSG_gU[None, 0, chunk_idx],
+                            bSG_gU[None, tile_idx, chunk_idx],
                             bSG_sU[None, u_prod.index],
                             tma_bar_ptr=u_pipeline.producer_get_barrier(u_prod),
                         )
@@ -579,179 +604,183 @@ class ChunkDeltaRulePreScanFusedSm90:
 
                     # Load gk[t = last valid token in this chunk]
                     if use_gk != 0:
-                        remaining = seq_len - chunk_idx * self.BT
-                        if remaining < self.BT:
-                            gk_t_idx = seq_len - 1
-                        else:
-                            gk_t_idx = chunk_idx * self.BT + self.BT - 1
+                        # Last valid token in this chunk: min(chunk_end - 1, seq_end - 1)
+                        gk_t_idx = cutlass.min(chunk_idx * self.BT + self.BT - 1, seq_len - 1)
 
                         gk_pipeline.producer_acquire(gk_prod)
                         cute.copy(
                             tma_atom_gk,
-                            bSG_gGK[None, gk_t_idx, 0],
+                            bSG_gGK[None, 0, gk_t_idx],
                             bSG_sGK[None, gk_prod.index],
                             tma_bar_ptr=gk_pipeline.producer_get_barrier(gk_prod),
                         )
                         gk_pipeline.producer_commit(gk_prod)
                         gk_prod.advance()
 
-            # Other warps in the load WG are idle.
-            return
+            # Other warps in the load WG are idle (no-op).
+            pass
 
-        # =========================================================
-        # ============= Consumer (math) warpgroups ================
-        # =========================================================
-        cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
-
-        # Each consumer WG identifies itself locally (0 or 1 of the 2 mma WGs).
-        wg_local = wg_idx - self.compute_wg_id_0
-
-        # Per-WG MMA slice — for atom_layout=(2,1,1) each slice covers
-        # rows [wg_local*64, (wg_local+1)*64) of the BV=128 M tile.
-        thr_mma_wh = wh_tiled_mma.get_slice(wg_local)
-        thr_mma_kv = kv_tiled_mma.get_slice(wg_local)
-
-        # B operands (SMEM → WGMMA fragment).
-        tCsW = thr_mma_wh.partition_B(sW)
-        tCrW = wh_tiled_mma.make_fragment_B(tCsW)
-        tCsKt = thr_mma_kv.partition_B(sKt)
-        tCrKt = kv_tiled_mma.make_fragment_B(tCsKt)
-
-        # Accumulator register tensors (C-layout).
-        wh_acc_shape = thr_mma_wh.partition_shape_C(self.wh_mma_tiler_mn)
-        kv_acc_shape = thr_mma_kv.partition_shape_C(self.kv_mma_tiler_mn)
-        acc_wh = thr_mma_wh.make_fragment_C(wh_acc_shape)
-        state = thr_mma_kv.make_fragment_C(kv_acc_shape)
-
-        # Identity tensors → per-element (M, N) global coords per thread.
-        cM_kv = cute.make_identity_tensor(self.kv_mma_tiler_mn)
-        tCcM_kv = thr_mma_kv.partition_C(cM_kv)
-        cM_wh = cute.make_identity_tensor(self.wh_mma_tiler_mn)
-        tCcM_wh = thr_mma_wh.partition_C(cM_wh)
-
-        # ===================== Initialise state =====================
-        if is_he_mode:
-            for ei in cutlass.range(cute.size(state), unroll_full=True):
-                state[ei] = Float32(0.0)
         else:
-            k_col_tile = tile_idx - num_v_tiles
-            for ei in cutlass.range(cute.size(state), unroll_full=True):
-                v_coord, k_coord = tCcM_kv[ei]
-                col_global = v_coord + k_col_tile * self.BS
-                if k_coord == col_global:
-                    state[ei] = Float32(1.0)
-                else:
-                    state[ei] = Float32(0.0)
+            # =========================================================
+            # ============= Consumer (math) warpgroup ================
+            # =========================================================
+            # State lives in persistent KV accumulator registers across
+            # chunks.  Before each WH MMA, _make_acc_into_op creates a
+            # bf16 A-frag copy (non-destructive).  gk decay and KV MMA
+            # accumulate directly into the state registers.
+            cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
 
-        # Consumer pipeline states.
-        w_cons_r = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.w_stage)
-        w_cons_e = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.w_stage)
-        kt_cons_r = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.k_stage)
-        kt_cons_e = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.k_stage)
-        u_cons_r = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.u_stage)
-        u_cons_e = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.u_stage)
-        gk_cons_r = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.gk_stage)
-        gk_cons_e = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.gk_stage)
+            thr_mma_wh = wh_tiled_mma.get_slice(tidx)
+            thr_mma_kv = kv_tiled_mma.get_slice(tidx)
 
-        # ===================== Main chunk loop =====================
-        for chunk_idx in cutlass.range(0, NT, unroll=0):
-            # ----- WH MMA: acc_wh = state_bf16 @ sW (ACC=False; RS-WGMMA) -----
-            wh_a_frag = self._make_acc_into_op(state, wh_tiled_mma.tv_layout_A, self.io_dtype)
+            # B operands (SMEM → WGMMA descriptor).
+            tCsW = thr_mma_wh.partition_B(sW)
+            tCrW = wh_tiled_mma.make_fragment_B(tCsW)
+            tCsKt = thr_mma_kv.partition_B(sKt)
+            tCrKt = kv_tiled_mma.make_fragment_B(tCsKt)
 
-            w_pipeline.consumer_wait(w_cons_r)
-            warpgroup.fence()
-            num_k_blocks_wh = cute.size(tCrW, mode=[2])
-            wh_tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
-            for kp in cutlass.range(num_k_blocks_wh, unroll_full=True):
-                cute.gemm(
-                    wh_tiled_mma,
-                    acc_wh,
-                    wh_a_frag[None, None, kp],
-                    tCrW[None, None, kp, w_cons_r.index],
-                    acc_wh,
-                )
-                wh_tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
-            warpgroup.commit_group()
-            warpgroup.wait_group(0)
-            w_pipeline.consumer_release(w_cons_e)
-            w_cons_r.advance()
-            w_cons_e.advance()
+            # Accumulator shapes.
+            wh_acc_shape = thr_mma_wh.partition_shape_C(self.wh_mma_tiler_mn)
+            kv_acc_shape = thr_mma_kv.partition_shape_C(self.kv_mma_tiler_mn)
 
-            # ----- CUDA: v_new = U - WH (he) or v_new = -WH (m); mask tail -----
+            # Persistent accumulators.
+            acc_wh = thr_mma_wh.make_fragment_C(wh_acc_shape)
+            state = thr_mma_kv.make_fragment_C(kv_acc_shape)
+
+            # Identity tensors → per-element (row, col) global coords per thread.
+            cM_kv = cute.make_identity_tensor(self.kv_mma_tiler_mn)
+            tCcM_kv = thr_mma_kv.partition_C(cM_kv)
+            cM_wh = cute.make_identity_tensor(self.wh_mma_tiler_mn)
+            tCcM_wh = thr_mma_wh.partition_C(cM_wh)
+
+            local_tid = tidx - self.compute_wg_id_0 * self.threads_per_wg
+
+            # ===================== Initialise state in registers =====================
             if is_he_mode:
-                u_pipeline.consumer_wait(u_cons_r)
-                for ei in cutlass.range(cute.size(acc_wh), unroll_full=True):
-                    v_coord, t_coord = tCcM_wh[ei]
-                    u_val = sU_epi[(v_coord, t_coord, u_cons_r.index)].to(self.acc_dtype)
-                    acc_wh[ei] = u_val - acc_wh[ei]
-                u_pipeline.consumer_release(u_cons_e)
-                u_cons_r.advance()
-                u_cons_e.advance()
-            else:
-                # m mode: state -= v_new @ K^T  →  pre-negate so we can re-use
-                # the accumulating KV MMA: state += (-v_new) @ K^T.
-                for ei in cutlass.range(cute.size(acc_wh), unroll_full=True):
-                    acc_wh[ei] = -acc_wh[ei]
-
-            # Varlen tail mask (zero out columns beyond seq_len).
-            valid_len_chunk = seq_len - chunk_idx * self.BT
-            if valid_len_chunk < self.BT:
-                for ei in cutlass.range(cute.size(acc_wh), unroll_full=True):
-                    _, t_coord = tCcM_wh[ei]
-                    if t_coord >= valid_len_chunk:
-                        acc_wh[ei] = Float32(0.0)
-
-            # ----- gk decay (applied before KV MMA) -----
-            if use_gk != 0:
-                gk_pipeline.consumer_wait(gk_cons_r)
-                # Apply exp2 cooperatively across all consumer threads.
-                local_tid = tidx - self.compute_wg_id_0 * self.threads_per_wg
-                if local_tid < self.BK:
-                    sGK_smem[(local_tid, gk_cons_r.index)] = cute.exp2(
-                        sGK_smem[(local_tid, gk_cons_r.index)],
-                        fastmath=self.use_fast_math,
-                    )
-                cute.arch.barrier_arrive(barrier_id=1, number_of_threads=self.num_mma_wgs * self.threads_per_wg)
-                cute.arch.barrier_wait(barrier_id=1, number_of_threads=self.num_mma_wgs * self.threads_per_wg)
                 for ei in cutlass.range(cute.size(state), unroll_full=True):
-                    _, k_coord = tCcM_kv[ei]
-                    state[ei] = state[ei] * sGK_smem[(k_coord, gk_cons_r.index)]
-                gk_pipeline.consumer_release(gk_cons_e)
-                gk_cons_r.advance()
-                gk_cons_e.advance()
+                    state[ei] = Float32(0.0)
+            else:
+                k_col_tile = tile_idx - num_v_tiles
+                for ei in cutlass.range(cute.size(state), unroll_full=True):
+                    v_coord, k_coord = tCcM_kv[ei]
+                    col_global_row = v_coord + k_col_tile * self.BS
+                    if k_coord == col_global_row:
+                        state[ei] = Float32(1.0)
+                    else:
+                        state[ei] = Float32(0.0)
 
-            # ----- KV MMA: state += v_new_bf16 @ sKt (ACC=True; RS-WGMMA) -----
-            kv_a_frag = self._make_acc_into_op(acc_wh, kv_tiled_mma.tv_layout_A, self.io_dtype)
+            # Consumer pipeline states.
+            w_cons_r = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.w_stage)
+            w_cons_e = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.w_stage)
+            kt_cons_r = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.k_stage)
+            kt_cons_e = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.k_stage)
+            u_cons_r = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.u_stage)
+            u_cons_e = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.u_stage)
+            gk_cons_r = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.gk_stage)
+            gk_cons_e = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.gk_stage)
 
-            kt_pipeline.consumer_wait(kt_cons_r)
-            warpgroup.fence()
-            num_k_blocks_kv = cute.size(tCrKt, mode=[2])
-            kv_tiled_mma.set(warpgroup.Field.ACCUMULATE, True)  # accumulate INTO state
-            for kp in cutlass.range(num_k_blocks_kv, unroll_full=True):
-                cute.gemm(
-                    kv_tiled_mma,
-                    state,
-                    kv_a_frag[None, None, kp],
-                    tCrKt[None, None, kp, kt_cons_r.index],
-                    state,
+            # ===================== Main chunk loop =====================
+            for chunk_idx in cutlass.range(0, NT, unroll=0):
+
+                # ── Step 1: state → bf16 A-frag for WH MMA (non-destructive) ──
+                wh_a_frag = self._make_acc_into_op(
+                    state, wh_tiled_mma.tv_layout_A, self.io_dtype,
                 )
-            warpgroup.commit_group()
-            warpgroup.wait_group(0)
-            kt_pipeline.consumer_release(kt_cons_e)
-            kt_cons_r.advance()
-            kt_cons_e.advance()
 
-        # ===================== Write state to GMEM =====================
-        if is_he_mode:
-            for ei in cutlass.range(cute.size(state), unroll_full=True):
-                v_coord, k_coord = tCcM_kv[ei]
-                he_tensor[(k_coord, v_coord + tile_idx * self.BV, (i_h, i_subseq))] = state[ei]
-        else:
-            k_col_tile = tile_idx - num_v_tiles
-            for ei in cutlass.range(cute.size(state), unroll_full=True):
-                v_coord, k_coord = tCcM_kv[ei]
-                col_global = v_coord + k_col_tile * self.BS
-                m_tensor[(k_coord, col_global, (i_h, i_subseq))] = state[ei]
+                # ── Step 2: WH MMA — acc_wh = state_bf16 @ W ──
+                w_pipeline.consumer_wait(w_cons_r)
+                warpgroup.fence()
+                num_k_blocks_wh = cute.size(tCrW, mode=[2])
+                wh_tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
+                for kp in cutlass.range(num_k_blocks_wh, unroll_full=True):
+                    cute.gemm(
+                        wh_tiled_mma,
+                        acc_wh,
+                        wh_a_frag[None, None, kp],
+                        tCrW[None, None, kp, w_cons_r.index],
+                        acc_wh,
+                    )
+                    wh_tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                warpgroup.commit_group()
+                warpgroup.wait_group(0)
+                w_pipeline.consumer_release(w_cons_e)
+                w_cons_r.advance()
+                w_cons_e.advance()
+
+                # ── Step 3: v_new = U - WH (he) or -WH (m); tail mask ──
+                if is_he_mode:
+                    u_pipeline.consumer_wait(u_cons_r)
+                    for ei in cutlass.range(cute.size(acc_wh), unroll_full=True):
+                        v_coord, t_coord = tCcM_wh[ei]
+                        u_val = sU_epi[(v_coord, t_coord, u_cons_r.index)].to(self.acc_dtype)
+                        acc_wh[ei] = u_val - acc_wh[ei]
+                    u_pipeline.consumer_release(u_cons_e)
+                    u_cons_r.advance()
+                    u_cons_e.advance()
+                else:
+                    for ei in cutlass.range(cute.size(acc_wh), unroll_full=True):
+                        acc_wh[ei] = -acc_wh[ei]
+
+                valid_len_chunk = seq_len - chunk_idx * self.BT
+                if valid_len_chunk < self.BT:
+                    for ei in cutlass.range(cute.size(acc_wh), unroll_full=True):
+                        _, t_coord = tCcM_wh[ei]
+                        if t_coord >= valid_len_chunk:
+                            acc_wh[ei] = Float32(0.0)
+
+                # ── Step 4: gk decay — apply directly to state registers ──
+                if use_gk != 0:
+                    gk_pipeline.consumer_wait(gk_cons_r)
+                    if local_tid < self.BK:
+                        sGK_smem[(local_tid, gk_cons_r.index)] = cute.exp2(
+                            sGK_smem[(local_tid, gk_cons_r.index)],
+                            fastmath=self.use_fast_math,
+                        )
+                    cute.arch.barrier(
+                        barrier_id=1,
+                        number_of_threads=self.num_mma_wgs * self.threads_per_wg,
+                    )
+                    for ei in cutlass.range(cute.size(state), unroll_full=True):
+                        _, k_coord = tCcM_kv[ei]
+                        state[ei] = state[ei] * sGK_smem[(k_coord, gk_cons_r.index)]
+                    gk_pipeline.consumer_release(gk_cons_e)
+                    gk_cons_r.advance()
+                    gk_cons_e.advance()
+
+                # ── Step 5: KV MMA — state += v_new @ K^T (ACC=True) ──
+                kv_a_frag = self._make_acc_into_op(
+                    acc_wh, kv_tiled_mma.tv_layout_A, self.io_dtype,
+                )
+
+                kt_pipeline.consumer_wait(kt_cons_r)
+                warpgroup.fence()
+                num_k_blocks_kv = cute.size(tCrKt, mode=[2])
+                kv_tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                for kp in cutlass.range(num_k_blocks_kv, unroll_full=True):
+                    cute.gemm(
+                        kv_tiled_mma,
+                        state,
+                        kv_a_frag[None, None, kp],
+                        tCrKt[None, None, kp, kt_cons_r.index],
+                        state,
+                    )
+                warpgroup.commit_group()
+                warpgroup.wait_group(0)
+                kt_pipeline.consumer_release(kt_cons_e)
+                kt_cons_r.advance()
+                kt_cons_e.advance()
+
+            # ===================== Write state to GMEM =====================
+            if is_he_mode:
+                for ei in cutlass.range(cute.size(state), unroll_full=True):
+                    v_coord, k_coord = tCcM_kv[ei]
+                    he_tensor[(k_coord, v_coord + tile_idx * self.BV, (i_h, i_subseq))] = state[ei]
+            else:
+                k_col_tile = tile_idx - num_v_tiles
+                for ei in cutlass.range(cute.size(state), unroll_full=True):
+                    v_coord, k_coord = tCcM_kv[ei]
+                    col_global = v_coord + k_col_tile * self.BS
+                    m_tensor[(k_coord, col_global, (i_h, i_subseq))] = state[ei]
 
 
 # =====================================================================
@@ -762,12 +791,13 @@ class ChunkDeltaRulePreScanFusedSm90:
 _pre_scan_sm90_kernel_cache: dict = {}
 
 
-def _compile_pre_scan_sm90_variant(H, K, V, chunk_size, use_fast_math):
+def _compile_pre_scan_sm90_variant(H, K, V, chunk_size, use_fast_math, block_v=64):
     """Compile one SM90 ``ChunkDeltaRulePreScanFusedSm90`` kernel variant."""
     kernel_obj = ChunkDeltaRulePreScanFusedSm90(
         chunk_size=chunk_size,
         head_dim_k=K,
         head_dim_v=V,
+        block_v=block_v,
         use_fast_math=use_fast_math,
     )
 
@@ -806,9 +836,9 @@ def _compile_pre_scan_sm90_variant(H, K, V, chunk_size, use_fast_math):
     return compiled_fn
 
 
-def get_compiled_pre_scan_sm90(H, K, V, chunk_size):
+def get_compiled_pre_scan_sm90(H, K, V, chunk_size, block_v=64):
     """Get cached compiled SM90 pre-scan kernel."""
-    key = (H, K, V, chunk_size, USE_FAST_MATH)
+    key = (H, K, V, chunk_size, USE_FAST_MATH, block_v)
     if key not in _pre_scan_sm90_kernel_cache:
-        _pre_scan_sm90_kernel_cache[key] = _compile_pre_scan_sm90_variant(H, K, V, chunk_size, USE_FAST_MATH)
+        _pre_scan_sm90_kernel_cache[key] = _compile_pre_scan_sm90_variant(H, K, V, chunk_size, USE_FAST_MATH, block_v)
     return _pre_scan_sm90_kernel_cache[key]
