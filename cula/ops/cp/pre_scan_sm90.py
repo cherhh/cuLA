@@ -443,6 +443,12 @@ class ChunkDeltaRulePreScanFusedSm90:
         wg_idx = cute.arch.make_warp_uniform(tidx // self.threads_per_wg)
         warp_in_wg = cute.arch.make_warp_uniform((tidx // self.threads_per_warp) % 4)
 
+        if wg_idx == self.load_wg_id and warp_in_wg == 0:
+            cpasync.prefetch_descriptor(tma_atom_w)
+            cpasync.prefetch_descriptor(tma_atom_kt)
+            cpasync.prefetch_descriptor(tma_atom_u)
+            cpasync.prefetch_descriptor(tma_atom_gk)
+
         # ===================== SMEM allocation =====================
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -498,6 +504,7 @@ class ChunkDeltaRulePreScanFusedSm90:
         eos = cu_seqlens[i_subseq + 1]
         seq_len = eos - bos
         NT = (seq_len + self.BT - 1) // self.BT
+        has_tail = NT * self.BT != seq_len
 
         is_he_mode = tile_idx < num_v_tiles
 
@@ -578,6 +585,16 @@ class ChunkDeltaRulePreScanFusedSm90:
                     w_pipeline.producer_commit(w_prod)
                     w_prod.advance()
 
+                    kt_pipeline.producer_acquire(kt_prod)
+                    cute.copy(
+                        tma_atom_kt,
+                        tKgK[None, 0, chunk_idx],
+                        tKsK[None, kt_prod.index],
+                        tma_bar_ptr=kt_pipeline.producer_get_barrier(kt_prod),
+                    )
+                    kt_pipeline.producer_commit(kt_prod)
+                    kt_prod.advance()
+
                     # Load U[v, t=chunk*BT..(chunk+1)*BT] — only used in he-mode.
                     # tile_idx selects which V-tile of U to load (BV=64 → 2 tiles).
                     if is_he_mode:
@@ -590,17 +607,6 @@ class ChunkDeltaRulePreScanFusedSm90:
                         )
                         u_pipeline.producer_commit(u_prod)
                         u_prod.advance()
-
-                    # Load K^T[chunk_idx]
-                    kt_pipeline.producer_acquire(kt_prod)
-                    cute.copy(
-                        tma_atom_kt,
-                        tKgK[None, 0, chunk_idx],
-                        tKsK[None, kt_prod.index],
-                        tma_bar_ptr=kt_pipeline.producer_get_barrier(kt_prod),
-                    )
-                    kt_pipeline.producer_commit(kt_prod)
-                    kt_prod.advance()
 
                     # Load gk[t = last valid token in this chunk]
                     if use_gk != 0:
@@ -721,12 +727,13 @@ class ChunkDeltaRulePreScanFusedSm90:
                     for ei in cutlass.range(cute.size(acc_wh), unroll_full=True):
                         acc_wh[ei] = -acc_wh[ei]
 
-                valid_len_chunk = seq_len - chunk_idx * self.BT
-                if valid_len_chunk < self.BT:
-                    for ei in cutlass.range(cute.size(acc_wh), unroll_full=True):
-                        _, t_coord = tCcM_wh[ei]
-                        if t_coord >= valid_len_chunk:
-                            acc_wh[ei] = Float32(0.0)
+                if has_tail:
+                    valid_len_chunk = seq_len - chunk_idx * self.BT
+                    if valid_len_chunk < self.BT:
+                        for ei in cutlass.range(cute.size(acc_wh), unroll_full=True):
+                            _, t_coord = tCcM_wh[ei]
+                            if t_coord >= valid_len_chunk:
+                                acc_wh[ei] = Float32(0.0)
 
                 # ── Step 4: gk decay — apply directly to state registers ──
                 if use_gk != 0:
