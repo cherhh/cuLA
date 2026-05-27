@@ -196,9 +196,10 @@ def prepare_subseq_cu_seqlens(
     (each a multiple of chunk_size); shorter sequences are kept intact.
     Returns (expanded boundaries, SplitSeqInfo or False, total_subseqs).
     """
-    N = len(cu_seqlens_cpu) - 1
+    cu_list = cu_seqlens_cpu.tolist()
+    N = len(cu_list) - 1
     if N == 0:
-        return cu_seqlens_cpu.tolist(), False, 0
+        return cu_list, False, 0
 
     subseq_chunks = (subseq_len + chunk_size - 1) // chunk_size
     threshold_subseq_len = 3 * subseq_len
@@ -211,8 +212,8 @@ def prepare_subseq_cu_seqlens(
     cumsum_offset = 0
 
     for i in range(N):
-        seq_start = int(cu_seqlens_cpu[i].item())
-        seq_end = int(cu_seqlens_cpu[i + 1].item())
+        seq_start = cu_list[i]
+        seq_end = cu_list[i + 1]
         seq_len_i = seq_end - seq_start
         seq_chunks_i = (seq_len_i + chunk_size - 1) // chunk_size
 
@@ -232,7 +233,7 @@ def prepare_subseq_cu_seqlens(
             cumsum_offset += 1
 
     if not split_seq_ids:
-        return cu_seqlens_cpu.tolist(), False, 0
+        return cu_list, False, 0
 
     total_subseqs = cumsum_offset
     split_info = SplitSeqInfo(
@@ -257,7 +258,6 @@ class _PrecomputedIndices(NamedTuple):
 
 def _precompute_intracard_indices(
     split_info: SplitSeqInfo,
-    cu_seqlens_subseq_values: list[int],
     N_orig: int,
 ) -> _PrecomputedIndices:
     """Precompute scatter/gather indices from split metadata."""
@@ -510,7 +510,7 @@ def intracard_fwd_h(
             merge_seq_starts,
             merge_seq_counts,
             merge_init_offsets,
-        ) = _precompute_intracard_indices(split_info, cu_seqlens_subseq_values, N_orig)
+        ) = _precompute_intracard_indices(split_info, N_orig)
 
         non_first_indices = torch.tensor(non_first_indices, dtype=torch.int64, device=device)
         first_subseq_indices = torch.tensor(first_subseq_indices, dtype=torch.int64, device=device)

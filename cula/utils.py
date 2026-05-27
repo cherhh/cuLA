@@ -126,9 +126,7 @@ def get_pre_scan(device: torch.device | str | int | None = None) -> Callable:
 
         return chunk_delta_rule_pre_scan
     elif major == 9 and minor == 0:
-        from cula.ops.cp.pre_scan_sm90 import chunk_delta_rule_pre_scan
-
-        return chunk_delta_rule_pre_scan
+        raise NotImplementedError("The Hopper (SM90) implementation of pre_scan is not yet available.")
     else:
         raise RuntimeError(
             f"Unsupported CUDA compute capability sm_{major}{minor}. "

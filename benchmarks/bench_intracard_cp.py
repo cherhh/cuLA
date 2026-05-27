@@ -155,7 +155,7 @@ def run_cp(q, k, v, g, beta, scale, A_log, dt_bias, cu_seqlens, lower_bound, *, 
 
 def predict_cp(seq_lens, H, num_sms):
     cu = torch.tensor(
-        [0] + list(torch.tensor(seq_lens).cumsum(0).tolist()),
+        exclusive_cumsum(seq_lens),
         dtype=torch.int32,
     )
     if not should_use_intracard_cp(cu, num_sms, H, BT):
