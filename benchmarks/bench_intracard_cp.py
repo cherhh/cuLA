@@ -1,144 +1,68 @@
 #!/usr/bin/env python3
 # Copyright 2025-2026 Ant Group Co., Ltd.
-# Licensed under the Apache License, Version 2.0.
-"""Intracard-CP benchmark — end-to-end chunk_kda.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+bench_intracard_cp.py — Benchmark: Intracard Context-Parallel speedup
+                        for chunk_kda (KDA forward)
 
 Measures the speedup of cuLA's intracard context-parallel path against the
 non-CP baseline across a range of varlen configurations.  Also verifies that
 the heuristic does not regress throughput when CP is correctly bypassed.
 
 Usage:
-    python benchmarks/bench_intracard_cp.py
-    python benchmarks/bench_intracard_cp.py --warmup 5 --n-iters 50
-    python benchmarks/bench_intracard_cp.py --ncu
-"""
+  python bench_intracard_cp.py [--ncu] [--sanitizer]
 
-from __future__ import annotations
+With --ncu, warmup=1 and iters=1 for ncu profiling:
+  ncu --set full -o report python bench_intracard_cp.py --ncu
+"""
 
 import argparse
 import contextlib
 import os
 import pathlib
 import sys
-from dataclasses import dataclass
 
 os.environ.setdefault("CULA_INTRACARD_CP", "1")
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
+import torch
 
-from cula.ops.cp.chunk_delta_h import (  # noqa: E402
+from benchmarks.utils import (
+    SEED,
+    exclusive_cumsum,
+    prepare_safe_gate_inputs,
+    set_seed,
+)
+from cula.kda.chunk_fwd import chunk_kda_fwd
+from cula.ops.cp.chunk_delta_h import (
     compute_subseq_len,
     prepare_subseq_cu_seqlens,
     should_use_intracard_cp,
 )
-from cula.utils import get_device_sm_count  # noqa: E402
+from cula.utils import get_device_sm_count
 
-BT, K, V, D = 64, 128, 128, 128
-
+# ============================================================
+# Constants
+# ============================================================
+BT, D = 64, 128
+H_VALUES = [4, 8]
 WARMUP = 10
 N_ITERS = 100
-NCU_MODE = False  # set by --ncu; forces warmup=1, n_iters=1
-
-
-# ============================== env toggle ==============================
-
-
-@contextlib.contextmanager
-def cp_on(enable: bool):
-    old = os.environ.get("CULA_INTRACARD_CP")
-    os.environ["CULA_INTRACARD_CP"] = "1" if enable else "0"
-    try:
-        if enable:
-            with torch.inference_mode():
-                yield
-        else:
-            yield
-    finally:
-        if old is None:
-            os.environ.pop("CULA_INTRACARD_CP", None)
-        else:
-            os.environ["CULA_INTRACARD_CP"] = old
-
-
-# ============================== inputs ==============================
-
-
-def make_inputs(seq_lens, H, seed=42, device="cuda", dtype=torch.bfloat16):
-    total = sum(seq_lens)
-    cu = [0]
-    for s in seq_lens:
-        cu.append(cu[-1] + s)
-    torch.manual_seed(seed)
-    q = torch.randn(1, total, H, D, dtype=dtype, device=device)
-    k = F.normalize(torch.randn(1, total, H, D, dtype=torch.float32, device=device), p=2, dim=-1).to(dtype)
-    v = torch.randn(1, total, H, D, dtype=dtype, device=device)
-    g = F.logsigmoid(torch.randn(1, total, H, D, dtype=torch.float32, device=device)).clamp(-5, 0)
-    beta = torch.randn(1, total, H, dtype=torch.float32, device=device).sigmoid()
-    cu_t = torch.tensor(cu, dtype=torch.int32, device=device)
-    return q, k, v, g, beta, cu_t
-
-
-# ============================== bench harness ==============================
-
-
-def time_kernel(fn, warmup, n_iters) -> float:
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(n_iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / n_iters
-
-
-def run_chunk_kda(q, k, v, g, beta, cu, *, enable_cp: bool) -> None:
-    from cula.kda.chunk_fwd import chunk_kda_fwd
-
-    scale = D**-0.5
-    with cp_on(enable_cp):
-        chunk_kda_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=None,
-            output_final_state=False,
-            cu_seqlens=cu,
-            cu_seqlens_cpu=cu.cpu(),
-            safe_gate=True,
-            lower_bound=-5.0,
-            use_gate_in_kernel=False,
-        )
-
-
-# ============================== strategy predict ==============================
-
-
-def predict_cp(seq_lens, H, num_sms):
-    cu = torch.tensor(
-        [0] + list(torch.tensor(seq_lens).cumsum(0).tolist()),
-        dtype=torch.int32,
-    )
-    if not should_use_intracard_cp(cu, num_sms, H, BT):
-        return False, 0
-    max_len = int(torch.diff(cu).max().item())
-    subseq_len = compute_subseq_len(max_len, num_sms, H, BT, num_seqs=len(seq_lens))
-    _, split_info, total_subseqs = prepare_subseq_cu_seqlens(cu, subseq_len, BT)
-    return bool(split_info), total_subseqs
-
-
-# ============================== configs ==============================
+NCU_MODE = False
+SANITIZER_MODE = False
 
 # (tag, seq_lens) — each entry is tested at every H in H_VALUES
 CONFIGS = [
@@ -166,91 +90,231 @@ CONFIGS = [
     ("128K+10x1K", [131072] + [1024] * 10),
 ]
 
-H_VALUES = [4, 8]
+
+# ============================================================
+# CP toggle
+# ============================================================
+@contextlib.contextmanager
+def cp_on(enable: bool):
+    old = os.environ.get("CULA_INTRACARD_CP")
+    os.environ["CULA_INTRACARD_CP"] = "1" if enable else "0"
+    try:
+        if enable:
+            with torch.inference_mode():
+                yield
+        else:
+            yield
+    finally:
+        if old is None:
+            os.environ.pop("CULA_INTRACARD_CP", None)
+        else:
+            os.environ["CULA_INTRACARD_CP"] = old
 
 
-# ============================== row + report ==============================
+# ============================================================
+# Helpers
+# ============================================================
+def time_kernel(fn, warmup=None, n_iters=None):
+    if warmup is None:
+        warmup = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
+    if n_iters is None:
+        n_iters = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    for _ in range(n_iters):
+        fn()
+    end_evt.record()
+    torch.cuda.synchronize()
+    return start_evt.elapsed_time(end_evt) / n_iters
 
 
-@dataclass
-class Row:
-    tag: str
-    H: int
-    total_T: int
-    pred: bool
-    n_sub: int
-    ms_off: float
-    ms_on: float
+def run_cp(q, k, v, g, beta, scale, A_log, dt_bias, cu_seqlens, lower_bound, *, enable_cp):
+    with cp_on(enable_cp):
+        chunk_kda_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=None,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens.cpu(),
+            safe_gate=True,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=True,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
 
-    @property
-    def speedup(self) -> float:
-        return self.ms_off / self.ms_on
+
+def predict_cp(seq_lens, H, num_sms):
+    cu = torch.tensor(
+        [0] + list(torch.tensor(seq_lens).cumsum(0).tolist()),
+        dtype=torch.int32,
+    )
+    if not should_use_intracard_cp(cu, num_sms, H, BT):
+        return False, 0
+    max_len = int(torch.diff(cu).max().item())
+    subseq_len = compute_subseq_len(max_len, num_sms, H, BT, num_seqs=len(seq_lens))
+    _, split_info, total_subseqs = prepare_subseq_cu_seqlens(cu, subseq_len, BT)
+    return bool(split_info), total_subseqs
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--warmup", type=int, default=None)
-    ap.add_argument("--n-iters", type=int, default=None, dest="n_iters")
-    ap.add_argument("--ncu", action="store_true", help="NCU mode: warmup=1, n_iters=1")
-    args = ap.parse_args()
+# ============================================================
+# Benchmark
+# ============================================================
+def bench_cp(h_values, configs):
+    print("\n" + "=" * 100)
+    print(" Intracard CP Benchmark: CP-on vs CP-off")
+    print("=" * 100)
 
-    global NCU_MODE
-    NCU_MODE = args.ncu
-
-    assert torch.cuda.is_available(), "CUDA required"
     device = torch.device("cuda")
     num_sms = get_device_sm_count(device)
+    results = []
 
-    warmup = 1 if NCU_MODE else (args.warmup or WARMUP)
-    n_iters = 1 if NCU_MODE else (args.n_iters or N_ITERS)
+    for H in h_values:
+        for tag, seq_lens in configs:
+            set_seed(SEED)
+            torch.cuda.empty_cache()
 
-    print(f"Device: {torch.cuda.get_device_name(device)} (SM={num_sms})")
-    print(f"Bench : warmup={warmup}, n_iters={n_iters}")
-    print()
+            total_T = sum(seq_lens)
+            cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+            inputs = prepare_safe_gate_inputs(1, total_T, H, D, device, cu_seqlens=cu_seqlens, seed=SEED)
+            q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+            A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
+            scale, lower_bound = inputs["scale"], inputs["lower_bound"]
 
-    hdr = f"{'config':<24s} {'T':>7} {'pred':>4} {'sub':>4}  {'CP_off':>8}  {'CP_on':>8}  {'speedup':>8}"
-    sep = "-" * len(hdr)
-
-    all_rows: list[Row] = []
-    for H in H_VALUES:
-        print(f"--- H={H} ---")
-        print(hdr)
-        print(sep)
-        for tag, seq_lens in CONFIGS:
             pred, n_sub = predict_cp(seq_lens, H, num_sms)
-            q, k, v, g, beta, cu = make_inputs(seq_lens, H)
-            ms_off = time_kernel(lambda: run_chunk_kda(q, k, v, g, beta, cu, enable_cp=False), warmup, n_iters)
-            ms_on = time_kernel(lambda: run_chunk_kda(q, k, v, g, beta, cu, enable_cp=True), warmup, n_iters)
-            r = Row(tag=tag, H=H, total_T=sum(seq_lens), pred=pred, n_sub=n_sub, ms_off=ms_off, ms_on=ms_on)
-            all_rows.append(r)
-            pred_s = "Y" if pred else "N"
-            print(
-                f"{r.tag:<24s} {r.total_T:>7}    {pred_s}  {r.n_sub:>4d}  "
-                f"{r.ms_off:>8.3f}  {r.ms_on:>8.3f}  {r.speedup:>7.2f}x"
-            )
-        print()
 
-    triggered = [r for r in all_rows if r.pred]
-    bypassed = [r for r in all_rows if not r.pred]
+            common = dict(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                cu_seqlens=cu_seqlens,
+                lower_bound=lower_bound,
+            )
+
+            ms_off = time_kernel(lambda: run_cp(**common, enable_cp=False))
+            ms_on = time_kernel(lambda: run_cp(**common, enable_cp=True))
+
+            r = {
+                "tag": tag,
+                "H": H,
+                "total_T": total_T,
+                "pred": pred,
+                "n_sub": n_sub,
+                "ms_off": ms_off,
+                "ms_on": ms_on,
+                "speedup": ms_off / ms_on if ms_on > 0 else float("inf"),
+            }
+            results.append(r)
+
+            del q, k, v, g, beta, A_log, dt_bias, inputs
+            torch.cuda.empty_cache()
+
+    return results
+
+
+# ============================================================
+# Report
+# ============================================================
+def print_report(results, h_values):
+    sep = "=" * 110
+    print(f"\n\n{sep}")
+    print("                       BENCHMARK REPORT: Intracard CP")
+    print("                       CP-on vs CP-off (same kernel, different code paths)")
+    print(f"                       D={D}  dtype=bf16  safe_gate=True")
+    wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
+    ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
+    mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
+    print(f"                       Warmup={wu}  Iters={ni}{mode_tag}")
+    print(sep)
+
+    for H_val in h_values:
+        h_results = [r for r in results if r["H"] == H_val]
+        if not h_results:
+            continue
+
+        print(f"\n  [H={H_val}]")
+        print(f"  {'─' * 95}")
+        print(
+            f"  {'config':<24s} {'T':>7s}  {'pred':>4s} {'sub':>4s}"
+            f"  │  {'CP_off(ms)':>10s}  {'CP_on(ms)':>10s}  {'Speedup':>8s}"
+        )
+        print(f"  {'─' * 95}")
+        for r in h_results:
+            pred_s = "Y" if r["pred"] else "N"
+            print(
+                f"  {r['tag']:<24s} {r['total_T']:>7d}     {pred_s}  {r['n_sub']:>4d}"
+                f"  │  {r['ms_off']:>10.4f}  {r['ms_on']:>10.4f}  {r['speedup']:>7.2f}x"
+            )
+        print(f"  {'─' * 95}")
+
+    # Summary
+    triggered = [r for r in results if r["pred"]]
+    bypassed = [r for r in results if not r["pred"]]
 
     if triggered:
-        speedups = [r.speedup for r in triggered]
+        speedups = [r["speedup"] for r in triggered]
         geo = 1.0
         for s in speedups:
             geo *= s
         geo = geo ** (1 / len(speedups))
         print(
-            f"CP triggered ({len(triggered)} configs): "
+            f"\n  CP triggered ({len(triggered)} configs): "
             f"geo-mean={geo:.2f}x  best={max(speedups):.2f}x  worst={min(speedups):.2f}x"
         )
 
     if bypassed:
-        ratios = [r.ms_on / r.ms_off for r in bypassed]
+        ratios = [r["ms_on"] / r["ms_off"] for r in bypassed]
         print(
-            f"CP bypassed  ({len(bypassed)} configs): "
+            f"  CP bypassed  ({len(bypassed)} configs): "
             f"mean overhead={sum(ratios) / len(ratios):.3f}x  max={max(ratios):.3f}x  "
             f"(1.00 = no regression)"
         )
+
+    print(f"\n{sep}\n")
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser(description="bench_intracard_cp: CP-on vs CP-off benchmark")
+    parser.add_argument(
+        "--ncu",
+        action="store_true",
+        help="NCU profiling mode: warmup=1, iters=1",
+    )
+    parser.add_argument(
+        "--sanitizer",
+        action="store_true",
+        help="Sanitizer mode: warmup=1, iters=1",
+    )
+    args = parser.parse_args()
+
+    global NCU_MODE, SANITIZER_MODE
+    if args.ncu:
+        NCU_MODE = True
+        print("[NCU mode] warmup=1, iters=1")
+    if args.sanitizer:
+        SANITIZER_MODE = True
+        print("[Sanitizer mode] warmup=1, iters=1")
+
+    results = bench_cp(H_VALUES, CONFIGS)
+    print_report(results, H_VALUES)
+    return results
 
 
 if __name__ == "__main__":

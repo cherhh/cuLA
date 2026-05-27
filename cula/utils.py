@@ -110,6 +110,34 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
         )
 
 
+def get_pre_scan(device: torch.device | str | int | None = None) -> Callable:
+    """Return the appropriate ``chunk_delta_rule_pre_scan`` implementation for *device*.
+
+    - sm100/sm103 (Blackwell) → cula.ops.cp.pre_scan (CuTeDSL SM100 kernel)
+    - sm90  (Hopper)          → cula.ops.cp.pre_scan_sm90 (to be implemented)
+
+    Args:
+        device: CUDA device to query.  Defaults to the currently active device.
+
+    Raises:
+        RuntimeError: If the device architecture is not supported.
+    """
+    major, minor = get_device_sm_version(device)
+    if major == 10 and minor in (0, 3):
+        from cula.ops.cp.pre_scan import chunk_delta_rule_pre_scan
+
+        return chunk_delta_rule_pre_scan
+    elif major == 9 and minor == 0:
+        from cula.ops.cp.pre_scan_sm90 import chunk_delta_rule_pre_scan
+
+        return chunk_delta_rule_pre_scan
+    else:
+        raise RuntimeError(
+            f"Unsupported CUDA compute capability sm_{major}{minor}. "
+            f"Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
+        )
+
+
 @cute.jit
 def print_tensor_2d(tensor: cute.Tensor):
     """
