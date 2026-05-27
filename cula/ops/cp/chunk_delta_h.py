@@ -47,7 +47,7 @@ _chunk_gated_delta_rule_fwd_h = None
 def _get_fwd_h():
     global _chunk_gated_delta_rule_fwd_h
     if _chunk_gated_delta_rule_fwd_h is None:
-        from cula.ops.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+        from cula.ops.chunk_delta_h_sm100 import chunk_gated_delta_rule_fwd_h
 
         _chunk_gated_delta_rule_fwd_h = chunk_gated_delta_rule_fwd_h
     return _chunk_gated_delta_rule_fwd_h
