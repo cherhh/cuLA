@@ -4,8 +4,8 @@
 # ruff: noqa: F821
 """3-way FlashKDA prefill benchmark:
 
-  * cute : CuTeDSL ``cula.ops.flashkda_prefill.flash_kda_prefill``
-           (env ``CULA_FLASHKDA_USE_CUTE=1`` -> ``launch_k1_full + launch_k2_phaseB``)
+  * cute : CuTeDSL ``cula.ops.flashkda.prefill.flash_kda_prefill``
+           (env ``CULA_FLASHKDA_USE_CUTE=1`` -> ``launch_k1 + launch_k2``)
   * cpp  : CUTLASS C++ ``flash_kda_C.fwd``
   * fla  : Triton ``fla.ops.kda.chunk_kda``
 
@@ -36,7 +36,7 @@ os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))
 import torch  # noqa: E402
 
 from benchmarks.utils import SEED, exclusive_cumsum, set_seed  # noqa: E402
-from cula.ops.flashkda_prefill import flash_kda_prefill  # noqa: E402
+from cula.ops.flashkda.prefill import flash_kda_prefill  # noqa: E402
 
 try:
     import flash_kda_C as flash_kda_cpp  # noqa: F401

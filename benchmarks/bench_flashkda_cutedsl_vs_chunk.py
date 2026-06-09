@@ -56,7 +56,7 @@ from benchmarks.utils import (
     set_seed,
 )
 from cula.kda import chunk_kda as cula_chunk_kda
-from cula.ops.flashkda_prefill import flash_kda_prefill
+from cula.ops.flashkda.prefill import flash_kda_prefill
 
 # ============================================================
 # Constants

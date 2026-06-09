@@ -1,40 +1,8 @@
-"""FlashKDA K2 Phase G — Phase E1 + tensor-core phase 6.
+"""FlashKDA K2 (Recurrence) — CuTeDSL port.
 
-Phase G adds a TC MMA for phase 6 (state += kr.T @ U) using SM80
-16x8x16 BF16 atom with LDSM.x4.trans on the existing sU/sKr SMEM
-layouts (no physical transpose). The state update uses an in-frag
-epilogue that loads sState, multiplies by gt, adds the MMA delta,
-and writes back as bf16.
-
-Key trick: A operand U^T is the (D, CHUNK) transpose-VIEW of sU
-built via cute.select(layout, mode=[1, 0]); B operand is sKr (CHUNK, D)
-used directly. Both feed LdMatrix8x8x16bOp(transpose=True).
-
-Legacy header preserved below.
-
-FlashKDA K2 Phase E1 — partial tensor-core port.
-
-This is the FIRST step toward C++-parity for the cute K2:
-
-  * Mirrors Phase B's structure (single CTA, 128 threads, 1 LOAD warp via
-    `elect_one`, in-thread compute) so we only swap math, not scaffolding.
-  * Replaces the TWO LARGEST scalar GEMMs with SM80 16x8x16 BF16 tensor core
-    MMAs (`cute.nvgpu.warp.MmaF16BF16Op`):
-        - phase-1 ``u_pre = kd @ state`` (M=16, N=128, K=128)
-        - phase-4 ``out0  = qd @ state`` (M=16, N=128, K=128)
-    These two have K=128 each (vs K=16 for INV@u, Mqk@u, kr.T@u) and dominate
-    the scalar runtime by ~8x per GEMM.
-  * Other GEMMs (INV@u, Mqk@u, state update kr.T@u + state*gt) keep the
-    scalar implementation from Phase B for now (smaller K=16, lower priority).
-
-Tiled-MMA layout:
-  * Atom: SM80 (16, 8, 16) BF16 -> FP32
-  * atom_layout = (1, 4, 1)  -> 4 warps split N=128 into 4 stripes of N=32
-  * permutation_mnk = (16, 32, 16) -> per-CTA tile (16, 128, 16) with 4 N
-    blocks per K iter; K-loop = D/16 = 8 iters
-
-If this matches Phase B numerically, Phase E2 will fold in the remaining 3
-GEMMs + warp-spec/pipeline scaffolding from Phase D.
+Warp-specialized (LOAD/MMA/STORE) recurrence kernel with SM80 tensor-core
+MMAs, 2-stage TMA pipeline, and swizzled SMEM layouts. 192 threads
+(4 MMA warps + 1 LOAD warp + 1 STORE warp).
 """
 
 from __future__ import annotations
@@ -48,8 +16,18 @@ from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import from_dlpack
 
-from cula.ops.flashkda_k2 import CHUNK, D, _make_state_smem_layout
-from cula.ops.flashkda_prefill import movm_t_b16
+CHUNK: int = 16
+D: int = 128
+
+
+def _make_state_smem_layout():
+    atom = cute.make_composed_layout(
+        cute.make_swizzle(3, 3, 3),
+        0,
+        cute.make_layout((8, 64), stride=(64, 1)),
+    )
+    return cute.tile_to_shape(atom, (D, D), (0, 1))
+from cula.ops.flashkda.prefill import movm_t_b16
 
 
 def _make_out_kinter_one_stage():
@@ -70,18 +48,8 @@ LOAD_WARP_IDX = 4
 STORE_WARP_IDX = 5
 
 
-def _make_qk_smem_layout():
-    """Plain K-major (CHUNK, D) layout, matching Phase B.
-
-    NOTE: When cute.gemm is wired in (Phase E2), this should switch to a
-    swizzled K_INTER atom for SM80 16x8x16 MMA A-operand. For now keep plain
-    layout to keep TMA partitioning identical to Phase B.
-    """
-    return cute.make_layout((CHUNK, D), stride=(D, 1))
-
-
 @cute.kernel
-def k2_phaseN_kernel(
+def k2_kernel(
     tma_atom_v: cute.CopyAtom,
     tma_tensor_v: cute.Tensor,
     tma_atom_kd: cute.CopyAtom,
@@ -104,52 +72,33 @@ def k2_phaseN_kernel(
     total_tiles: cutlass.Constexpr[int],
     T_total: cutlass.Constexpr[int],
     cu_seqlens_tiles: cute.Tensor,
-    initial_state_g: cute.Tensor,  # flat fp32 [N*H*D*D], bhvk (V-major) gmem
-    final_state_g: cute.Tensor,  # flat fp32 [N*H*D*D], bhvk (V-major) gmem
+    initial_state_g: cute.Tensor,  # flat fp32 [N*H*D*D] gmem (layout per state_transposed)
+    final_state_g: cute.Tensor,  # flat fp32 [N*H*D*D] gmem (layout per state_transposed)
     has_initial_state: cutlass.Constexpr[bool],
     has_final_state: cutlass.Constexpr[bool],
+    state_transposed: cutlass.Constexpr[bool],
 ):
     seq_idx, head_idx, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
 
     smem = cutlass.utils.SmemAllocator()
 
-    qk_layout = _make_qk_smem_layout()  # K-major swizzled, MMA-ready  # noqa: F841 (kept for parity)
-    cc_layout = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))  # noqa: F841 (kept for parity)
-    state_layout = _make_state_smem_layout()  # swizzled K-major
-    # Phase 6 reads sKr's (D, CHUNK) transposed view directly via LdMatrix.x4.trans
-    # (matches cpp baseline). No sKr_T SMEM, no manual transpose loop, no extra
-    # cross-warp barrier.
+    state_layout = _make_state_smem_layout()
 
     # Input pipeline (TMA load): InputStages slot ring.
     STAGES: cutlass.Constexpr[int] = 2
     # Output pipeline (TMA store): OutputStages slot ring of sOut tiles.
     OUT_STAGES: cutlass.Constexpr[int] = 2
-    _ = cute.make_layout((CHUNK, D, STAGES), stride=(D, 1, CHUNK * D))  # noqa: F841 (qk_stage_layout)
     cc_stage_layout = cute.make_layout((CHUNK, CHUNK, STAGES), stride=(CHUNK, 1, CHUNK * CHUNK))
-    # sOut now uses K_INTER swizzled atom so STSM_N (cute.copy via
-    # StMatrix8x8x16bOp) produces the correct SMEM thread-data mapping.
     out_kinter_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_INTER, cutlass.BFloat16)
     out_stage_layout = cute.tile_to_shape(out_kinter_atom, (CHUNK, D, OUT_STAGES), order=(0, 1, 2))
-    # sV uses K_INTER swizzled layout to reduce shared-load bank conflicts on the
-    # ldmatrix path that feeds Phase-2 MOVM_T (consumed via partition_C, which is
-    # transparent through swizzle).
     v_kinter_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_INTER, cutlass.BFloat16)
     v_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
-    # sKd K_INTER swizzled layout (consumed via cute.copy(LdMatrix...) only).
     kd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
-    # sQd K_INTER swizzled layout (consumed via cute.copy(LdMatrix...) only).
     qd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
-    # sKr K_INTER swizzled allocation. Same atom as sV/sKd/sQd. Phase 4-prelude
-    # B-load uses LDSM_N on this swizzled (CHUNK, D) view directly. Phase 6
-    # A-load uses LDSM_T on a MN_INTER-atom view of the SAME bytes (cpp
-    # baseline pattern: SMEM written via K_INTER is read via MN_INTER+.trans).
     kr_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
-    # MN_INTER atom for the transposed view of sKr used by Phase 6 (D, CHUNK).
-    # CRITICAL: use order=(1, 0, 2) to match C++ LayoutRight for TransposedMMALayout.
-    # K_INTER (CHUNK, D) uses order=(0,1) = LayoutLeft; the compatible transposed
-    # MN_INTER (D, CHUNK) must use order=(1,0) = LayoutRight so that the outer tile
-    # strides match: K_INTER(t,k) and MN_INTER(k,t) map to the same physical byte.
+    # MN_INTER transposed view of sKr for Phase 6: order=(1,0,2) so K_INTER(t,k) and
+    # MN_INTER(k,t) map to the same physical byte (LdMatrix.x4.trans reads correctly).
     kr_mninter_atom = make_smem_layout_atom(SmemLayoutAtomKind.MN_INTER, cutlass.BFloat16)
     kr_t_stage_layout = cute.tile_to_shape(kr_mninter_atom, (D, CHUNK, STAGES), order=(1, 0, 2))
 
@@ -161,11 +110,7 @@ def k2_phaseN_kernel(
     sMqk = smem.allocate_tensor(cutlass.BFloat16, cc_stage_layout, 128)
     sOut = smem.allocate_tensor(cutlass.BFloat16, out_stage_layout, 128)
     sState = smem.allocate_tensor(cutlass.BFloat16, state_layout, 128)
-    # NOTE: sU_T removed (U is now register-resident via MOVM_T inline PTX).
-    # NOTE: sKr_T removed (Phase 6 uses LdMatrix.x4.trans on sKr directly).
     sGt = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D, 1, STAGES), stride=(1, D, D)), 128)
-    # sBeta padded to 128 bytes (64 bf16 elements) per stage so each TMA-tile
-    # destination is 128-byte aligned (CHUNK=16 bf16 = 32B is too small).
     sBeta = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((CHUNK, 1, STAGES), stride=(1, 64, 64)), 128)
     # ---- mbarriers (Int64 each) ----
     # Load pipeline: full (TMA producer arrival) / empty (compute consumer arrival).
@@ -180,6 +125,8 @@ def k2_phaseN_kernel(
     sMbarSE_ptr = sMbarSE.iterator
 
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    
+    # initial mbarrier
     if warp_idx == 0:
         with cute.arch.elect_one():
             for s in cutlass.range_constexpr(STAGES):
@@ -198,7 +145,8 @@ def k2_phaseN_kernel(
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
 
-    # --- TMA partitioning (same as Phase B) ---
+    # --- TMA partitioning ---
+    # issue tma 
     gSrc_v = cute.local_tile(tma_tensor_v, (CHUNK, D), (None, None, None))
     tVs, tVg = cpasync.tma_partition(
         tma_atom_v,
@@ -277,17 +225,30 @@ def k2_phaseN_kernel(
     if tidx < D:
         for e in cutlass.range_constexpr(D):
             sState[tidx, e] = cutlass.BFloat16(0.0)
-    # Load initial_state (bhvk layout: [N, H, V, K]) -> sState[K_in, D_out]
-    # sState axis 0 = K_in (= tidx), axis 1 = D_out (= d_out iteration).
-    # initial_state[n, h, d_out, k_in] flat offset = n*H*D*D + h*D*D + d_out*D + k_in.
-    # For fixed d_out, all 128 threads access k_in = 0..127 → coalesced (stride-1).
+    # Load initial_state -> sState[K_in, D_out] (sState axis 0 = K_in, axis 1 = D_out).
+    # Two GMEM layouts are supported; both keep the GMEM access coalesced by
+    # having the contiguous (stride-1) axis vary with tidx:
+    #   state_transposed=False  -> [N, H, V, K] (K-contiguous, "bhvk", default):
+    #       offset = n*H*D*D + h*D*D + d_out*D + k_in; tidx = k_in (stride 1).
+    #       Matches the cuLA / FLA decode default ("vk" layout); avoids any
+    #       transpose at the prefill->decode handoff.
+    #   state_transposed=True   -> [N, H, K, V] (V-contiguous):
+    #       offset = n*H*D*D + h*D*D + k_in*D + d_out; tidx = d_out (stride 1).
+    #       Alternative form only for callers that already hold state this way.
+    # Both produce coalesced loads inside K2; prefill perf is identical.
     if has_initial_state:
         state_base = cutlass.Int32(seq_idx) * cutlass.Int32(H * D * D) + cutlass.Int32(head_idx) * cutlass.Int32(D * D)
         if tidx < D:
-            for d_out in cutlass.range_constexpr(D):
-                sState[tidx, d_out] = cutlass.BFloat16(
-                    initial_state_g[state_base + cutlass.Int32(d_out * D) + cutlass.Int32(tidx)]
-                )
+            if state_transposed:
+                for k_in in cutlass.range_constexpr(D):
+                    sState[k_in, tidx] = cutlass.BFloat16(
+                        initial_state_g[state_base + cutlass.Int32(k_in * D) + cutlass.Int32(tidx)]
+                    )
+            else:
+                for d_out in cutlass.range_constexpr(D):
+                    sState[tidx, d_out] = cutlass.BFloat16(
+                        initial_state_g[state_base + cutlass.Int32(d_out * D) + cutlass.Int32(tidx)]
+                    )
     cute.arch.barrier()
 
     # --- SM80 16x8x16 BF16 tiled MMA (4 warps split N=128 into 4 stripes of 32) ---
@@ -306,9 +267,6 @@ def k2_phaseN_kernel(
     smem_tiled_copy_A = cute.make_tiled_copy_A(copy_atom_AB, tiled_mma)
     smem_tiled_copy_B = cute.make_tiled_copy_B(copy_atom_AB, tiled_mma)
     smem_thr_copy_A = smem_tiled_copy_A.get_slice(tidx)
-    _ = smem_tiled_copy_B  # kept for symmetry; B-loads use the .trans variant below
-    # Phase 1/4-main B reads sState in transposed view (N=D_out fast axis).
-    # Use ldmatrix.x4.trans atom because N is now the contig SMEM axis.
     copy_atom_B_T = cute.make_copy_atom(
         warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
         cutlass.BFloat16,
@@ -316,10 +274,7 @@ def k2_phaseN_kernel(
     smem_tiled_copy_B_T = cute.make_tiled_copy_B(copy_atom_B_T, tiled_mma)
     smem_thr_copy_B_T = smem_tiled_copy_B_T.get_slice(tidx)
 
-    # STSM_N for sOut writes — mirrors cpp's SM90_U32x4_STSM_N. Requires the
-    # K_INTER swizzled sOut layout above. Use make_tiled_copy_C_atom because
-    # the STSM atom holds fewer values per warp than a full MMA C-frag stripe;
-    # this helper produces a sub-tiled copy with explicit per-block iteration.
+    # STSM for sOut writes (stmatrix.x4 on K_INTER swizzled sOut).
     copy_atom_stsm = cute.make_copy_atom(
         warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2),
         cutlass.BFloat16,
@@ -327,19 +282,14 @@ def k2_phaseN_kernel(
     smem_tiled_store_C = cute.make_tiled_copy_C_atom(copy_atom_stsm, tiled_mma)
     smem_thr_store_C = smem_tiled_store_C.get_slice(tidx)
 
-    # Phase 6 tiled MMA: same atom layout as phase 1/4.
     tiled_mma6 = cute.make_tiled_mma(
         mma_atom,
         atom_layout_mnk=(1, 4, 1),
         permutation_mnk=(16, 32, 16),
     )
     thr_mma6 = tiled_mma6.get_slice(tidx)
-    # Phase 6 A operand reads (D, CHUNK) transposed VIEW of sKr (CHUNK, D)
-    # via LdMatrix.x4.trans — no physical sKr_T transpose needed.
     smem_tiled_copy_A6 = cute.make_tiled_copy_A(copy_atom_B_T, tiled_mma6)
-    smem_tiled_copy_B6 = cute.make_tiled_copy_B(copy_atom_AB, tiled_mma6)
     smem_thr_copy_A6 = smem_tiled_copy_A6.get_slice(tidx)
-    _ = smem_tiled_copy_B6  # B-operand for phase 6 is register-resident (tCrU_T_post)
 
     # Reference 16x16 sub-tiles for fragment construction (use stage-0 view).
     sKd_s0 = sKd[(None, None, 0)]
@@ -365,8 +315,6 @@ def k2_phaseN_kernel(
 
     tCrKd_cv = smem_thr_copy_A.retile(tCrKd)
     tCrQd_cv = smem_thr_copy_A.retile(tCrQd)
-    # tCrState is loaded with the transposed B-copy atom (sState_B_view has
-    # N=D_out as the fast SMEM axis after select-mode-[1,0]).
     tCrState_cv = smem_thr_copy_B_T.retile(tCrState)
 
     sMqk_s0 = sMqk[(None, None, 0)]
@@ -375,94 +323,38 @@ def k2_phaseN_kernel(
     tCrMqk = thr_mma.make_fragment_A(thr_mma.partition_A(sMqk_ref))
     tCrMqk_cv = smem_thr_copy_A.retile(tCrMqk)
 
-    # ---- Phase 6 TC fragments (declared once, reused per chunk) ----
-    # A operand: (D, CHUNK) transposed VIEW of sKr (CHUNK, D, STAGES) — no
-    # physical transpose; LdMatrix.x4.trans handles per-8x8 transpose in regs.
-    # Result[m, n] = sum_k sKr_T[m, k] * U_post[k, n] = (kr^T @ U)[m, n] —
-    # directly stored as sState[m=K_in, n=D_out]. Eliminates sU_T SMEM trip.
-    #
-    # CRITICAL: sKr is K_INTER swizzled-allocated. We construct sKr_T as an
-    # MN_INTER-atom view of the SAME iterator (kr_t_stage_layout, shape
-    # (D, CHUNK, STAGES)). Both atoms map onto the same 1024-byte cosize,
-    # and ldmatrix.x4.trans + MN_INTER stride pattern yields the correct
-    # per-8x8 transposed bf16 data — matching the cpp baseline's
-    # MMALayout↔TransposedMMALayout dual-view pattern on `k_restored`.
+    # Phase 6: MN_INTER transposed view of sKr (same bytes, different swizzle interpretation).
     sKr_T_view = cute.make_tensor(sKr.iterator, kr_t_stage_layout)
     sKr_T_view_s0 = sKr_T_view[(None, None, 0)]
-    sKr_T_tile = cute.flat_divide(sKr_T_view_s0, (D, CHUNK))  # ((D, CHUNK), 1, 1)
-    sKr_T_ref = sKr_T_tile[None, None, 0, 0]  # (D, CHUNK)
-    tCrKrA6 = thr_mma6.make_fragment_A(thr_mma6.partition_A(sKr_T_ref))
-    _ = thr_mma6.make_fragment_C(tiled_mma6.partition_shape_C((D, D)))  # noqa: F841 (tCrUpd, unused full-D acc)
-    _ = smem_thr_copy_A6.retile(tCrKrA6)  # noqa: F841 (tCrKrA6_cv, blocked variant used instead)
+    sKr_T_ref = cute.flat_divide(sKr_T_view_s0, (D, CHUNK))[None, None, 0, 0]
 
-    # ---- Phase 6 BLOCKED accumulator ref (CHUNK_M = CHUNK = 16) ----
-    # Decompose the (D, D) Phase-6 GEMM into D/CHUNK = 4 M-block iterations
-    # of (CHUNK, D, CHUNK) each. Per-warp accumulator per iteration is only
-    # CHUNK / atom_M(=16) × D / (atom_N(=8) × 4 warps) × 8 fp32 = 1 × 2 × 8
-    # = 8 fp32 regs (vs 64 for the full (D, D) accumulator). This matches
-    # the cpp baseline pattern in fwd_kernel2.cuh Phase 6 (S_M_BLOCKS loop).
-    # Build a (CHUNK, CHUNK) reference for partition_A frag-shape derivation.
+    # Phase 6 blocked (D, D) GEMM: D/CHUNK M-block iterations of (CHUNK, D, CHUNK).
     sKr_T_blk_for_frag = cute.flat_divide(sKr_T_view_s0, (CHUNK, CHUNK))[None, None, 0, 0]
     tCrKrA6_blk = thr_mma6.make_fragment_A(thr_mma6.partition_A(sKr_T_blk_for_frag))
     tCrKrA6_blk_cv = smem_thr_copy_A6.retile(tCrKrA6_blk)
-    # C operand per block: (CHUNK, D) shape, same as tCrU/tCrOut/tCrU3.
     tCrUpd_blk = thr_mma6.make_fragment_C(tiled_mma6.partition_shape_C((CHUNK, D)))
-    # State-block reference for partition_C frag-shape.
-    sState_blk_tile = cute.flat_divide(sState, (CHUNK, D))  # ((CHUNK, D), M_BLOCKS_6, 1)
-    _ = sState_blk_tile[None, None, 0, 0]  # noqa: F841 (sState_blk_for_frag, unused ref)
+    sState_blk_tile = cute.flat_divide(sState, (CHUNK, D))
     coord_state_blk = cute.make_identity_tensor((CHUNK, D))
     tCcState_blk = thr_mma6.partition_C(coord_state_blk)
-    # NOTE: per-iteration state_frag/gt_frag are allocated inside the loop so
-    # their lifetime is tightly scoped (compiler can reuse storage across mi
-    # iterations and with other transients). Shape: same as tCrUpd_blk.
 
-    # Phase 3/4-epi B-frag layout: (N=D, K=CHUNK), tile (16, 32, 16).
-    # No backing SMEM (register-resident). Use sKr_T_ref shape to derive
-    # the partition_B layout (same shape (D, CHUNK)).
     tCrU_T = thr_mma.make_fragment_B(thr_mma.partition_B(sKr_T_ref))
 
-    # ---- Phase 3 TC fragments: A=sINV (16,16), B=sU_T (D, CHUNK), C=tCrU3 (16, D) ----
     sINV_s0 = sINV[(None, None, 0)]
     sINV_tile0 = cute.flat_divide(sINV_s0, (CHUNK, CHUNK))
     sINV_ref = sINV_tile0[None, None, 0, 0]
     tCrInv = thr_mma.make_fragment_A(thr_mma.partition_A(sINV_ref))
     tCrInv_cv = smem_thr_copy_A.retile(tCrInv)
     tCrU3 = thr_mma.make_fragment_C(tiled_mma.partition_shape_C((CHUNK, D)))
-    # Register-resident U-post B-fragment (MOVM_T from phase 3 C-frag).
-    # Same shape/dtype as tCrU_T; populated post-phase-3 via inline-PTX
-    # movmatrix.sync.aligned.m8n8.trans.b16. Replaces phase 4-epi B-load
-    # from sU_T (1 SMEM round-trip eliminated per chunk).
     tCrU_T_post = cute.make_fragment_like(tCrU_T)
     tCrU3_bf16_tmp = cute.make_fragment_like(tCrU3, cutlass.BFloat16)
-    # Phase-2 scratch: bf16 view of phase-1 result for MOVM_T into tCrU_T.
-    # Hoisted out of the t-loop so the allocation/lifetime is loop-uniform and
-    # the compiler can fold its storage with other transient frags.
     tCrU_pre_bf16 = cute.make_fragment_like(tCrU, cutlass.BFloat16)
 
-    # Identity coords for phase-6 epilogue gt indexing — loop-invariant.
-    coord_state = cute.make_identity_tensor((D, D))
-    _ = thr_mma6.partition_C(coord_state)  # noqa: F841 (tCcState, unused full-D coord)
-    _ = thr_mma6.partition_C(sState)  # noqa: F841 (tCsState, unused full-D state partition)
-
-    # Read per-sequence tile base and count from the cu_seqlens_tiles prefix-sum tensor.
-    # cu_seqlens_tiles[i] = sum of tile counts for sequences 0..i-1 (0-indexed prefix sum).
     tile_base = cu_seqlens_tiles[seq_idx]
     t_tiles = cu_seqlens_tiles[seq_idx + 1] - tile_base  # dynamic tile count for this sequence
     TMA_BYTES: cutlass.Constexpr[int] = 4 * CHUNK * D * 2 + 2 * CHUNK * CHUNK * 2 + D * 4 + CHUNK * 2
 
-    # ---- Helper: warp-issued TMA load for chunk t_g into stage `s_idx`.
-    # `s_idx` may be Constexpr (prologue) or Int32 (steady-state). The
-    # mbarrier arrival is single-lane; cute.copy is whole-warp.
-    # ---------------------------------------------------------------
-
-    # ---------------------------------------------------------------
-    # Warp specialization: warp 4 (tidx 128..159) is dedicated TMA-load
-    # warp; warps 0..3 (tidx 0..127) are MMA / compute warps.
-    # ---------------------------------------------------------------
     if warp_idx == LOAD_WARP_IDX:
         # ===== LOAD WARP =====
-        # Producer-start phase = 1 so the first wait on each empty[s] returns
-        # immediately (slots are conceptually "empty" at startup).
         s_dyn_l = cutlass.Int32(0)
         phase_emp = cutlass.Int32(1)
         for t in cutlass.range(t_tiles, unroll=1):
@@ -513,13 +405,7 @@ def k2_phaseN_kernel(
         phase_se = cutlass.Int32(1)
 
         for t in cutlass.range(t_tiles, unroll=1):
-            t_g = tile_base + t  # noqa: F841 (kept for clarity; consumed via TMA stage)
-            ws_t = head_idx * total_tiles + t_g  # noqa: F841
-            gt_off = ws_t * D  # noqa: F841
-
-            # Per-stage SMEM views (dynamic stage indexing).
             sV_s = sV[(None, None, s_dyn)]
-            _ = sKr[(None, None, s_dyn)]  # noqa: F841 (sKr_s, accessed via sKr_T_view)
             sKd_tile = cute.flat_divide(sKd[(None, None, s_dyn)], (CHUNK, 16))
             sQd_tile = cute.flat_divide(sQd[(None, None, s_dyn)], (CHUNK, 16))
             sINV_ref_s = cute.flat_divide(sINV[(None, None, s_dyn)], (CHUNK, CHUNK))[None, None, 0, 0]
@@ -528,35 +414,24 @@ def k2_phaseN_kernel(
             sGt_s = sGt[(None, 0, s_dyn)]
             sBeta_s = sBeta[(None, 0, s_dyn)]
 
-            # Wait for TMA into stage s_dyn (single rotating phase).
             cute.arch.mbarrier_wait(sMbar_ptr + s_dyn, phase_full)
 
-            # Per-stage transposed view of sKr for Phase 6 (no physical transpose).
             sKr_T_s = sKr_T_view[(None, None, s_dyn)]
-            _ = cute.flat_divide(sKr_T_s, (D, CHUNK))[None, None, 0, 0]  # noqa: F841 (sKr_T_ref_s, blocked variant used)
-            # Per-stage M-blocked view: ((CHUNK, CHUNK), M_BLOCKS_6, 1).
             sKr_T_blk_tile_s = cute.flat_divide(sKr_T_s, (CHUNK, CHUNK))
 
-            # ============================================================
-            # Phase 1+4-MAIN FUSED (TENSOR-CORE): both share same State B-load.
-            #   tCrU   += kd  @ state   (Phase 1: u_pre)
-            #   tCrOut += qd  @ state   (Phase 4-main: out)
-            # cpp does this fusion explicitly to halve the State LDSM traffic.
-            # ============================================================
+            # Phase 1a: kd @ state -> tCrU only.
+            # qd @ state -> tCrOut is split off to Phase 1b (after Phase 3) so
+            # tCrOut does not need to be alive during Phase 2-3, relieving
+            # register pressure.
             tCrU.fill(0.0)
-            tCrOut.fill(0.0)
             for k in cutlass.range_constexpr(D // 16):
                 sKd_k = sKd_tile[None, None, 0, k]
-                sQd_k = sQd_tile[None, None, 0, k]
                 sState_k = sState_tile[None, None, 0, k]
-                # Single State B-load shared by both GEMMs.
                 cute.copy(smem_tiled_copy_B_T, smem_thr_copy_B_T.partition_S(sState_k), tCrState_cv)
                 cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
                 cute.gemm(tiled_mma, tCrU, tCrKd, tCrState, tCrU)
-                cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sQd_k), tCrQd_cv)
-                cute.gemm(tiled_mma, tCrOut, tCrQd, tCrState, tCrOut)
 
-            # ----- Phase 2: u = sigmoid(beta) * (v - u_pre); MOVM_T into B-frag for phase 3 -----
+            # Phase 2: u = sigmoid(beta) * (v - u_pre); MOVM_T -> B-frag
             lane_in_warp = tidx % 32
             Rrow0 = lane_in_warp // 4
             Rrow1 = Rrow0 + 8
@@ -565,9 +440,6 @@ def k2_phaseN_kernel(
             sig0 = cutlass.Float32(0.5) * (cute.tanh(b0 * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
             sig1 = cutlass.Float32(0.5) * (cute.tanh(b1 * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
             tCsV = thr_mma.partition_C(sV_s)
-            # Compute U_pre = sig*(v-u_pre) into the hoisted bf16 frag, then MOVM_T
-            # into tCrU_T (B-frag) for phase 3 GEMM. Eliminates sU_T write here AND
-            # the corresponding cross-thread sync (data stays per-lane).
             for i in cutlass.range_constexpr(cute.size(tCrU)):
                 ii: cutlass.Constexpr[int] = i
                 sub_i: cutlass.Constexpr[int] = (ii % 4) // 2
@@ -579,16 +451,11 @@ def k2_phaseN_kernel(
             for i in cutlass.range_constexpr(cute.size(tCrU_pre_u32)):
                 ii: cutlass.Constexpr[int] = i
                 tCrU_T_u32[ii] = movm_t_b16(cutlass.Int32(tCrU_pre_u32[ii]))
-            # sU_T removed: U is now register-resident across phases 2->3->4-epi->6.
 
-            # ----- Phase 3 (TC): U_post = INV @ U_pre  (M=16 N=D K=CHUNK) -----
-            # B operand U_pre comes from register tCrU_T (MOVM_T'd in phase 2).
+            # Phase 3: U_post = INV @ U_pre
             cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sINV_ref_s), tCrInv_cv)
             tCrU3.fill(0.0)
             cute.gemm(tiled_mma, tCrU3, tCrInv, tCrU_T, tCrU3)
-            # In-frag fp32->bf16 cast into a register tmp; MOVM_T converts the
-            # C-format bytes into B-frag layout (tCrU_T_post) for phase 4-epi AND
-            # phase 6. No SMEM trip — sU_T eliminated entirely.
             for i in cutlass.range_constexpr(cute.size(tCrU3)):
                 ii: cutlass.Constexpr[int] = i
                 tCrU3_bf16_tmp[ii] = cutlass.BFloat16(tCrU3[ii])
@@ -598,16 +465,22 @@ def k2_phaseN_kernel(
                 ii: cutlass.Constexpr[int] = i
                 tCrU_T_post_u32[ii] = movm_t_b16(cutlass.Int32(tCrU3_u32[ii]))
 
-            # ----- Phase 4 MAIN: FUSED above (tCrOut already accumulated qd@state) -----
+            # Phase 1b (delayed): qd @ state -> tCrOut.
+            # Same B-operand (state) as Phase 1a; sState is unchanged within
+            # this iteration (Phase 6 writes the next state, runs later).
+            tCrOut.fill(0.0)
+            for k in cutlass.range_constexpr(D // 16):
+                sQd_k = sQd_tile[None, None, 0, k]
+                sState_k = sState_tile[None, None, 0, k]
+                cute.copy(smem_tiled_copy_B_T, smem_thr_copy_B_T.partition_S(sState_k), tCrState_cv)
+                cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sQd_k), tCrQd_cv)
+                cute.gemm(tiled_mma, tCrOut, tCrQd, tCrState, tCrOut)
 
-            # ----- Phase 4 EPI (TC): out += Mqk @ U_T (1 K iter) -----
+            # Phase 4 epi: out += Mqk @ U_T
             cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sMqk_ref_s), tCrMqk_cv)
             # B operand from MOVM_T register frag (tCrU_T_post) — skip sU_T B-load.
             cute.gemm(tiled_mma, tCrOut, tCrMqk, tCrU_T_post, tCrOut)
 
-            # Wait for sOut[s_out] to be free (consumed by STORE warp). Then
-            # write the bf16 output frag via STSM (stmatrix.x4) into K_INTER
-            # sOut — 1 warp instruction replaces 8 scalar bf16 stores per atom.
             cute.arch.mbarrier_wait(sMbarSE_ptr + s_out, phase_se)
             sOut_s = sOut[(None, None, s_out)]
             tCrOut_bf16 = cute.make_fragment_like(tCrOut, cutlass.BFloat16)
@@ -618,32 +491,19 @@ def k2_phaseN_kernel(
                 smem_thr_store_C.retile(tCrOut_bf16),
                 smem_thr_store_C.partition_D(sOut_s),
             )
-            # NOTE: no barrier here. Phase 6 reads disjoint SMEM (sKr,
-            # sState) so it can run in parallel with sOut writes settling.
 
-            # ----- Phase 6 (TC MMA) BLOCKED: state[m, n] = state*gt + (kr^T @ U)[m, n] -----
-            # Decomposed into D/CHUNK = 4 M-block iterations of (CHUNK, D, CHUNK)
-            # GEMM each. Per-iteration accumulator (tCrUpd_blk) is only 8 fp32
-            # regs/thread vs 64 for the full (D, D) accumulator. state_frag /
-            # gt_frag are also block-sized (~8 bf16 + ~8 fp32 per iter) and
-            # allocated inside the loop so the compiler can reuse storage
-            # across iterations. Mirrors cpp baseline Phase 6 S_M_BLOCKS loop.
-            M_BLOCKS_6: cutlass.Constexpr[int] = D // CHUNK  # = 4
+            # Phase 6: state = state*gt + kr^T @ U (blocked M-loop)
+            M_BLOCKS_6: cutlass.Constexpr[int] = D // CHUNK
             for mi in cutlass.range_constexpr(M_BLOCKS_6):
-                # Slice this M-block from the per-stage transposed sKr view
-                # (CHUNK rows of D-major K=CHUNK).
                 sKr_T_blk_s = sKr_T_blk_tile_s[None, None, mi, 0]
                 cute.copy(
                     smem_tiled_copy_A6,
                     smem_thr_copy_A6.partition_S(sKr_T_blk_s),
                     tCrKrA6_blk_cv,
                 )
-                # Compute (kr_blk^T @ U_post) -> (CHUNK, D) accumulator.
                 tCrUpd_blk.fill(0.0)
                 cute.gemm(tiled_mma6, tCrUpd_blk, tCrKrA6_blk, tCrU_T_post, tCrUpd_blk)
 
-                # In-frag epilogue: state[mi-block] = bf16(float(state)*gt + delta).
-                # Slice sState rows for this mi block and partition_C.
                 sState_blk = sState_blk_tile[None, None, mi, 0]
                 tCsState_blk = thr_mma6.partition_C(sState_blk)
                 state_frag_blk = cute.make_fragment_like(tCsState_blk, cutlass.BFloat16)
@@ -657,45 +517,38 @@ def k2_phaseN_kernel(
                     ii: cutlass.Constexpr[int] = i
                     old = cutlass.Float32(state_frag_blk[ii]) * gt_frag_blk[ii]
                     tCsState_blk[ii] = cutlass.BFloat16(old + tCrUpd_blk[ii])
-            # Combined barrier: syncs sOut (Phase 4) + sState (Phase 6) writes
-            # across compute warps before signaling consumers. COMPUTE-ONLY.
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
-            # All compute threads fence prior generic-proxy stores to sOut
-            # before the async-proxy TMA store reads them.
             cute.arch.fence_view_async_shared()
             if warp_idx == 0:
                 with cute.arch.elect_one():
-                    # Signal STORE warp the output slot is full and visible.
                     cute.arch.mbarrier_arrive(sMbarSF_ptr + s_out)
-                    # Signal LOAD warp the input slot is now empty.
                     cute.arch.mbarrier_arrive(sMbarE_ptr + s_dyn)
-            # Advance rotating input stage / phase.
             s_dyn = s_dyn + cutlass.Int32(1)
             if s_dyn == cutlass.Int32(STAGES):
                 s_dyn = cutlass.Int32(0)
                 phase_full = phase_full ^ cutlass.Int32(1)
-            # Advance rotating output stage / phase.
             s_out = s_out + cutlass.Int32(1)
             if s_out == cutlass.Int32(OUT_STAGES):
                 s_out = cutlass.Int32(0)
                 phase_se = phase_se ^ cutlass.Int32(1)
-    # ===== POST-LOOP: store final state to gmem if requested =====
-    # Full CTA barrier: ensures sState is fully written by compute warps' last
-    # phase-6, and all other warps have exited their loop bodies.
     cute.arch.barrier()
     if has_final_state:
-        # Store sState[K_in=tidx, D_out=d_out] -> final_state[n, h, d_out, k_in]
-        # flat offset = seq_idx*H*D*D + head_idx*D*D + d_out*D + k_in
         state_base_f = cutlass.Int32(seq_idx) * cutlass.Int32(H * D * D) + cutlass.Int32(head_idx) * cutlass.Int32(D * D)
         if tidx < D:
-            for d_out in cutlass.range_constexpr(D):
-                final_state_g[state_base_f + cutlass.Int32(d_out * D) + cutlass.Int32(tidx)] = cutlass.Float32(
-                    sState[tidx, d_out]
-                )
+            if state_transposed:
+                for k_in in cutlass.range_constexpr(D):
+                    final_state_g[state_base_f + cutlass.Int32(k_in * D) + cutlass.Int32(tidx)] = cutlass.Float32(
+                        sState[k_in, tidx]
+                    )
+            else:
+                for d_out in cutlass.range_constexpr(D):
+                    final_state_g[state_base_f + cutlass.Int32(d_out * D) + cutlass.Int32(tidx)] = cutlass.Float32(
+                        sState[tidx, d_out]
+                    )
 
 
 @cute.jit
-def run_k2_phaseN(
+def run_k2(
     v: cute.Tensor,
     beta: cute.Tensor,
     ws_qd: cute.Tensor,
@@ -714,32 +567,25 @@ def run_k2_phaseN(
     N: cutlass.Constexpr[int],
     has_initial_state: cutlass.Constexpr[bool],
     has_final_state: cutlass.Constexpr[bool],
+    state_transposed: cutlass.Constexpr[bool],
     stream: cuda_drv.CUstream,
 ):
-    qk_smem = _make_qk_smem_layout()
     cc_smem = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
-    out_smem = _make_out_kinter_one_stage()
-    # K_INTER swizzled (CHUNK, D) layout for sV TMA atom (matches kernel-side
-    # v_stage_layout for swizzled bank-conflict-free shared loads).
-    v_smem = _make_out_kinter_one_stage()
-    # K_INTER swizzled (CHUNK, D) layout for sKd TMA atom.
-    kd_smem = _make_out_kinter_one_stage()
-    # K_INTER swizzled (CHUNK, D) layout for sQd TMA atom.
-    qd_smem = _make_out_kinter_one_stage()
+    kinter_smem = _make_out_kinter_one_stage()
 
-    def make_thd_atom(t, op, smem_layout=qk_smem):
+    def make_thd_atom(t, op):
         view = cute.make_tensor(
             t.iterator,
             cute.make_layout((T_total, D, H), stride=(H * D, 1, D)),
         )
-        return cpasync.make_tiled_tma_atom(op, view, smem_layout, (CHUNK, D))
+        return cpasync.make_tiled_tma_atom(op, view, kinter_smem, (CHUNK, D))
 
-    def make_ws_qkd_atom(t, smem_layout=qk_smem):
+    def make_ws_qkd_atom(t):
         view = cute.make_tensor(
             t.iterator,
             cute.make_layout((CHUNK, D, total_tiles * H), stride=(D, 1, CHUNK * D)),
         )
-        return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, smem_layout, (CHUNK, D))
+        return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, kinter_smem, (CHUNK, D))
 
     def make_ws_cc_atom(t):
         view = cute.make_tensor(
@@ -748,21 +594,14 @@ def run_k2_phaseN(
         )
         return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, cc_smem, (CHUNK, CHUNK))
 
-    tma_atom_v, tma_tensor_v = make_thd_atom(v, cpasync.CopyBulkTensorTileG2SOp(), smem_layout=v_smem)
-    tma_atom_out, tma_tensor_out = make_thd_atom(out, cpasync.CopyBulkTensorTileS2GOp(), smem_layout=out_smem)
-    tma_atom_kd, tma_tensor_kd = make_ws_qkd_atom(ws_kd, smem_layout=kd_smem)
-    tma_atom_qd, tma_tensor_qd = make_ws_qkd_atom(ws_qd, smem_layout=qd_smem)
-    # ws_kr is written by K1 using K_INTER swizzle; use the same K_INTER smem
-    # layout here so TMA correctly applies the swizzle when loading into sKr.
-    kr_smem = _make_out_kinter_one_stage()
-    tma_atom_kr, tma_tensor_kr = make_ws_qkd_atom(ws_kr, smem_layout=kr_smem)
+    tma_atom_v, tma_tensor_v = make_thd_atom(v, cpasync.CopyBulkTensorTileG2SOp())
+    tma_atom_out, tma_tensor_out = make_thd_atom(out, cpasync.CopyBulkTensorTileS2GOp())
+    tma_atom_kd, tma_tensor_kd = make_ws_qkd_atom(ws_kd)
+    tma_atom_qd, tma_tensor_qd = make_ws_qkd_atom(ws_qd)
+    tma_atom_kr, tma_tensor_kr = make_ws_qkd_atom(ws_kr)
     tma_atom_inv, tma_tensor_inv = make_ws_cc_atom(ws_inv)
     tma_atom_mqk, tma_tensor_mqk = make_ws_cc_atom(ws_mqk)
 
-    # 1D-style TMA atoms for ws_gt (D fp32 per slot) and beta (CHUNK bf16 per slot).
-    # Modeled as (X, 1, total_tiles*H) gmem with stride (1, X, X) so partition has
-    # one outer "slot" mode indexed by (head*total_tiles + tg).
-    # sBeta tile padded to 64 bf16 elements (128B) per stage in SMEM for TMA dst alignment.
     gt_smem = cute.make_layout((D, 1), stride=(1, D))
     beta_smem = cute.make_layout((CHUNK, 1), stride=(1, 64))
 
@@ -779,8 +618,6 @@ def run_k2_phaseN(
         )
 
     def make_beta_atom(t):
-        # beta is laid out as (H, B, T) flat — i.e. h*T_total + b*T + t_pos + c.
-        # Slot s = h*total_tiles + (b*t_tiles + t) maps directly.
         view = cute.make_tensor(
             t.iterator,
             cute.make_layout((CHUNK, 1, total_tiles * H), stride=(1, CHUNK, CHUNK)),
@@ -795,27 +632,23 @@ def run_k2_phaseN(
     tma_atom_gt, tma_tensor_gt = make_gt_atom(ws_gt)
     tma_atom_beta, tma_tensor_beta = make_beta_atom(beta)
 
-    # SMEM layout (warp-specialized, double-buffered output):
-    #   sState (D*D bf16) + InputStages * (4 QK + 2 CC) + OutputStages * sOut
-    #   + sKr_T (padded) + sGt + sBeta + 4 mbarrier rings + slack.
-    STAGES_LOCAL = 3
+    STAGES_LOCAL = 2
     OUT_STAGES_LOCAL = 2
     smem_bytes = (
-        D * D * 2  # sState
-        + STAGES_LOCAL * 4 * (CHUNK * D * 2)  # sV/sKd/sQd/sKr staged
-        + STAGES_LOCAL * 2 * (CHUNK * CHUNK * 2)  # sINV/sMqk staged
-        + OUT_STAGES_LOCAL * (CHUNK * D * 2)  # sOut staged
-        + (CHUNK * D * 2)  # sKr_T (padded conservatively to (D*CHUNK))
-        + STAGES_LOCAL * (D * 4)  # sGt staged
-        + STAGES_LOCAL * (64 * 2)  # sBeta staged (padded to 128B/stage)
+        D * D * 2  # sState = 32 KB
+        + STAGES_LOCAL * 4 * (CHUNK * D * 2)  # sV/sKd/sQd/sKr staged = 32 KB
+        + STAGES_LOCAL * 2 * (CHUNK * CHUNK * 2)  # sINV/sMqk staged = 2 KB
+        + OUT_STAGES_LOCAL * (CHUNK * D * 2)  # sOut staged = 8 KB
+        + STAGES_LOCAL * (D * 4)  # sGt staged = 1 KB
+        + STAGES_LOCAL * (64 * 2)  # sBeta staged (padded to 128B/stage) = 256 B
         + STAGES_LOCAL * 8  # load-full mbarriers
         + STAGES_LOCAL * 8  # load-empty mbarriers
         + OUT_STAGES_LOCAL * 8  # store-full mbarriers
         + OUT_STAGES_LOCAL * 8  # store-empty mbarriers
-        + 4096  # slack (alignment + KR_T_PAD overhead)
+        + 2048  # alignment slack (128B per allocation × ~15 allocs)
     )
 
-    k2_phaseN_kernel(
+    k2_kernel(
         tma_atom_v,
         tma_tensor_v,
         tma_atom_kd,
@@ -842,6 +675,7 @@ def run_k2_phaseN(
         final_state_g,
         has_initial_state,
         has_final_state,
+        state_transposed,
     ).launch(
         grid=(N, H, 1),
         block=[THREADS_PER_CTA, 1, 1],
@@ -850,7 +684,7 @@ def run_k2_phaseN(
     )
 
 
-_compiled_cache_k2N: dict = {}
+_compiled_cache_k2: dict = {}
 _DUMMY_FP32_CACHE: dict[str, torch.Tensor] = {}
 _CU_STREAM_CACHE: dict[int, object] = {}
 
@@ -875,7 +709,7 @@ def _get_dummy_fp32(device: torch.device) -> torch.Tensor:
     return cached
 
 
-def launch_k2_phaseN(
+def launch_k2(
     v: torch.Tensor,
     beta: torch.Tensor,
     ws_qd: torch.Tensor,
@@ -888,6 +722,7 @@ def launch_k2_phaseN(
     cu_seqlens_tiles: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,  # [N, H, V, K] fp32/bf16 bhvk
     final_state: torch.Tensor | None = None,  # [N, H, V, K] fp32/bf16 bhvk (written in-place)
+    state_transposed: bool = False,
 ) -> None:
     """Run K2 Phase N (warp-specialized recurrence).
 
@@ -900,9 +735,16 @@ def launch_k2_phaseN(
     cu_seqlens_tiles (int32, shape=[N_seqs+1]) as the prefix sum of per-sequence
     tile counts: cu_seqlens_tiles[i] = sum of tile counts for sequences 0..i-1.
 
-    ``initial_state`` and ``final_state`` use bhvk layout [N, H, V, K] (V-major,
-    k-last). fp32 or bf16 (converted to fp32 internally). The kernel internally
-    stores state as [K_in, D_out] (k-first), transposing on load/store.
+    ``initial_state`` and ``final_state`` are [N, H, D, D] fp32 or bf16 (converted
+    to fp32 internally). The kernel internally stores state as [K_in, D_out]
+    (k-first), transposing on load/store. ``state_transposed`` selects the GMEM
+    layout of the two last dims:
+        False -> [N, H, V, K] (K-contiguous, "bhvk" — DEFAULT; matches the cuLA
+                 / FLA decode convention, no transpose at prefill->decode handoff).
+        True  -> [N, H, K, V] (V-contiguous — alternative, only when upstream
+                 already holds state this way).
+    K2 perf is identical for both layouts (both load patterns are coalesced);
+    the choice only affects the call site / decode side.
     """
     assert v.is_cuda and v.dtype == torch.bfloat16 and v.is_contiguous()
     assert out.is_cuda and out.dtype == torch.bfloat16 and out.is_contiguous()
@@ -951,13 +793,13 @@ def launch_k2_phaseN(
     else:
         final_state_fp32 = _dummy
 
-    key = (N_seqs, H, total_tiles, has_initial_state_flag, has_final_state_flag)
-    if key not in _compiled_cache_k2N:
+    key = (N_seqs, H, total_tiles, has_initial_state_flag, has_final_state_flag, state_transposed)
+    if key not in _compiled_cache_k2:
         stream = _get_current_custream()
         v_flat = v.view(T_total, H, D)
         out_flat = out.view(T_total, H, D)
-        _compiled_cache_k2N[key] = cute.compile(
-            run_k2_phaseN,
+        _compiled_cache_k2[key] = cute.compile(
+            run_k2,
             from_dlpack(v_flat.detach(), assumed_align=16),
             from_dlpack(beta.detach(), assumed_align=16),
             from_dlpack(ws_qd.detach(), assumed_align=16),
@@ -976,13 +818,14 @@ def launch_k2_phaseN(
             N=N_seqs,
             has_initial_state=has_initial_state_flag,
             has_final_state=has_final_state_flag,
+            state_transposed=state_transposed,
             stream=stream,
         )
 
     stream = _get_current_custream()
     v_flat = v.view(T_total, H, D)
     out_flat = out.view(T_total, H, D)
-    _compiled_cache_k2N[key](
+    _compiled_cache_k2[key](
         v_flat,
         beta,
         ws_qd,
@@ -995,12 +838,6 @@ def launch_k2_phaseN(
         cu_seqlens_tiles,
         initial_state_fp32,
         final_state_fp32,
-        H,
-        total_tiles,
-        T_total,
-        N_seqs,
-        has_initial_state_flag,
-        has_final_state_flag,
         stream,
     )
 

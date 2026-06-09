@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Smoke tests for cula.ops.flashkda_prefill (CuteDSL port WIP)."""
+"""Smoke tests for cula.ops.flashkda.prefill (CuteDSL port WIP)."""
 
 import os
 
 import pytest
 import torch
 
-from cula.ops.flashkda_prefill import (
+from cula.ops.flashkda.prefill import (
     CHUNK,
     WORKSPACE_BYTES_PER_TILE,
     D,
@@ -126,7 +126,7 @@ def test_cute_dispatch_bridges_to_cpp():
     os.environ.pop("CULA_FLASHKDA_USE_CUTE", None)
     import importlib
 
-    import cula.ops.flashkda_prefill as mod
+    import cula.ops.flashkda.prefill as mod
 
     importlib.reload(mod)
     mod.flash_kda_prefill(

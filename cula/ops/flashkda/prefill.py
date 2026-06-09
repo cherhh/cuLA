@@ -136,7 +136,7 @@ def add_f16x2_u32(a_u32: Int32, b_u32: Int32, *, loc=None, ip=None) -> Int32:
 @cute.jit
 def sigmoid_fast(x: Float32) -> Float32:
     """``sigmoid(x)`` via ``tanh.approx.f32`` (single PTX instruction)."""
-    return cute.math.tanh(x * Float32(0.5), fastmath=True) * Float32(0.5) + Float32(0.5)
+    return Float32(cute.math.tanh(x * Float32(0.5), fastmath=True) * Float32(0.5) + Float32(0.5))
 
 
 # ============================================================================
@@ -342,6 +342,9 @@ def _ensure_cute_arch_for_device(device: torch.device) -> None:
     major, _minor = torch.cuda.get_device_capability(device)
     if major == 9:
         os.environ["CUTE_DSL_ARCH"] = "sm_90a"
+    if major == 10:
+        os.environ["CUTE_DSL_ARCH"] = "sm_100"
+    
 
 
 def _is_cute_runtime_compat_error(exc: Exception) -> bool:
@@ -373,7 +376,7 @@ _LAST_VARLEN_GRAPH_STATE = None
 _LAST_PROBLEM_KEY = None
 _LAST_PROBLEM: _PrefillProblem | None = None
 _K1_SYMBOLS = None
-_K2_LAUNCHERS: dict[str, object] = {}
+_K2_LAUNCHER = None
 _SEQ_LENS_OBJ_CACHE: dict[int, tuple[weakref.ReferenceType, int, tuple[int, ...]]] = {}
 _CU_TILES_OBJ_CACHE: dict[int, tuple[weakref.ReferenceType, int, torch.Tensor]] = {}
 
@@ -476,26 +479,21 @@ def _get_or_build_cu_tiles(cu_seqlens: torch.Tensor, chunk: int) -> torch.Tensor
 def _get_k1_symbols():
     global _K1_SYMBOLS
     if _K1_SYMBOLS is None:
-        from cula.ops.flashkda_k1 import CHUNK as k1_chunk
-        from cula.ops.flashkda_k1 import D as k1_d
-        from cula.ops.flashkda_k1 import launch_k1_full as k1_launch
+        from cula.ops.flashkda.k1 import CHUNK as k1_chunk
+        from cula.ops.flashkda.k1 import D as k1_d
+        from cula.ops.flashkda.k1 import launch_k1 as k1_launch
 
         _K1_SYMBOLS = (k1_chunk, k1_d, k1_launch)
     return _K1_SYMBOLS
 
 
-def _get_k2_launcher(variant: str):
-    launcher = _K2_LAUNCHERS.get(variant)
-    if launcher is not None:
-        return launcher
-    if variant == "N":
-        from cula.ops.flashkda_k2_phaseN import launch_k2_phaseN as launcher
-    elif variant == "B":
-        from cula.ops.flashkda_k2 import launch_k2_phaseB as launcher
-    else:
-        raise ValueError(f"unknown CULA_FLASHKDA_K2_VARIANT={variant!r}")
-    _K2_LAUNCHERS[variant] = launcher
-    return launcher
+def _get_k2_launcher():
+    global _K2_LAUNCHER
+    if _K2_LAUNCHER is not None:
+        return _K2_LAUNCHER
+    from cula.ops.flashkda.k2 import launch_k2
+    _K2_LAUNCHER = launch_k2
+    return launch_k2
 
 
 def flash_kda_prefill(
@@ -512,11 +510,23 @@ def flash_kda_prefill(
     initial_state: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    state_transposed: bool = False,
 ) -> None:
     """FlashKDA prefill (CuteDSL port of MoonshotAI/FlashKDA).
 
     Args mirror ``flash_kda.fwd``. ``out`` and ``final_state`` are written
     in-place. Currently only ``head_dim_k = head_dim_v = 128`` is supported.
+
+    ``state_transposed`` selects the GMEM layout of ``initial_state`` /
+    ``final_state``:
+      ``False`` -> [N, H, V, K] (K-contiguous, default; FLA / cuLA decode
+                    convention — recommended unless you already have V-contiguous
+                    state, since decode reads `state[v, :]` along K and
+                    K-stride-1 is 8x faster than V-stride-1).
+      ``True``  -> [N, H, K, V] (V-contiguous; alternative form, only worth using
+                    if upstream callers store state this way to avoid a transpose).
+    Prefill kernel performance is identical for both (the two GMEM access patterns
+    are coalesced equivalently); the choice only affects the decode call site.
     """
     global _WARNED_CUTE_FALLBACK, _LAST_PROBLEM_KEY, _LAST_PROBLEM
 
@@ -565,6 +575,7 @@ def flash_kda_prefill(
                 final_state,
                 cu_seqlens,
                 problem,
+                state_transposed=state_transposed,
             )
             return
         except Exception as exc:
@@ -606,7 +617,8 @@ def flash_kda_prefill(
 # CuteDSL kernel dispatch
 # ============================================================================
 def _dispatch_cute(
-    q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state, final_state, cu_seqlens, problem: _PrefillProblem
+    q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state, final_state, cu_seqlens, problem: _PrefillProblem,
+    *, state_transposed: bool = False,
 ):
     """Launch K1 + K2 (CuteDSL ports of FlashKDA C++).
 
@@ -618,7 +630,7 @@ def _dispatch_cute(
     ``tests/test_flashkda_k1_phases.py`` which validate each K1 phase against
     a torch reference by reading the per-tile workspace dump.
     """
-    K1_CHUNK, K1_D, launch_k1_full = _get_k1_symbols()
+    K1_CHUNK, K1_D, launch_k1 = _get_k1_symbols()
 
     # Native arbitrary-varlen support path:
     # Existing K1/K2 kernels require per-sequence CHUNK alignment. For arbitrary
@@ -703,14 +715,7 @@ def _dispatch_cute(
                 problem_pad,
             )
 
-    # K2 variant selector (env CULA_FLASHKDA_K2_VARIANT).
-    # Default: phaseN (latest, matches/beats cpp baseline at T>=4096).
-    _k2_variant = os.environ.get("CULA_FLASHKDA_K2_VARIANT", "N").upper()
-    _launch_k2 = _get_k2_launcher(_k2_variant)
-
-    if problem.has_state_in or problem.has_state_out:
-        if _k2_variant != "N":
-            raise NotImplementedError("State inputs/outputs require K2 variant N (CULA_FLASHKDA_K2_VARIANT=N).")
+    _launch_k2 = _get_k2_launcher()
 
     B, T, H = problem.B, problem.T, problem.H
 
@@ -728,7 +733,7 @@ def _dispatch_cute(
             k2_cu_seqlens_tiles = _get_or_build_cu_tiles(cu_seqlens, K1_CHUNK)
     else:
         T_total = B * T
-        k2_cu_seqlens_tiles = None  # launch_k2_phaseN builds uniform tiles internally
+        k2_cu_seqlens_tiles = None  # launch_k2 builds uniform tiles internally
 
     total_tiles = T_total // K1_CHUNK
 
@@ -759,7 +764,7 @@ def _dispatch_cute(
         k2_initial_state = initial_state.to(torch.float32).contiguous() if initial_state.dtype != torch.float32 else initial_state
 
     def _run_k1k2(out_tensor: torch.Tensor, k2_final_state_tensor: torch.Tensor | None) -> None:
-        launch_k1_full(
+        launch_k1(
             q,
             k,
             g,
@@ -775,34 +780,46 @@ def _dispatch_cute(
             ws_inv,
             ws_mqk,
         )
-        if _k2_variant == "N":
-            _launch_k2(
-                v,
-                beta_flat,
-                ws_qd,
-                ws_kd,
-                ws_kr,
-                ws_gt,
-                ws_inv,
-                ws_mqk,
-                out_tensor,
-                k2_cu_seqlens_tiles,
-                initial_state=k2_initial_state,
-                final_state=k2_final_state_tensor,
-            )
-        else:
-            if problem.is_varlen:
-                raise NotImplementedError("Varlen requires K2 variant N (CULA_FLASHKDA_K2_VARIANT=N)")
-            _launch_k2(v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, out_tensor)
+        _launch_k2(
+            v,
+            beta_flat,
+            ws_qd,
+            ws_kd,
+            ws_kr,
+            ws_gt,
+            ws_inv,
+            ws_mqk,
+            out_tensor,
+            k2_cu_seqlens_tiles,
+            initial_state=k2_initial_state,
+            final_state=k2_final_state_tensor,
+            state_transposed=state_transposed,
+        )
 
-    use_varlen_graph = (
-        problem.is_varlen
-        and _k2_variant == "N"
-        and (not problem.has_state_in)
+    # CUDA Graph path: amortizes Python/CuTeDSL dispatch overhead by capturing
+    # K1+K2 launches into a graph that replays in a single CUDA call. Applies
+    # to BOTH varlen (cu_seqlens != None) and fixed-mode (B, T) inputs. Skipped
+    # when initial state is provided (state path bypasses the capture for now).
+    use_cuda_graph = (
+        (not problem.has_state_in)
         and os.environ.get("CULA_FLASHKDA_VARLEN_CUDAGRAPH", "1") != "0"
     )
-    if use_varlen_graph:
+    if use_cuda_graph:
         global _LAST_VARLEN_GRAPH_KEY, _LAST_VARLEN_GRAPH, _LAST_VARLEN_GRAPH_OUT, _LAST_VARLEN_GRAPH_STATE
+        # When scatter_back is needed (varlen with unaligned seq lens), the
+        # captured graph must write into a private padded buffer that we
+        # index_select from afterwards. When NOT scatter_back, capture writes
+        # directly into the user's `out` so replay needs no follow-up copy.
+        # The user's out.data_ptr() therefore participates in graph_key, so a
+        # different output buffer triggers re-capture rather than silently
+        # writing to a stale tensor.
+        bind_user_out = scatter_back_target is None
+        # Same logic for final_state (fp32 fast path skips the dtype cast copy).
+        bind_user_state = (
+            problem.has_state_out
+            and final_state is not None
+            and final_state.dtype == torch.float32
+        )
         graph_key = (
             q.data_ptr(), int(q._version),
             k.data_ptr(), int(k._version),
@@ -813,21 +830,30 @@ def _dispatch_cute(
             dt_bias.data_ptr(), int(dt_bias._version),
             cu_seqlens.data_ptr() if cu_seqlens is not None else 0,
             int(cu_seqlens._version) if cu_seqlens is not None else -1,
+            out.data_ptr() if bind_user_out else 0,
             out.shape,
             out.dtype,
             out.device,
             problem.has_state_out,
+            final_state.data_ptr() if bind_user_state else 0,
             problem.N,
             scale,
             lower_bound,
+            # state_transposed switches the GMEM access pattern inside K2 — its
+            # JIT-compiled binary differs per value, so the captured graph is
+            # only valid for the matching layout. Must invalidate on change.
+            state_transposed,
         )
         if graph_key != _LAST_VARLEN_GRAPH_KEY:
-            graph_out = torch.empty_like(out)
-            graph_state = (
-                torch.empty((problem.N, H, D, D), dtype=torch.float32, device=out.device)
-                if problem.has_state_out
-                else None
-            )
+            graph_out = out if bind_user_out else torch.empty_like(out)
+            if problem.has_state_out:
+                graph_state = (
+                    final_state
+                    if bind_user_state
+                    else torch.empty((problem.N, H, D, D), dtype=torch.float32, device=out.device)
+                )
+            else:
+                graph_state = None
             # Warmup once so allocations and JITed kernels are outside capture.
             _run_k1k2(graph_out, graph_state)
             graph = torch.cuda.CUDAGraph()
@@ -839,31 +865,27 @@ def _dispatch_cute(
             _LAST_VARLEN_GRAPH_STATE = graph_state
 
         _LAST_VARLEN_GRAPH.replay()
-        if scatter_back_target is not None:
-            torch.index_select(_LAST_VARLEN_GRAPH_OUT, 1, scatter_back_idx, out=scatter_back_target)
-        else:
-            out.copy_(_LAST_VARLEN_GRAPH_OUT)
-        if problem.has_state_out:
+        if not bind_user_out:
+            if scatter_back_target is not None:
+                torch.index_select(_LAST_VARLEN_GRAPH_OUT, 1, scatter_back_idx, out=scatter_back_target)
+            else:
+                out.copy_(_LAST_VARLEN_GRAPH_OUT)
+        if problem.has_state_out and not bind_user_state:
             if final_state.dtype == torch.float32:
                 final_state.copy_(_LAST_VARLEN_GRAPH_STATE)
             else:
                 final_state.copy_(_LAST_VARLEN_GRAPH_STATE.to(final_state.dtype))
         return
 
-    if _k2_variant == "N":
-        k2_final_state = None
-        if problem.has_state_out:
-            # final_state is pre-allocated by the caller; use fp32 scratch if bf16.
-            if final_state.dtype == torch.float32:
-                k2_final_state = final_state
-            else:
-                k2_final_state = torch.empty_like(final_state, dtype=torch.float32)
-        _run_k1k2(out, k2_final_state)
-        # Copy fp32 scratch back to caller's bf16 final_state tensor.
-        if problem.has_state_out and final_state.dtype != torch.float32:
-            final_state.copy_(k2_final_state.to(final_state.dtype))
-    else:
-        _run_k1k2(out, None)
+    k2_final_state = None
+    if problem.has_state_out:
+        if final_state.dtype == torch.float32:
+            k2_final_state = final_state
+        else:
+            k2_final_state = torch.empty_like(final_state, dtype=torch.float32)
+    _run_k1k2(out, k2_final_state)
+    if problem.has_state_out and final_state.dtype != torch.float32:
+        final_state.copy_(k2_final_state.to(final_state.dtype))
 
     if scatter_back_target is not None:
         torch.index_select(out, 1, scatter_back_idx, out=scatter_back_target)

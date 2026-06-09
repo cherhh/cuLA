@@ -5,9 +5,8 @@
 
 Compares the full prefill path (K1 prepare + K2 recurrence) head-to-head:
 
-  - cute:  ``cula.ops.flashkda_prefill.flash_kda_prefill`` with
-           ``CULA_FLASHKDA_USE_CUTE=1`` (currently runs ``launch_k1_full`` +
-           ``launch_k2_phaseB``).
+  - cute:  ``cula.ops.flashkda.prefill.flash_kda_prefill`` with
+           ``CULA_FLASHKDA_USE_CUTE=1`` (runs ``launch_k1`` + ``launch_k2``).
   - cpp :  ``flash_kda_C.fwd`` (the CUTLASS C++ baseline shipped with
            MoonshotAI/FlashKDA).
 
@@ -37,7 +36,7 @@ os.environ["CULA_FLASHKDA_USE_CUTE"] = "1"
 import torch  # noqa: E402
 
 from benchmarks.utils import SEED, set_seed  # noqa: E402
-from cula.ops.flashkda_prefill import flash_kda_prefill  # noqa: E402
+from cula.ops.flashkda.prefill import flash_kda_prefill  # noqa: E402
 
 try:
     import flash_kda_C as flash_kda_cpp  # noqa: F401
@@ -230,7 +229,7 @@ def print_report(fixed_results):
     sep = "=" * 100
     print(f"\n\n{sep}")
     print("                BENCHMARK REPORT: FlashKDA prefill (K1 + K2)")
-    print("                CuTeDSL (k1_full + k2_phaseB)  vs  CUTLASS C++ (flash_kda_C.fwd)")
+    print("                CuTeDSL (k1 + k2)  vs  CUTLASS C++ (flash_kda_C.fwd)")
     print(f"                H={H}  D={D}  dtype=bf16")
     wu = 1 if NCU_MODE else WARMUP
     ni = 1 if NCU_MODE else N_ITERS

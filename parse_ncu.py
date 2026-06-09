@@ -10,10 +10,10 @@ def parse_ncu_csv(file_path):
         for row in reader:
             kname = row.get("Kernel Name", "").strip()
             if kname:
-                if "cutlass_k2_phaseN" in kname:
-                    current_kernel = "cpp"
+                if "cutlass_k2_kernel" in kname:
+                    current_kernel = "cula"
                 elif "_flash_kda_fwd_recurrence" in kname:
-                    current_kernel = "phaseN"
+                    current_kernel = "cpp"
                 else:
                     current_kernel = None
 
@@ -32,13 +32,12 @@ def parse_ncu_csv(file_path):
 
 
 def print_comparison(kernels):
-    if "cpp" not in kernels or "phaseN" not in kernels:
+    if "cula" not in kernels or "cpp" not in kernels:
         return
 
+    cula_data = kernels["cula"]
     cpp_data = kernels["cpp"]
-    phaseN_data = kernels["phaseN"]
 
-    # Map requested names to possible CSV names
     mapping = {
         "Total Instructions": ["smsp__inst_executed.sum", "Executed Instructions"],
         "ALU Pipe": ["smsp__inst_executed_pipe_alu.sum"],
@@ -54,14 +53,14 @@ def print_comparison(kernels):
         "Waves/SM": ["launch__waves_per_multiprocessor", "Waves Per SM"],
     }
 
-    print("| Metric | phaseN | cpp | Diff (%) |")
+    print("| Metric | cula | cpp | Diff (%) |")
     print("| :--- | :---: | :---: | :---: |")
 
     for label, names in mapping.items():
-        v_phaseN = 0.0
+        v_cula = 0.0
         for n in names:
-            if n in phaseN_data:
-                v_phaseN = phaseN_data[n]
+            if n in cula_data:
+                v_cula = cula_data[n]
                 break
 
         v_cpp = 0.0
@@ -72,11 +71,11 @@ def print_comparison(kernels):
 
         diff = 0.0
         if v_cpp != 0:
-            diff = (abs(v_phaseN - v_cpp) / v_cpp) * 100
-        elif v_phaseN != 0:
+            diff = (abs(v_cula - v_cpp) / v_cpp) * 100
+        elif v_cula != 0:
             diff = 100.0
 
-        print(f"| {label} | {v_phaseN:,.2f} | {v_cpp:,.2f} | {diff:.1f}% |")
+        print(f"| {label} | {v_cula:,.2f} | {v_cpp:,.2f} | {diff:.1f}% |")
 
 
 if __name__ == "__main__":

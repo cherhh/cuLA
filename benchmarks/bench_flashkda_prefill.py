@@ -22,8 +22,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "FlashKDA"))
 
-from cula.ops.flashkda_prefill import D as HEAD_DIM
-from cula.ops.flashkda_prefill import flash_kda_prefill
+from cula.ops.flashkda.prefill import D as HEAD_DIM
+from cula.ops.flashkda.prefill import flash_kda_prefill
 
 try:
     import flash_kda  # noqa: F401  (presence check)
@@ -97,7 +97,7 @@ def main():
         os.environ["CULA_FLASHKDA_USE_CUTE"] = "1"
         # Re-import to pick up env var
         import importlib
-        import cula.ops.flashkda_prefill as _mod
+        import cula.ops.flashkda.prefill as _mod
         importlib.reload(_mod)
 
         fn_cute = lambda: _mod.flash_kda_prefill(
