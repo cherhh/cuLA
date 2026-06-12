@@ -367,8 +367,8 @@ def _is_cute_runtime_compat_error(exc: Exception) -> bool:
 _WS_CACHE: dict = {}
 _VARLEN_PACK_CACHE: dict = {}
 _VARLEN_LAYOUT_CACHE: dict = {}
-_LAST_VARLEN_REPACK_KEY = None
-_LAST_BETA_FLAT_COPY_KEY = None
+_LAST_VARLEN_REPACK_REFS = None
+_LAST_BETA_FLAT_COPY = None
 _LAST_VARLEN_GRAPH_KEY = None
 _LAST_VARLEN_GRAPH = None
 _LAST_VARLEN_GRAPH_OUT = None
@@ -397,6 +397,34 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
     cached = (ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat)
     _WS_CACHE[key] = cached
     return cached
+
+
+def _make_tensor_refs(tensors) -> tuple:
+    return tuple((weakref.ref(t), int(t._version)) for t in tensors)
+
+
+def _same_tensor_refs(cached, tensors) -> bool:
+    # Identity via live weakrefs, NOT data_ptr: a freed tensor's address can be
+    # reused by a new tensor (same _version=0), which a data_ptr key cannot
+    # distinguish — a dead weakref can.
+    return (
+        cached is not None
+        and len(cached) == len(tensors)
+        and all(r() is t and ver == int(t._version) for (r, ver), t in zip(cached, tensors))
+    )
+
+
+def _copy_beta_flat(beta: torch.Tensor, beta_flat: torch.Tensor, H: int, T_total: int) -> None:
+    """Fill head-major beta_flat[H, T_total] from beta [.., T, H], skipping the
+    transpose-copy kernel when the same beta -> beta_flat pair is already
+    materialized. Sole writer of beta_flat; all callers must go through here so
+    the skip cache stays coherent."""
+    global _LAST_BETA_FLAT_COPY
+    c = _LAST_BETA_FLAT_COPY
+    if c is not None and c[1] == (H, T_total) and _same_tensor_refs(c[0], (beta, beta_flat)):
+        return
+    beta_flat.view(H, T_total).copy_(beta.view(T_total, H).transpose(0, 1))
+    _LAST_BETA_FLAT_COPY = (_make_tensor_refs((beta, beta_flat)), (H, T_total))
 
 
 def _get_or_alloc_varlen_pack_buffers(total_aligned: int, H: int, N: int, device, q_dtype, beta_dtype):
@@ -664,21 +692,9 @@ def _dispatch_cute(
             cu_pad = cu_pad_cached
             k2_cu_seqlens_tiles_cached = cu_tiles_cached
 
-            global _LAST_VARLEN_REPACK_KEY
-            repack_key = (
-                q.data_ptr(),
-                int(q._version),
-                k.data_ptr(),
-                int(k._version),
-                v.data_ptr(),
-                int(v._version),
-                g.data_ptr(),
-                int(g._version),
-                beta.data_ptr(),
-                int(beta._version),
-                gather_idx.data_ptr(),
-            )
-            if repack_key != _LAST_VARLEN_REPACK_KEY:
+            global _LAST_VARLEN_REPACK_REFS
+            repack_srcs = (q, k, v, g, beta, gather_idx)
+            if not _same_tensor_refs(_LAST_VARLEN_REPACK_REFS, repack_srcs):
                 torch.index_select(q, 1, gather_idx, out=q_pad)
                 torch.index_select(k, 1, gather_idx, out=k_pad)
                 torch.index_select(v, 1, gather_idx, out=v_pad)
@@ -689,7 +705,7 @@ def _dispatch_cute(
                     # For padded timesteps, beta~0 already nulls updates; q/k/v values do not
                     # affect valid outputs and need not be rewritten.
                     beta_pad.index_fill_(1, pad_idx, -80.0)
-                _LAST_VARLEN_REPACK_KEY = repack_key
+                _LAST_VARLEN_REPACK_REFS = _make_tensor_refs(repack_srcs)
 
             problem_pad = _PrefillProblem(
                 B=1,
@@ -750,13 +766,7 @@ def _dispatch_cute(
     )
 
     # Beta arrives as [B, T, H]; K1/K2 expect head-major [H, B*T] flat.
-    # Reuse cached destination buffer (same shape across calls) and emit a
-    # single transpose kernel into it instead of allocating a fresh tensor.
-    global _LAST_BETA_FLAT_COPY_KEY
-    beta_copy_key = (beta.data_ptr(), int(beta._version), H, T_total)
-    if beta_copy_key != _LAST_BETA_FLAT_COPY_KEY:
-        beta_flat.view(H, T_total).copy_(beta.view(T_total, H).transpose(0, 1))
-        _LAST_BETA_FLAT_COPY_KEY = beta_copy_key
+    _copy_beta_flat(beta, beta_flat, H, T_total)
 
     k2_initial_state = None
     if problem.has_state_in:
