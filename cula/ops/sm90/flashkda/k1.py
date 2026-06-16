@@ -18,7 +18,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import from_dlpack
 
-from cula.ops.flashkda.sm90.prefill import add_f16x2_u32, movm_t_b16
+from cula.ops.sm90.flashkda.prefill import add_f16x2_u32, movm_t_b16
 
 
 CHUNK: int = 16

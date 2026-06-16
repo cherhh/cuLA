@@ -19,7 +19,7 @@ import os
 import pytest
 import torch
 
-from cula.ops.flashkda.sm90.prefill import (
+from cula.ops.sm90.flashkda.prefill import (
     CHUNK,
     WORKSPACE_BYTES_PER_TILE,
     D,
@@ -126,7 +126,7 @@ def test_cute_dispatch_bridges_to_cpp():
     os.environ.pop("CULA_FLASHKDA_USE_CUTE", None)
     import importlib
 
-    import cula.ops.flashkda.prefill as mod
+    import cula.ops.sm90.flashkda.prefill as mod
 
     importlib.reload(mod)
     mod.flash_kda_prefill(

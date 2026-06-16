@@ -30,9 +30,9 @@ import os
 
 import torch
 
-from cula.ops.flashkda.sm90.k1 import launch_k1
-from cula.ops.flashkda.sm90.k2 import CHUNK, D, launch_k2
-from cula.ops.flashkda.sm90.prefill import (
+from cula.ops.sm90.flashkda.k1 import launch_k1
+from cula.ops.sm90.flashkda.k2 import CHUNK, D, launch_k2
+from cula.ops.sm90.flashkda.prefill import (
     _copy_beta_flat,
     _ensure_cute_arch_for_device,
     _get_or_alloc_workspaces,
@@ -170,7 +170,7 @@ def _get_prescan_launcher():
     if os.environ.get("CULA_FLASHKDA_CP_V0", "0") == "1":
         return None
     try:
-        from cula.ops.flashkda.sm90.k2_prescan import launch_k2_prescan
+        from cula.ops.sm90.flashkda.k2_prescan import launch_k2_prescan
 
         return launch_k2_prescan
     except ImportError:

@@ -47,7 +47,7 @@ _chunk_gated_delta_rule_fwd_h = None
 def _get_fwd_h():
     global _chunk_gated_delta_rule_fwd_h
     if _chunk_gated_delta_rule_fwd_h is None:
-        from cula.ops.chunk_delta_h_sm100 import chunk_gated_delta_rule_fwd_h
+        from cula.ops.sm100.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 
         _chunk_gated_delta_rule_fwd_h = chunk_gated_delta_rule_fwd_h
     return _chunk_gated_delta_rule_fwd_h
@@ -347,7 +347,7 @@ def intracard_merge(
     For split seq [s0, s1, ..., s_{n-1}]: h0_sj = m_{j-1} @ h0_{j-1} + he_{j-1}.
     Returns (initial_states_merge [num_non_first, H, K, V] fp32, num_non_first).
     """
-    from cula.ops.cp.merge import merge_fwd
+    from cula.ops.sm100.cp.merge import merge_fwd
 
     if num_non_first == 0:
         return None, 0

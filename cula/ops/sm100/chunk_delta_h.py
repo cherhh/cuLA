@@ -2061,7 +2061,7 @@ def chunk_gated_delta_rule_fwd_h(
     """
     # --- Intracard CP auto-dispatch ---
     if _intracard_cp_enabled() and not _no_cp and cu_seqlens is not None and g is None and torch.is_inference_mode_enabled():
-        from cula.ops.cp.chunk_delta_h import intracard_fwd_h, should_use_intracard_cp
+        from cula.ops.sm100.cp.chunk_delta_h import intracard_fwd_h, should_use_intracard_cp
         from cula.utils import get_device_sm_count
 
         # Materialize cu_seqlens_cpu once here to avoid repeated D2H sync inside intracard_fwd_h.

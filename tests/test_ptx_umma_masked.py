@@ -48,7 +48,7 @@ from cutlass.cute.nvgpu.tcgen05 import (
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32, Int64, TFloat32
 
-from cula.ops.ptx_umma_ext import (
+from cula.ops.sm100.ptx_umma_ext import (
     Tcgen05SmemDescriptor,
     tcgen05mma_ss_mask0,
     tcgen05mma_ss_mask1,

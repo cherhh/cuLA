@@ -512,9 +512,9 @@ def _get_or_build_cu_tiles(cu_seqlens: torch.Tensor, chunk: int) -> torch.Tensor
 def _get_k1_symbols():
     global _K1_SYMBOLS
     if _K1_SYMBOLS is None:
-        from cula.ops.flashkda.sm90.k1 import CHUNK as k1_chunk
-        from cula.ops.flashkda.sm90.k1 import D as k1_d
-        from cula.ops.flashkda.sm90.k1 import launch_k1 as k1_launch
+        from cula.ops.sm90.flashkda.k1 import CHUNK as k1_chunk
+        from cula.ops.sm90.flashkda.k1 import D as k1_d
+        from cula.ops.sm90.flashkda.k1 import launch_k1 as k1_launch
 
         _K1_SYMBOLS = (k1_chunk, k1_d, k1_launch)
     return _K1_SYMBOLS
@@ -524,7 +524,7 @@ def _get_k2_launcher():
     global _K2_LAUNCHER
     if _K2_LAUNCHER is not None:
         return _K2_LAUNCHER
-    from cula.ops.flashkda.sm90.k2 import launch_k2
+    from cula.ops.sm90.flashkda.k2 import launch_k2
     _K2_LAUNCHER = launch_k2
     return launch_k2
 

@@ -24,7 +24,7 @@ from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 from fla.ops.utils import prepare_chunk_indices
 
-from cula.ops.intrinsics_sm100 import (
+from cula.ops.sm100.intrinsics import (
     reinterpret_cast,
     store_256b,
     subvec,
@@ -34,7 +34,7 @@ from cula.ops.intrinsics_sm100 import (
     tcgen05_st_32x32b,
     umma_arrive,
 )
-from cula.ops.ptx_umma_ext import (
+from cula.ops.sm100.ptx_umma_ext import (
     Tcgen05SmemDescriptor,
     tcgen05mma_ws_ss_f16,
 )

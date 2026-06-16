@@ -28,14 +28,14 @@ from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import from_dlpack
 
-from cula.ops.flashkda.sm90.k2 import (
+from cula.ops.sm90.flashkda.k2 import (
     CHUNK,
     D,
     _get_current_custream,
     _make_out_kinter_one_stage,
     _make_state_smem_layout,
 )
-from cula.ops.flashkda.sm90.prefill import movm_t_b16
+from cula.ops.sm90.flashkda.prefill import movm_t_b16
 
 THREADS_PER_CTA = 160  # 128 compute (4 MMA warps) + 32 load; no STORE warp
 LOAD_WARP_IDX = 4

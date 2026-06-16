@@ -46,12 +46,12 @@ from cutlass.cute.nvgpu.tcgen05 import (
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64, TFloat32
 
-from cula.ops.intrinsics_sm100 import (
+from cula.ops.sm100.intrinsics import (
     store_256b,
     subvec,
     tcgen05_ld_32x32b,
 )
-from cula.ops.ptx_umma_ext import (
+from cula.ops.sm100.ptx_umma_ext import (
     CollectorBBuffer,
     CollectorOp,
     Tcgen05SmemDescriptor,

@@ -33,7 +33,7 @@ See https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions
 
 Usage inside a ``@cute.kernel`` or ``@cute.jit`` function::
 
-    from cula.ops.intrinsics_sm100 import (
+    from cula.ops.sm100.intrinsics import (
         tcgen05_ld_32x32b, tcgen05_st_32x32b,
         reinterpret_cast, subvec, store_256b,
     )
@@ -77,7 +77,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
-from cula.ops.ptx_umma_ext import Tcgen05SmemDescriptor
+from cula.ops.sm100.ptx_umma_ext import Tcgen05SmemDescriptor
 
 
 def _to_ir(val, loc=None, ip=None):

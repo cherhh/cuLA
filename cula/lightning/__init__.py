@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from cula.ops.la_decode import linear_attention_decode
-from cula.ops.lightning_attn_sm100 import (
+from cula.ops.sm100.lightning_attn import (
     LinearAttentionChunkwiseDecay,
     lightning_attn_fwd,
     lightning_attn_fwd_varlen,

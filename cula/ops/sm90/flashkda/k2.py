@@ -27,7 +27,7 @@ def _make_state_smem_layout():
         cute.make_layout((8, 64), stride=(64, 1)),
     )
     return cute.tile_to_shape(atom, (D, D), (0, 1))
-from cula.ops.flashkda.sm90.prefill import movm_t_b16
+from cula.ops.sm90.flashkda.prefill import movm_t_b16
 
 
 def _make_out_kinter_one_stage():

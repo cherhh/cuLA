@@ -32,7 +32,7 @@ from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
-from cula.ops.kda_fully_fused_sm100_wip import KDAChunkwise
+from cula.ops.sm100.kda_fully_fused_wip import KDAChunkwise
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
 # Global kernel cache
