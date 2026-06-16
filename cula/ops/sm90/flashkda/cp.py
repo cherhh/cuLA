@@ -1,27 +1,11 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FlashKDA intracard-CP (intra-card sequence parallelism) prefill driver.
+"""FlashKDA intracard-CP prefill driver.
 
-Three-stage pipeline over chunk-affine recurrence S' = M_c*S + B_c:
-
-  1. pre_scan : per segment (contiguous tile range) compute
-                  B_seg (S-chain, S0=0) and M_seg (M-chain, M0=I, V:=0 duality).
-  2. merge    : host-side fold of segment carries
-                  carry_{i+1} = carry_i @ G_M_i + G_B_i      (bhvk layout trick:
-                GMEM "vk" layout stores G = S^T, turning the left-multiplied
-                recurrence S' = M*S + B into a right-multiplication, so the
-                merge is a plain torch.baddbmm with no transposes).
-  3. rerun    : full K2 per segment with the correct carry as initial_state,
-                writing the real `out` (global tile indexing places segment
-                outputs at their final positions).
-
-K1 runs ONCE for the whole batch: its workspaces are per-tile with no
-cross-chunk recurrence, shared by pre_scan and rerun.
-
-All internal CP state buffers use layout False ("bhvk", [*, V, K] K-contiguous).
-A user-facing ``state_transposed=True`` is handled by transposing the last two
-dims at driver entry/exit.
+Three-stage pipeline (pre_scan, merge, rerun) over chunk-affine recurrence.
+Internal state buffers use bhvk layout; user-facing state_transposed handled
+at entry/exit.
 """
 
 from __future__ import annotations
@@ -41,9 +25,6 @@ from cula.ops.sm90.flashkda.prefill import (
 )
 
 MIN_SEG_TILES = int(os.environ.get("CULA_FLASHKDA_CP_MIN_SEG_TILES", "4"))
-# Auto planner: never split below this many tiles per segment (S6 sweep: the
-# 2-CTA/SM target + this floor hits the measured optimum on every deployment
-# config, H in {8,16,24,32}, T in {16K,32K}, varlen).
 AUTO_MIN_SEG_TILES = int(os.environ.get("CULA_FLASHKDA_CP_AUTO_MIN_SEG_TILES", "128"))
 
 
@@ -66,10 +47,7 @@ def _auto_s_split(device: torch.device, seq_tiles: list[int], H: int) -> int:
     sm_count = _sm_count(device)
     target_ctas = 2 * sm_count
     n_seqs = len(seq_tiles)
-    # Budget-aware: short sequences (tiles < 2*AUTO_MIN_SEG_TILES) always get
-    # 1 segment regardless of s_split; don't let them consume SM budget that
-    # could go to long sequences. Without this, 128K+10x1K at H=8 computes
-    # s=floor(264/88)=3 → the 128K seq gets only 3 segments instead of 23.
+    # Short sequences (< 2*AUTO_MIN_SEG_TILES) get 1 segment; exclude from SM budget.
     n_nosplit = sum(1 for r in seq_tiles if r < 2 * AUTO_MIN_SEG_TILES)
     n_split = n_seqs - n_nosplit
     if n_split == 0:
@@ -81,11 +59,7 @@ def _auto_s_split(device: torch.device, seq_tiles: list[int], H: int) -> int:
 def _plan_segments(
     seq_tiles: list[int], s_split: int, min_seg_tiles: int | None = None
 ) -> tuple[list[int], list[tuple[int, int]]]:
-    """Split each sequence's tile range into <= s_split near-equal segments.
-
-    Returns (seg_cu_tiles, per_seq) where seg_cu_tiles is the exclusive prefix
-    sum over ALL segments (global tile units) and per_seq[s] = (first_seg, n_seg).
-    """
+    """Split each sequence's tile range into <= s_split near-equal segments."""
     if min_seg_tiles is None:
         min_seg_tiles = MIN_SEG_TILES
     seg_cu = [0]
@@ -111,11 +85,7 @@ def _merge_carries_(
     per_seq: list[tuple[int, int]],
     init_bhvk: torch.Tensor | None,  # [N, H, D, D] fp32 or None
 ) -> torch.Tensor:
-    """Per-sequence affine fold: carries[i] = state entering segment i (bhvk).
-
-    In-place into preallocated scratch: out= baddbmm per step, no per-step
-    allocations or extra copies (the fold is launch-count-bound on host).
-    """
+    """Per-sequence affine fold: carries[i] = state entering segment i (bhvk)."""
     for s, (first, n_seg) in enumerate(per_seq):
         if init_bhvk is None:
             carries[first].zero_()
@@ -136,8 +106,7 @@ _PLAN_TENSOR_CACHE: dict = {}
 
 
 def _get_plan_tensor(values: tuple, dtype, device: torch.device) -> torch.Tensor:
-    """Small host-derived index tensor (seg_cu_tiles, last-segment idx), cached
-    per plan so steady-state calls skip the torch.tensor alloc + HtoD copy."""
+    """Cached small host-derived index tensor (seg_cu_tiles, last-segment idx)."""
     key = (values, dtype, str(device))
     cached = _PLAN_TENSOR_CACHE.get(key)
     if cached is None:
@@ -199,9 +168,8 @@ def flash_kda_prefill_cp(
 ) -> None:
     """FlashKDA prefill with intracard sequence parallelism.
 
-    Same semantics as ``flash_kda_prefill`` (CuTeDSL path), restricted to
-    CHUNK-aligned sequence lengths. ``s_split`` caps the number of segments
-    per sequence (None = auto from SM count).
+    Same semantics as ``flash_kda_prefill``, restricted to CHUNK-aligned
+    sequence lengths. ``s_split`` caps segments per sequence (None = auto).
     """
     assert q.is_cuda and q.dtype == torch.bfloat16
     B, T, H, K = q.shape
@@ -216,7 +184,6 @@ def flash_kda_prefill_cp(
         T_total = B * T
     else:
         assert B == 1, "varlen requires packed B=1"
-        # weakref-identity cached in prefill.py: no DtoH sync on repeat calls
         seq_lens = _get_or_build_seq_lens(cu_seqlens)
         n_seqs = len(seq_lens)
         assert all(sl % CHUNK == 0 for sl in seq_lens), (
@@ -234,12 +201,9 @@ def flash_kda_prefill_cp(
     seg_cu, per_seq = _plan_segments(seq_tiles, s_split, min_seg_tiles)
     n_seg_total = len(seg_cu) - 1
 
-    # Bypass: if no sequence gets more than 2 segments, the parallelism gain
-    # is too small to overcome prescan+merge overhead (~0.3-0.4 ms).
+    # Bypass: <= 2 segments per sequence => CP overhead outweighs parallelism.
     max_n_seg = max(n_seg for _, n_seg in per_seq)
     if n_seg_total == n_seqs or max_n_seg <= 2:
-        # Degenerate plan (1 segment per sequence): CP is pure overhead, the
-        # serial path is bit-identical semantics. Delegate.
         flash_kda_prefill(
             q, k, v, g, beta, scale=scale, out=out, A_log=A_log,
             dt_bias=dt_bias, lower_bound=lower_bound,
@@ -251,7 +215,7 @@ def flash_kda_prefill_cp(
     seg_cu_tiles = _get_plan_tensor(tuple(seg_cu), torch.int32, device)
     total_tiles = T_total // CHUNK
 
-    # ---- K1 once (workspaces are per-tile, segment-agnostic) ----
+    # ---- K1 once ----
     n_qk = total_tiles * H * CHUNK * D
     n_cc = total_tiles * H * CHUNK * CHUNK
     ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat = _get_or_alloc_workspaces(
@@ -261,7 +225,7 @@ def flash_kda_prefill_cp(
     launch_k1(q, k, g, A_log, dt_bias, beta_flat, scale, lower_bound,
               ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk)
 
-    # ---- user initial_state -> internal bhvk fp32 ----
+    # ---- initial_state -> bhvk fp32 ----
     init_bhvk = None
     if initial_state is not None:
         assert initial_state.shape == (n_seqs, H, D, D)
@@ -270,7 +234,7 @@ def flash_kda_prefill_cp(
             init_bhvk = init_bhvk.transpose(-1, -2)
         init_bhvk = init_bhvk.contiguous()
 
-    # ---- stage 1: pre_scan -> B_seg, M_seg (bhvk fp32) ----
+    # ---- stage 1: pre_scan ----
     b_seg = _get_scratch("b_seg", (n_seg_total, H, D, D), torch.float32, device)
     m_seg = _get_scratch("m_seg", (n_seg_total, H, D, D), torch.float32, device)
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
@@ -280,12 +244,10 @@ def flash_kda_prefill_cp(
         prescan(v_flat, beta_flat, ws_kd, ws_kr, ws_gt, ws_inv,
                 b_seg, m_seg, seg_cu_tiles)
     else:
-        # v0: two passes through the unmodified K2.
         scratch_out = _get_scratch("scratch_out", v_flat.shape, torch.bfloat16, device)
         launch_k2(v_flat, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk,
                   scratch_out, seg_cu_tiles,
                   initial_state=None, final_state=b_seg, state_transposed=False)
-        # Read-only inside K2; zeroed once at allocation.
         zeros_v = _get_scratch("zeros_v", v_flat.shape, torch.bfloat16, device, zero_on_alloc=True)
         launch_k2(zeros_v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk,
                   scratch_out, seg_cu_tiles,
@@ -296,7 +258,7 @@ def flash_kda_prefill_cp(
     carries = _get_scratch("carries", (n_seg_total, H, D, D), torch.float32, device)
     _merge_carries_(carries, m_seg, b_seg, per_seq, init_bhvk)
 
-    # ---- stage 3: rerun with correct carries ----
+    # ---- stage 3: rerun ----
     out_flat = out.view(1, T_total, H, D) if B > 1 else out
     seg_final = None
     if final_state is not None:
@@ -315,7 +277,6 @@ def flash_kda_prefill_cp(
             and final_state.is_contiguous()
             and final_state.shape == (n_seqs, H, D, D)
         ):
-            # Gather straight into the user buffer: no alloc, no extra copy.
             torch.index_select(seg_final, 0, last_idx, out=final_state)
         else:
             fin = seg_final.index_select(0, last_idx)

@@ -65,24 +65,23 @@ def k1_kernel(
     kinter_qk_layout = cute.tile_to_shape(kinter_atom_qk, (CHUNK, D), order=(0, 1))
     cc_layout = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
 
-    # ---- SMEM allocations with union aliasing ----
-    # Inputs (plain layout, TMA load targets):
+    # ---- SMEM allocations (union aliasing) ----
+    # Input tiles (plain layout, TMA load targets)
     sQ = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sK = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sGbf = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sGcs = smem.allocate_tensor(cutlass.Float32, qk_layout, 128)
     s_g_total = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 128)
-    # Outputs (K_INTER swizzled, alias input bytes after barrier):
-    #   sQ -> s_q_decayed,  sK -> s_k_decayed,  sGbf -> s_k_restored,  sGcs[0:4KB] -> s_k_inv
+    # Outputs (K_INTER swizzled, alias input bytes after barrier)
     s_k_inv = cute.make_tensor(cute.recast_ptr(sGcs.iterator, dtype=cutlass.BFloat16), kinter_qk_layout)
     s_q_decayed = cute.make_tensor(sQ.iterator, kinter_qk_layout)
     s_k_decayed = cute.make_tensor(sK.iterator, kinter_qk_layout)
     s_k_restored = cute.make_tensor(sGbf.iterator, kinter_qk_layout)
-    # L/Mqk MMA outputs:
+    # L/Mqk MMA outputs
     sL_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     sMqk_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     sBetaSig = smem.allocate_tensor(cutlass.Float32, cute.make_layout((CHUNK,)), 128)
-    # Neumann buffers (alias sGcs after decay_apply barrier):
+    # Neumann buffers (alias sGcs after decay_apply barrier)
     sGcs_fp16_ptr = cute.recast_ptr(sGcs.iterator, dtype=cutlass.Float16)
     sGcs_bf16_ptr = cute.recast_ptr(sGcs.iterator, dtype=cutlass.BFloat16)
     sL_fp16 = cute.make_tensor(sGcs_fp16_ptr, cc_layout)
@@ -148,10 +147,6 @@ def k1_kernel(
         cute.group_modes(s_k_restored, 0, 2),
         cute.group_modes(gDst_kr, 0, 2),
     )
-    # ws_inv / ws_mqk TMA bulk store partitioning. Source SMEM tiles are
-    # the (CHUNK, CHUNK)=(16,16) bf16 plain-layout tiles sINV_bf16 / sMqk_bf16
-    # (512 B each). Replaces the previous per-thread STG.U16 dump pattern
-    # (256 STG/CTA → 1 TMA bulk/CTA).
     gDst_inv = cute.local_tile(tma_tensor_ws_inv, (CHUNK, CHUNK), (None, None, None))
     tINVws_s, tINVws_g = cpasync.tma_partition(
         tma_atom_ws_inv,
@@ -181,11 +176,6 @@ def k1_kernel(
 
     # L2 normalize
     row = tidx // 16
-    # Vectorized 128-bit (8 bf16) load via cute.autovec_copy. Replaces a
-    # scalar 8-iter loop that compiled to 8 separate LDS.U16 per thread and
-    # produced ~74% bank-conflict rate on the SMEM load wavefronts (NCU).
-    # Per-thread mapping (row=tidx/16, cb=tidx%16, col_base=cb*8) keeps
-    # adjacent threads on adjacent 16-byte chunks (coalesced 128b LDS).
     sQ_tile = cute.flat_divide(sQ, (1, 8))  # ((1,8), CHUNK, D//8)
     sK_tile = cute.flat_divide(sK, (1, 8))
     cb = tidx % 16
@@ -215,13 +205,6 @@ def k1_kernel(
         r_k_bf[0, j] = cutlass.BFloat16(k_vals[j] * k_inv)
     cute.autovec_copy(r_q_bf, sQ_my)
     cute.autovec_copy(r_k_bf, sK_my)
-    # No barrier needed here: cumsum below reads sGbf (TMA-loaded, made
-    # visible by mbarrier_wait above) and dt_bias (gmem); it does NOT
-    # consume sQ or sK. Each thread's sQ/sK writes here are observed by
-    # the same thread in decay_apply below (after the cumsum barrier),
-    # and decay's read of sQ/sK is partitioned identically per-thread —
-    # so no cross-thread visibility of sQ/sK writes is required.
-
     # Gate cumsum
     a_log_exp = cute.exp(cutlass.Float32(a_log[head_idx]), fastmath=True)
     if tidx < 128:
@@ -237,17 +220,12 @@ def k1_kernel(
         s_g_total[col_c] = cute.exp(s, fastmath=True)
     cute.arch.barrier()
 
-    # Pre-compute per-row sigmoid(beta) into sBetaSig (16 elements). Used by
-    # the cpp-faithful TC L/Mqk path below to fold the L mask via branch-free
-    # multiply against an identity-coord factor.
-    # No barrier needed here: sBetaSig is consumed only by the L/Mqk MMA
-    # path (after the decay_apply barrier below), and decay_apply itself
-    # does not read sBetaSig.
+    # Pre-compute per-row sigmoid(beta)
     if tidx < CHUNK:
         bv = cutlass.Float32(beta[head_idx * T_total + tile_idx * CHUNK + tidx])
         sBetaSig[tidx] = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
 
-    # decay_apply (mirrors fwd_kernel1.cuh:341-465)
+    # decay_apply
     lane_d = tidx % 32
     warp_d = tidx // 32
     g_d = lane_d // 4
@@ -282,8 +260,6 @@ def k1_kernel(
     r_kd_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
     r_ki_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
     r_kr_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
-    # zipped_divide gives a tensor of shape ((1,2), (CHUNK, D//2)) — outer
-    # mode is the static (1,2) sub-tile, inner is the per-thread coord.
     s_q_decayed_zipped = cute.zipped_divide(s_q_decayed, (1, 2))
     s_k_decayed_zipped = cute.zipped_divide(s_k_decayed, (1, 2))
     s_k_inv_zipped = cute.zipped_divide(s_k_inv, (1, 2))
@@ -316,27 +292,15 @@ def k1_kernel(
     cute.arch.barrier()
 
     # ---- TMA bulk stores for ws_qd / ws_kd / ws_kr ----
-    # NOTE: issued together with ws_inv / ws_mqk in the SINGLE elect_one block
-    # below (after the Neumann series completes).  All five copies + commit_group
-    # + wait_group must originate from the SAME thread because cp.async.bulk
-    # pending groups are per-thread; splitting across multiple elect_one calls
-    # risks electing different threads and leaving some stores uncommitted.
+    # All 5 TMA stores must come from one thread (cp.async.bulk groups are per-thread).
 
-    # ===== L/Mqk via cpp-faithful TWO PARALLEL single-warp MMAs =====
-    # Mirrors FlashKDA cpp baseline (fwd_kernel1.cuh:465-467): two
-    # independent single-warp 16x16x16 MMAs running in parallel:
-    #   warp0:  sL_bf16   = (s_k_decayed @ s_k_inv^T) * mask(m > n) * sigmoid(beta[m])
-    #   warp1:  sMqk_bf16 = (s_q_decayed @ s_k_inv^T) * mask(m >= n)
-    # Each warp owns its own A/B/C fragments and STSM. This eliminates the
-    # stacked-A coupling between s_q_decayed/s_k_decayed which was blocking K_INTER swizzle.
+    # ---- L/Mqk: two parallel single-warp 16x16x16 MMAs ----
     mma_atom_mask_mma = warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))
     tiled_mma_mask_mma = cute.make_tiled_mma(
         mma_atom_mask_mma,
         atom_layout_mnk=(1, 1, 1),
         permutation_mnk=(16, 16, 16),
     )
-    # Each warp uses its own lanes 0..31; pass (tidx % 32) so both warp0 and
-    # warp1 select the same in-warp lane partition.
     warp_lane = tidx % 32
     thr_mma_mask_mma = tiled_mma_mask_mma.get_slice(warp_lane)
 
@@ -356,7 +320,6 @@ def k1_kernel(
     smem_tiled_store_mask_mma = cute.make_tiled_copy_C_atom(copy_atom_stsm_mask_mma, tiled_mma_mask_mma)
     smem_thr_store_mask_mma = smem_tiled_store_mask_mma.get_slice(warp_lane)
 
-    # B operand is shared (s_k_inv) — both warps load identical B fragments.
     sB_tile = cute.flat_divide(s_k_inv, (CHUNK, 16))  # ((16,16), 1, D//16)
     sB_ref = sB_tile[None, None, 0, 0]
 
@@ -434,11 +397,7 @@ def k1_kernel(
         )
     cute.arch.barrier()
 
-    # Neumann inverse — single-warp register-resident TC version
-    # (mirrors cpp utils.cuh::neumann_inv_fused_1warp).
-    # Step 1: read sL_bf16 (Phase-1 dedicated tile written by warp0 above)
-    # and populate sL_fp16 + sINV_fp16 = (I - L) in fp16 SMEM. All 256
-    # threads cooperate on the (CHUNK, CHUNK) cast.
+    # Neumann inverse
     i = tidx // CHUNK
     j2 = tidx % CHUNK
     l_bf = cutlass.Float32(sL_bf16[i, j2])
@@ -447,8 +406,6 @@ def k1_kernel(
     sINV_fp16[i, j2] = cutlass.Float16(inv_init)
     cute.arch.barrier()
 
-    # Step 2: warp 0 runs the 6-MMA + 4-MOVM_T + 3-packed-add Neumann.
-    # Other warps wait at the barrier below.
     if warp_idx == 0:
         mma_atom_neumann = warp.MmaF16BF16Op(cutlass.Float16, cutlass.Float16, (16, 8, 16))
         tiled_mma_neumann = cute.make_tiled_mma(
@@ -465,29 +422,19 @@ def k1_kernel(
         smem_tiled_copy_A_neumann = cute.make_tiled_copy_A(copy_atom_A_neumann, tiled_mma_neumann)
         smem_thr_copy_A_neumann = smem_tiled_copy_A_neumann.get_slice(tidx)
 
-        # Load L into A-frag (fp16) — used for both L²=L·L^T and the initial
-        # MOVM_T → B-frag.
         tCrL = thr_mma_neumann.make_fragment_A(thr_mma_neumann.partition_A(sL_fp16))
         tCrL_cv = smem_thr_copy_A_neumann.retile(tCrL)
         cute.copy(smem_tiled_copy_A_neumann, smem_thr_copy_A_neumann.partition_S(sL_fp16), tCrL_cv)
 
-        # Load INV0 = I - L into A-frag (fp16). INV is updated in-place via
-        # the fp16-acc m16n8k16 layout coincidence (A-frag and C-frag share
-        # the same per-thread u32 layout for a 16x16 square tile).
         tCrInv = thr_mma_neumann.make_fragment_A(thr_mma_neumann.partition_A(sINV_fp16))
         tCrInv_cv = smem_thr_copy_A_neumann.retile(tCrInv)
         cute.copy(smem_tiled_copy_A_neumann, smem_thr_copy_A_neumann.partition_S(sINV_fp16), tCrInv_cv)
 
-        # B-frag scratch (16, 16) — reused across MMAs for L^pow^T transpose.
         tCrLpowB = thr_mma_neumann.make_fragment_B(thr_mma_neumann.partition_B(sL_fp16))
-        # C-frag accumulators (fp16). For m16n8k16 fp16-acc on 16x16 SQUARE
-        # tile, C-frag and A-frag share the same per-thread u32 layout.
         tCrLpow = thr_mma_neumann.make_fragment_C(tiled_mma_neumann.partition_shape_C((CHUNK, CHUNK)))
         tCrDelta = thr_mma_neumann.make_fragment_C(tiled_mma_neumann.partition_shape_C((CHUNK, CHUNK)))
-        # A-frag scratch for "L^pow as A operand" steps (L⁴=L²·L²^T, L⁸=L⁴·L⁴^T).
         tCrLpowA = thr_mma_neumann.make_fragment_A(thr_mma_neumann.partition_A(sL_fp16))
 
-        # u32 views for MOVM_T and packed h2 add.
         tCrL_u32 = cute.recast_tensor(tCrL, dtype=cutlass.Int32)
         tCrInv_u32 = cute.recast_tensor(tCrInv, dtype=cutlass.Int32)
         tCrLpowB_u32 = cute.recast_tensor(tCrLpowB, dtype=cutlass.Int32)
@@ -539,9 +486,7 @@ def k1_kernel(
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrInv_u32[ii] = add_f16x2_u32(cutlass.Int32(tCrInv_u32[ii]), cutlass.Int32(tCrDelta_u32[ii]))
 
-        # Step 3: cast fp16 → bf16 in C-frag layout, STSM_N to sINV_bf16.
-        # The A-frag→C-frag u32 copy relies on the same fp16-acc 16x16 layout
-        # coincidence used for the += accumulator above.
+        # Cast fp16 -> bf16, STSM to sINV_bf16
         tCrInvC = thr_mma_neumann.make_fragment_C(tiled_mma_neumann.partition_shape_C((CHUNK, CHUNK)))
         tCrInvC_u32 = cute.recast_tensor(tCrInvC, dtype=cutlass.Int32)
         for ii in cutlass.range_constexpr(N_REGS_U32):
@@ -563,9 +508,7 @@ def k1_kernel(
         )
     cute.arch.barrier()
 
-    # Dump ALL 5 workspace tensors via TMA bulk stores in ONE elect_one block.
-    # cp.async.bulk pending groups are per-thread; commit_group and wait_group
-    # must be called from the SAME thread that issued all the copies.
+    # TMA bulk store all 5 workspace tensors (one elect_one, one thread).
     if warp_idx == 0:
         with cute.arch.elect_one():
             cute.copy(tma_atom_ws_qd, tQDws_s[(None,)], tQDws_g[(None, 0, 0, ws_slot)])
@@ -599,9 +542,7 @@ def run_k1(
     stream: cuda_drv.CUstream,
 ):
     smem_layout_qk = cute.make_layout((CHUNK, D), stride=(D, 1))
-    # K_INTER swizzled (CHUNK, D) bf16 layout for ws_qd/ws_kd/ws_kr TMA
-    # bulk stores. Must MATCH the kernel-side s_q_decayed/s_k_decayed/s_k_restored layout (the one
-    # written by decay_apply Phase B), otherwise TMA reads garbage.
+    # K_INTER swizzled layout — must match kernel SMEM layout for TMA stores.
     kinter_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_INTER, cutlass.BFloat16)
     smem_layout_qk_kinter = cute.tile_to_shape(kinter_atom, (CHUNK, D), order=(0, 1))
 
@@ -630,9 +571,6 @@ def run_k1(
         )
 
     # (CHUNK, CHUNK) bf16 plain layout for ws_inv / ws_mqk TMA bulk store.
-    # Source SMEM tiles sINV_bf16 / sMqk_bf16 are non-swizzled (CHUNK*CHUNK
-    # too small for K_INTER atom), and TMA bulk works fine with linear
-    # (16,16):(16,1) bf16 = 512 bytes per CTA.
     smem_layout_cc = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
 
     def make_ws_cc_store_atom(t):
@@ -659,20 +597,6 @@ def run_k1(
     tma_atom_ws_inv, tma_tensor_ws_inv = make_ws_cc_store_atom(ws_inv)
     tma_atom_ws_mqk, tma_tensor_ws_mqk = make_ws_cc_store_atom(ws_mqk)
 
-    # SMEM byte budget after cpp-faithful union:
-    #   3 plain qk bf16  (sQ/sK/sGbf — UNION'd with s_q_decayed/s_k_decayed/s_k_restored), 0 extra
-    #   s_k_inv K_INTER swizzled (4 KB)
-    #   s_k_restored aliases sGbf (free)
-    #   sGcs (fp32 qk = 8 KB) — has Neumann/MMA buffers (sL_fp16/sINV_fp16/
-    #     sINV_bf16, ~1.5 KB) ALIASED into it via cute.make_tensor
-    #   s_g_total (fp32, D = 0.5 KB)
-    #   sL_bf16 + sMqk_bf16 (each CHUNK*CHUNK bf16 = 0.5 KB each)
-    #   sBetaSig (CHUNK fp32 = 64 B)
-    #   sMbar (8 B)
-    #   + per-allocation 128B alignment padding from the bump allocator
-    # After all unions allocator needs ~ 22 KB. Round up to 24 KB for safety.
-    # 24 KB → ~9 CTA/SM on sm_100a (228 KB SMEM / SM); cpp uses 21 KB at
-    # 8 CTA/SM (97% occ). This brings cute occupancy parity with cpp.
     smem_bytes = 24 * 1024
 
     k1_kernel(
@@ -708,10 +632,6 @@ def run_k1(
         block=[THREADS_PER_CTA, 1, 1],
         smem=smem_bytes,
         stream=stream,
-        # cpp __launch_bounds__(256, 8): hint compiler to fit 8 CTAs/SM.
-        # With 256 thr that caps regs at 65536/(8*256)=32 reg/thr. Combined
-        # with SMEM union (~28 KB/CTA → 8×28=224 KB ≤ 228 KB SM cap) this
-        # is what gets us to ~96% achieved occupancy like cpp.
         min_blocks_per_mp=8,
     )
 

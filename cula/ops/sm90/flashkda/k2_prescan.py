@@ -3,18 +3,8 @@
 
 """FlashKDA K2 pre_scan kernel — intracard-CP stage 1 (fused S+M chains).
 
-Per segment (contiguous tile range of one sequence) computes in ONE pass:
-  B_seg : S-chain final state with S0 = 0      (regular K2 recurrence)
-  M_seg : M-chain final state with M0 = I      (V:=0 duality — running the
-          identical phase pipeline with V=0 and state:=M yields M' = M_c*M)
-
-Derived from k2.py by dropping everything output-related (sQd/sMqk/sOut, the
-STORE warp, the OUT pipeline mbarriers, Phase 1b/4/5) and adding a second
-state buffer sM plus a duplicated phase block per tile that reuses the SAME
-fragment variables (no extra persistent registers). 160 threads = 4 MMA
-warps + 1 LOAD warp. Outputs are always written, fp32, internal "bhvk"
-layout (GMEM[d_out*D + k_in] = state[k_in, d_out]); no initial-state input,
-no state_transposed.
+Computes B_seg (S-chain, S0=0) and M_seg (M-chain, M0=I) per segment in one
+pass. 160 threads = 4 MMA warps + 1 LOAD warp; outputs fp32 bhvk layout.
 """
 
 from __future__ import annotations
@@ -37,7 +27,7 @@ from cula.ops.sm90.flashkda.k2 import (
 )
 from cula.ops.sm90.flashkda.prefill import movm_t_b16
 
-THREADS_PER_CTA = 160  # 128 compute (4 MMA warps) + 32 load; no STORE warp
+THREADS_PER_CTA = 160  # 4 MMA warps + 1 LOAD warp
 LOAD_WARP_IDX = 4
 
 
@@ -69,7 +59,6 @@ def k2_prescan_kernel(
 
     state_layout = _make_state_smem_layout()
 
-    # Input pipeline (TMA load): InputStages slot ring.
     STAGES: cutlass.Constexpr[int] = 2
     cc_stage_layout = cute.make_layout((CHUNK, CHUNK, STAGES), stride=(CHUNK, 1, CHUNK * CHUNK))
     v_kinter_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_INTER, cutlass.BFloat16)
@@ -87,7 +76,7 @@ def k2_prescan_kernel(
     sM = smem.allocate_tensor(cutlass.BFloat16, state_layout, 128)
     sGt = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D, 1, STAGES), stride=(1, D, D)), 128)
     sBeta = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((CHUNK, 1, STAGES), stride=(1, 64, 64)), 128)
-    # ---- mbarriers (Int64 each): load full/empty only ----
+    # mbarriers: load full/empty
     sMbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((STAGES,)), 16)
     sMbar_ptr = sMbar.iterator
     sMbarE = smem.allocate_tensor(cutlass.Int64, cute.make_layout((STAGES,)), 16)
@@ -103,7 +92,7 @@ def k2_prescan_kernel(
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
 
-    # --- TMA partitioning ---
+    # TMA partitioning
     gSrc_v = cute.local_tile(tma_tensor_v, (CHUNK, D), (None, None, None))
     tVs, tVg = cpasync.tma_partition(
         tma_atom_v,
@@ -153,7 +142,7 @@ def k2_prescan_kernel(
         cute.group_modes(gSrc_beta, 0, 2),
     )
 
-    # Init S-chain state to 0 and M-chain state to I (exact in bf16).
+    # sState=0, sM=I
     if tidx < D:
         for e in cutlass.range_constexpr(D):
             sState[tidx, e] = cutlass.BFloat16(0.0)
@@ -161,7 +150,7 @@ def k2_prescan_kernel(
         sM[tidx, tidx] = cutlass.BFloat16(1.0)
     cute.arch.barrier()
 
-    # --- SM80 16x8x16 BF16 tiled MMA (4 warps split N=128 into 4 stripes of 32) ---
+    # MMA setup
     mma_atom = warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))
     tiled_mma = cute.make_tiled_mma(
         mma_atom,
@@ -192,11 +181,10 @@ def k2_prescan_kernel(
     smem_tiled_copy_A6 = cute.make_tiled_copy_A(copy_atom_B_T, tiled_mma6)
     smem_thr_copy_A6 = smem_tiled_copy_A6.get_slice(tidx)
 
-    # Reference 16x16 sub-tiles for fragment construction (use stage-0 view).
+    # Sub-tile views for fragment construction (stage 0)
     sKd_s0 = sKd[(None, None, 0)]
     sKd_tile0 = cute.flat_divide(sKd_s0, (CHUNK, 16))
-    # Role-swap convention identical to k2: state[K_in, D_out] in normal form;
-    # Phase 1 needs the transposed B view. Same views for sM.
+    # state[K_in, D_out] transposed B-view for Phase 1
     sState_B_view = cute.make_tensor(sState.iterator, layout=cute.select(sState.layout, mode=[1, 0]))
     sState_tile = cute.flat_divide(sState_B_view, (D, 16))
     sM_B_view = cute.make_tensor(sM.iterator, layout=cute.select(sM.layout, mode=[1, 0]))
@@ -212,12 +200,12 @@ def k2_prescan_kernel(
     tCrKd_cv = smem_thr_copy_A.retile(tCrKd)
     tCrState_cv = smem_thr_copy_B_T.retile(tCrState)
 
-    # MN_INTER transposed view of sKr (same bytes, different swizzle interpretation).
+    # sKr transposed view (MN_INTER swizzle, aliased storage)
     sKr_T_view = cute.make_tensor(sKr.iterator, kr_t_stage_layout)
     sKr_T_view_s0 = sKr_T_view[(None, None, 0)]
     sKr_T_ref = cute.flat_divide(sKr_T_view_s0, (D, CHUNK))[None, None, 0, 0]
 
-    # Phase 6 blocked (D, D) GEMM: D/CHUNK M-block iterations of (CHUNK, D, CHUNK).
+    # Phase 6 blocked GEMM fragments
     sKr_T_blk_for_frag = cute.flat_divide(sKr_T_view_s0, (CHUNK, CHUNK))[None, None, 0, 0]
     tCrKrA6_blk = thr_mma6.make_fragment_A(thr_mma6.partition_A(sKr_T_blk_for_frag))
     tCrKrA6_blk_cv = smem_thr_copy_A6.retile(tCrKrA6_blk)
@@ -240,7 +228,7 @@ def k2_prescan_kernel(
     tCrU_pre_bf16 = cute.make_fragment_like(tCrU, cutlass.BFloat16)
 
     tile_base = seg_cu_tiles[seg_idx]
-    t_tiles = seg_cu_tiles[seg_idx + 1] - tile_base  # dynamic tile count for this segment
+    t_tiles = seg_cu_tiles[seg_idx + 1] - tile_base
     TMA_BYTES: cutlass.Constexpr[int] = 3 * CHUNK * D * 2 + CHUNK * CHUNK * 2 + D * 4 + CHUNK * 2
 
     if warp_idx == LOAD_WARP_IDX:
@@ -281,8 +269,8 @@ def k2_prescan_kernel(
             sKr_T_s = sKr_T_view[(None, None, s_dyn)]
             sKr_T_blk_tile_s = cute.flat_divide(sKr_T_s, (CHUNK, CHUNK))
 
-            # ================= S-chain (B_seg): regular K2 phases =================
-            # Phase 1a: kd @ state -> tCrU.
+            # ===== S-chain (B_seg) =====
+            # Phase 1a: kd @ state
             tCrU.fill(0.0)
             for k in cutlass.range_constexpr(D // 16):
                 sKd_k = sKd_tile[None, None, 0, k]
@@ -291,7 +279,7 @@ def k2_prescan_kernel(
                 cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
                 cute.gemm(tiled_mma, tCrU, tCrKd, tCrState, tCrU)
 
-            # Phase 2: u = sigmoid(beta) * (v - u_pre); MOVM_T -> B-frag
+            # Phase 2: sigmoid(beta) * (v - u_pre), MOVM_T
             lane_in_warp = tidx % 32
             Rrow0 = lane_in_warp // 4
             Rrow1 = Rrow0 + 8
@@ -312,7 +300,7 @@ def k2_prescan_kernel(
                 ii: cutlass.Constexpr[int] = i
                 tCrU_T_u32[ii] = movm_t_b16(cutlass.Int32(tCrU_pre_u32[ii]))
 
-            # Phase 3: U_post = INV @ U_pre
+            # Phase 3: INV @ U_pre
             cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sINV_ref_s), tCrInv_cv)
             tCrU3.fill(0.0)
             cute.gemm(tiled_mma, tCrU3, tCrInv, tCrU_T, tCrU3)
@@ -325,7 +313,7 @@ def k2_prescan_kernel(
                 ii: cutlass.Constexpr[int] = i
                 tCrU_T_post_u32[ii] = movm_t_b16(cutlass.Int32(tCrU3_u32[ii]))
 
-            # Phase 6: state = state*gt + kr^T @ U (blocked M-loop)
+            # Phase 6: state = state*gt + kr^T @ U
             M_BLOCKS_6: cutlass.Constexpr[int] = D // CHUNK
             for mi in cutlass.range_constexpr(M_BLOCKS_6):
                 sKr_T_blk_s = sKr_T_blk_tile_s[None, None, mi, 0]
@@ -351,10 +339,8 @@ def k2_prescan_kernel(
                     old = cutlass.Float32(state_frag_blk[ii]) * gt_frag_blk[ii]
                     tCsState_blk[ii] = cutlass.BFloat16(old + tCrUpd_blk[ii])
 
-            # ================= M-chain (M_seg): V:=0 duality =================
-            # Same phases, same fragments; B-operand source is sM; Phase 2'
-            # uses diff = 0 - u_pre (no sV read); Phase 6' targets sM views.
-            # Phase 1a': kd @ M -> tCrU.
+            # ===== M-chain (M_seg): V:=0 duality =====
+            # Phase 1a': kd @ M
             tCrU.fill(0.0)
             for k in cutlass.range_constexpr(D // 16):
                 sKd_k = sKd_tile[None, None, 0, k]
@@ -363,7 +349,7 @@ def k2_prescan_kernel(
                 cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
                 cute.gemm(tiled_mma, tCrU, tCrKd, tCrState, tCrU)
 
-            # Phase 2': u = sigmoid(beta) * (0 - u_pre); MOVM_T -> B-frag
+            # Phase 2': sigmoid(beta) * (0 - u_pre), MOVM_T
             for i in cutlass.range_constexpr(cute.size(tCrU)):
                 ii: cutlass.Constexpr[int] = i
                 sub_i: cutlass.Constexpr[int] = (ii % 4) // 2
@@ -374,7 +360,7 @@ def k2_prescan_kernel(
                 ii: cutlass.Constexpr[int] = i
                 tCrU_T_u32[ii] = movm_t_b16(cutlass.Int32(tCrU_pre_u32[ii]))
 
-            # Phase 3': U_post = INV @ U_pre (tCrInv already loaded this tile)
+            # Phase 3': INV @ U_pre
             tCrU3.fill(0.0)
             cute.gemm(tiled_mma, tCrU3, tCrInv, tCrU_T, tCrU3)
             for i in cutlass.range_constexpr(cute.size(tCrU3)):
@@ -384,7 +370,7 @@ def k2_prescan_kernel(
                 ii: cutlass.Constexpr[int] = i
                 tCrU_T_post_u32[ii] = movm_t_b16(cutlass.Int32(tCrU3_u32[ii]))
 
-            # Phase 6': M = M*gt + kr^T @ U (blocked M-loop)
+            # Phase 6': M = M*gt + kr^T @ U
             for mi in cutlass.range_constexpr(M_BLOCKS_6):
                 sKr_T_blk_s = sKr_T_blk_tile_s[None, None, mi, 0]
                 cute.copy(
@@ -419,8 +405,7 @@ def k2_prescan_kernel(
                 s_dyn = cutlass.Int32(0)
                 phase_full = phase_full ^ cutlass.Int32(1)
     cute.arch.barrier()
-    # Epilogue: always write both segment states, fp32, bhvk
-    # (GMEM[d_out*D + k_in] = state[k_in, d_out]).
+    # Epilogue: write both states fp32 bhvk
     state_base_f = cutlass.Int32(seg_idx) * cutlass.Int32(H * D * D) + cutlass.Int32(head_idx) * cutlass.Int32(D * D)
     if tidx < D:
         for d_out in cutlass.range_constexpr(D):
@@ -510,14 +495,14 @@ def run_k2_prescan(
 
     STAGES_LOCAL = 2
     smem_bytes = (
-        2 * D * D * 2  # sState + sM = 64 KB
-        + STAGES_LOCAL * 3 * (CHUNK * D * 2)  # sV/sKd/sKr staged = 24 KB
-        + STAGES_LOCAL * (CHUNK * CHUNK * 2)  # sINV staged = 1 KB
-        + STAGES_LOCAL * (D * 4)  # sGt staged = 1 KB
-        + STAGES_LOCAL * (64 * 2)  # sBeta staged (padded to 128B/stage) = 256 B
-        + STAGES_LOCAL * 8  # load-full mbarriers
-        + STAGES_LOCAL * 8  # load-empty mbarriers
-        + 2048  # alignment slack
+        2 * D * D * 2
+        + STAGES_LOCAL * 3 * (CHUNK * D * 2)
+        + STAGES_LOCAL * (CHUNK * CHUNK * 2)
+        + STAGES_LOCAL * (D * 4)
+        + STAGES_LOCAL * (64 * 2)
+        + STAGES_LOCAL * 8
+        + STAGES_LOCAL * 8
+        + 2048
     )
 
     k2_prescan_kernel(
@@ -561,9 +546,7 @@ def launch_k2_prescan(
     m_state: torch.Tensor,  # [S, H, D, D] fp32, written (bhvk)
     seg_cu_tiles: torch.Tensor,  # int32 [S+1], global tile prefix sum
 ) -> None:
-    """Fused pre_scan: one pass computes B_seg (S-chain, S0=0) and M_seg
-    (M-chain, M0=I) for every segment. Workspaces must already be filled by
-    launch_k1 (indexed by global tile, segment-agnostic)."""
+    """Launch fused pre_scan: B_seg and M_seg for all segments."""
     assert v.is_cuda and v.dtype == torch.bfloat16 and v.is_contiguous()
     B, T, H, K = v.shape
     assert K == D

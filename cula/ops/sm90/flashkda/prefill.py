@@ -12,26 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-FlashKDA Prefill — CuteDSL port of MoonshotAI/FlashKDA.
-
-Two-kernel design (CHUNK=16, D=128, SM90):
-
-  K1 (Prepare, grid=(total_tiles, H)):
-      g activation -> L2 norm -> decay apply -> L/Mqk GEMM
-      -> 16x16 Neumann inverse -> write workspace (gmem)
-
-  K2 (Recurrence, grid=(N, H), warp-specialized):
-      load workspace -> dual GEMM (k@s, q@s) -> u = (v - k_s) * beta
-      -> u = INV @ u -> out = q_s + Mqk @ u -> state += k_restored^T @ u
-
-See cula/ops/flashkda_prefill_design.md for the full design rationale.
-
-Status:
-    - Public API + torch reference: implemented.
-    - K1/K2 CuteDSL kernels: WIP. The wrapper currently dispatches to the
-      torch reference unless ``CULA_FLASHKDA_USE_CUTE=1`` is set.
-"""
+"""FlashKDA Prefill — two-kernel (K1 Prepare + K2 Recurrence), CHUNK=16, D=128, SM90."""
 
 from __future__ import annotations
 
@@ -48,50 +29,30 @@ from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cutlass_dsl import T as _T
 
 # ---------------------------------------------------------------------------
-# Constants (mirror FlashKDA C++ defaults)
+# Constants
 # ---------------------------------------------------------------------------
-CHUNK: int = 16  # token-block size
-D: int = 128  # head_dim_k == head_dim_v (only 128 supported)
-LOG2E: float = 1.4426950408889634  # log2(e), folds change-of-base into ex2
+CHUNK: int = 16
+D: int = 128  # only 128 supported
+LOG2E: float = 1.4426950408889634
 
-# Per-tile workspace byte sizes (must match C++ WorkspaceSizes).
-# Layout: [k_decayed | q_decayed | k_restored | g_total | INV | Mqk] x H*total_tiles
-_BYTES_KD = CHUNK * D * 2  # bf16
+# Per-tile workspace byte sizes.
+_BYTES_KD = CHUNK * D * 2
 _BYTES_QD = CHUNK * D * 2
 _BYTES_KR = CHUNK * D * 2
-_BYTES_GT = D * 4  # fp32
-_BYTES_INV = CHUNK * CHUNK * 2  # bf16
-_BYTES_MQK = CHUNK * CHUNK * 2  # bf16
+_BYTES_GT = D * 4
+_BYTES_INV = CHUNK * CHUNK * 2
+_BYTES_MQK = CHUNK * CHUNK * 2
 WORKSPACE_BYTES_PER_TILE: int = _BYTES_KD + _BYTES_QD + _BYTES_KR + _BYTES_GT + _BYTES_INV + _BYTES_MQK
 
 
 # ============================================================================
 # NVVM helpers
 # ============================================================================
-# CuteDSL already exposes:
-#   cute.math.exp2(x, fastmath=True)  -> ex2.approx.ftz.f32
-#   cute.math.tanh(x, fastmath=True)  -> tanh.approx.f32
-#   cute.math.rsqrt(x, fastmath=True) -> rsqrt.approx
-#
-# What we still need to inline manually:
-#   movmatrix.sync.aligned.m8n8.trans.b16  (no high-level CuteDSL wrapper)
-#   This is the SM75 register-file matrix transpose used to convert MMA C-format
-#   bf16 fragments into B-format operands without an SMEM round-trip.
 
 
 @cutlass.dsl_user_op
 def movm_t_b16(src_u32: Int32, *, loc=None, ip=None) -> Int32:
-    """SM75 ``movmatrix.sync.aligned.m8n8.trans.b16``.
-
-    Transposes an 8x8 b16 matrix that lives across the 32 lanes of a warp
-    (1 ``u32`` register per lane, packing two bf16/fp16 elements). The
-    instruction operates entirely in the register file - no SMEM trip.
-
-    This is the cornerstone of the K2 inner loop: it converts the bf16
-    fragment produced by an MMA accumulator (C-format) into a fragment laid
-    out as a B operand for the next MMA, avoiding an SMEM write/read pair
-    for every iteration.
-    """
+    """``movmatrix.sync.aligned.m8n8.trans.b16`` -- register-file 8x8 b16 transpose."""
     result = _llvm.inline_asm(
         _T.i32(),
         [Int32(src_u32).ir_value(loc=loc, ip=ip)],
@@ -108,14 +69,7 @@ def movm_t_b16(src_u32: Int32, *, loc=None, ip=None) -> Int32:
 
 @cutlass.dsl_user_op
 def add_f16x2_u32(a_u32: Int32, b_u32: Int32, *, loc=None, ip=None) -> Int32:
-    """Packed ``add.f16x2`` — adds two pairs of fp16 packed in u32.
-
-    Used by the K1 Neumann register-resident accumulator path: when both
-    A-frag (current INV) and C-frag (delta from MMA) hold fp16 values with
-    the same per-thread u32 layout (a coincidence of m16n8k16 fp16-acc on a
-    16x16 square tile), this PTX folds the +=update into a single 2-way
-    SIMD packed add per u32 register.
-    """
+    """Packed ``add.f16x2`` on two u32 registers."""
     result = _llvm.inline_asm(
         _T.i32(),
         [
@@ -135,7 +89,7 @@ def add_f16x2_u32(a_u32: Int32, b_u32: Int32, *, loc=None, ip=None) -> Int32:
 
 @cute.jit
 def sigmoid_fast(x: Float32) -> Float32:
-    """``sigmoid(x)`` via ``tanh.approx.f32`` (single PTX instruction)."""
+    """``sigmoid(x)`` via ``tanh.approx.f32``."""
     return Float32(cute.math.tanh(x * Float32(0.5), fastmath=True) * Float32(0.5) + Float32(0.5))
 
 
@@ -143,31 +97,27 @@ def sigmoid_fast(x: Float32) -> Float32:
 # Torch reference (used for unit tests and as initial fallback)
 # ============================================================================
 def _flashkda_torch_reference(
-    q: torch.Tensor,  # [B, T, H, K] bf16
-    k: torch.Tensor,  # [B, T, H, K] bf16
-    v: torch.Tensor,  # [B, T, H, V] bf16
-    g: torch.Tensor,  # [B, T, H, K] bf16 (pre-activation)
-    beta: torch.Tensor,  # [B, T, H] bf16 (pre-sigmoid)
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
     scale: float,
-    A_log: torch.Tensor,  # [H] fp32
-    dt_bias: torch.Tensor,  # [H, K] fp32
-    lower_bound: float,  # gate floor (negative; e.g. -5.0)
-    initial_state: torch.Tensor | None,  # [N, H, V, K] bf16/fp32 or None
-    cu_seqlens: torch.Tensor | None,  # [N+1] int64 or None
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
     output_final_state: bool,
     state_transposed: bool = False,
 ):
-    """Bit-equivalent torch reference (chunk-free, all fp32 intermediates).
-
-    Mirrors the math in flash_kda/__init__.py + FlashKDA C++ code.
-    Returns (out_bf16, final_state) where final_state is None if not requested.
-    """
+    """Torch reference for unit tests and fallback."""
     B, T, H, K = q.shape
     V = v.shape[-1]
     assert K == V == D
     device = q.device
 
-    # ---- variable-length unpacking ------------------------------------------------
+    # ---- variable-length unpacking ----
     if cu_seqlens is None:
         N = B
         seq_lens = [T] * B
@@ -179,7 +129,7 @@ def _flashkda_torch_reference(
         seq_lens = [cu[i + 1] - cu[i] for i in range(N)]
         starts = cu[:-1]
 
-    # ---- initial state ------------------------------------------------------------
+    # ---- initial state ----
     if initial_state is None:
         h = torch.zeros(N, H, V, K, device=device, dtype=torch.float32)
     else:
@@ -189,16 +139,15 @@ def _flashkda_torch_reference(
 
     out = torch.empty_like(v)
 
-    A_exp = torch.exp(A_log).to(torch.float32)  # [H]
-    dt_b = dt_bias.to(torch.float32)  # [H, K]
-    # gate_scale = clamp(lower_bound, max=0); same as C++ launcher (negative scaling).
+    A_exp = torch.exp(A_log).to(torch.float32)
+    dt_b = dt_bias.to(torch.float32)
     gate_scale = float(min(lower_bound, 0.0))
 
     for n in range(N):
         Tn = seq_lens[n]
         bos = starts[n]
         for h_idx in range(H):
-            state = h[n, h_idx]  # [V, K] fp32  (V-major like FlashKDA)
+            state = h[n, h_idx]
             for t in range(Tn):
                 qi = q[0, bos + t, h_idx].float() if cu_seqlens is not None else q[n, t, h_idx].float()
                 ki = k[0, bos + t, h_idx].float() if cu_seqlens is not None else k[n, t, h_idx].float()
@@ -211,22 +160,16 @@ def _flashkda_torch_reference(
                 ki = ki / (ki.pow(2).sum().sqrt() + 1e-6).clamp(min=1e-6)
                 qi = qi * scale
 
-                # Gate: g = gate_scale * sigmoid(A_exp * (g_raw + dt_bias))
-                g_act = gate_scale * torch.sigmoid(A_exp[h_idx] * (gi + dt_b[h_idx]))  # [K]
-                exp_g = torch.exp(g_act)  # decay per-key
+                g_act = gate_scale * torch.sigmoid(A_exp[h_idx] * (gi + dt_b[h_idx]))
+                exp_g = torch.exp(g_act)
 
-                # Beta
                 beta_act = torch.sigmoid(bi)
 
-                # Decay state along K dimension: state[v,k] *= exp_g[k]
                 state = state * exp_g.unsqueeze(0)
 
-                # Delta-rule update: u = (v - state @ k) * beta
-                u = (vi - state @ ki) * beta_act  # [V]
-                # state += u outer k
+                u = (vi - state @ ki) * beta_act
                 state = state + u.unsqueeze(1) * ki.unsqueeze(0)
-                # output: o = state @ q
-                o_t = state @ qi  # [V]
+                o_t = state @ qi
                 if cu_seqlens is not None:
                     out[0, bos + t, h_idx] = o_t.to(out.dtype)
                 else:
@@ -257,7 +200,7 @@ def allocate_workspace(
     *,
     device: torch.device | str | int = "cuda",
 ) -> torch.Tensor:
-    """Allocate the inter-kernel workspace consumed by K1 (write) and K2 (read)."""
+    """Allocate inter-kernel workspace for K1/K2."""
     n_bytes = total_tiles * H * WORKSPACE_BYTES_PER_TILE
     return torch.empty(n_bytes, dtype=torch.uint8, device=device)
 
@@ -333,11 +276,7 @@ _WARNED_CUTE_FALLBACK = False
 
 
 def _ensure_cute_arch_for_device(device: torch.device) -> None:
-    """Best-effort default for CuteDSL target arch.
-
-    CuteDSL defaults target arch to "unknown" if ``CUTE_DSL_ARCH`` is unset,
-    which can fail at runtime on Hopper. We set a safe default for SM90 here.
-    """
+    """Set CUTE_DSL_ARCH from device capability if unset."""
     if os.environ.get("CUTE_DSL_ARCH"):
         return
     if not torch.cuda.is_available():
@@ -353,11 +292,7 @@ def _ensure_cute_arch_for_device(device: torch.device) -> None:
 
 
 def _is_cute_runtime_compat_error(exc: Exception) -> bool:
-    """Return True if exception indicates CuteDSL runtime/env mismatch.
-
-    These failures are not math/kernel correctness issues and should fall back
-    to the torch reference path so prefill remains usable.
-    """
+    """True if exception is a CuteDSL runtime/env mismatch (not a kernel bug)."""
     msg = repr(exc)
     markers = (
         "DSLCudaRuntimeError",
@@ -367,8 +302,7 @@ def _is_cute_runtime_compat_error(exc: Exception) -> bool:
     )
     return any(m in msg for m in markers)
 
-# ---- Cached scratch workspaces for K1+K2 ----
-# Reused across calls when shape/device match; avoids allocator + zero-fill.
+# ---- Cached scratch workspaces ----
 _WS_CACHE: dict = {}
 _VARLEN_PACK_CACHE: dict = {}
 _VARLEN_LAYOUT_CACHE: dict = {}
@@ -397,7 +331,6 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
     ws_gt = torch.empty(n_gt, dtype=torch.float32, device=device)
     ws_inv = torch.empty(n_cc, dtype=torch.bfloat16, device=device)
     ws_mqk = torch.empty_like(ws_inv)
-    # Persistent beta-flat scratch [H, B*T] reused across calls (same shape).
     beta_flat = torch.empty(n_beta, dtype=dtype, device=device)
     cached = (ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat)
     _WS_CACHE[key] = cached
@@ -409,9 +342,6 @@ def _make_tensor_refs(tensors) -> tuple:
 
 
 def _same_tensor_refs(cached, tensors) -> bool:
-    # Identity via live weakrefs, NOT data_ptr: a freed tensor's address can be
-    # reused by a new tensor (same _version=0), which a data_ptr key cannot
-    # distinguish — a dead weakref can.
     return (
         cached is not None
         and len(cached) == len(tensors)
@@ -420,10 +350,7 @@ def _same_tensor_refs(cached, tensors) -> bool:
 
 
 def _copy_beta_flat(beta: torch.Tensor, beta_flat: torch.Tensor, H: int, T_total: int) -> None:
-    """Fill head-major beta_flat[H, T_total] from beta [.., T, H], skipping the
-    transpose-copy kernel when the same beta -> beta_flat pair is already
-    materialized. Sole writer of beta_flat; all callers must go through here so
-    the skip cache stays coherent."""
+    """Transpose beta [.., T, H] -> beta_flat [H, T_total], with caching."""
     global _LAST_BETA_FLAT_COPY
     c = _LAST_BETA_FLAT_COPY
     if c is not None and c[1] == (H, T_total) and _same_tensor_refs(c[0], (beta, beta_flat)):
@@ -545,21 +472,20 @@ def flash_kda_prefill(
     cu_seqlens: torch.Tensor | None = None,
     state_transposed: bool = False,
 ) -> None:
-    """FlashKDA prefill (CuteDSL port of MoonshotAI/FlashKDA).
+    """FlashKDA prefill. ``out`` and ``final_state`` are written in-place.
 
-    Args mirror ``flash_kda.fwd``. ``out`` and ``final_state`` are written
-    in-place. Currently only ``head_dim_k = head_dim_v = 128`` is supported.
-
-    ``state_transposed`` selects the GMEM layout of ``initial_state`` /
-    ``final_state``:
-      ``False`` -> [N, H, V, K] (K-contiguous, default; FLA / cuLA decode
-                    convention — recommended unless you already have V-contiguous
-                    state, since decode reads `state[v, :]` along K and
-                    K-stride-1 is 8x faster than V-stride-1).
-      ``True``  -> [N, H, K, V] (V-contiguous; alternative form, only worth using
-                    if upstream callers store state this way to avoid a transpose).
-    Prefill kernel performance is identical for both (the two GMEM access patterns
-    are coalesced equivalently); the choice only affects the decode call site.
+    Args:
+        q, k, v, g: [B, T, H, D] bf16.
+        beta: [B, T, H] bf16 (pre-sigmoid).
+        scale: attention scale.
+        out: [B, T, H, D] bf16 output (written in-place).
+        A_log: [H] fp32.
+        dt_bias: [H, D] fp32.
+        lower_bound: gate floor (negative).
+        initial_state: [N, H, D, D] bf16/fp32 or None.
+        final_state: [N, H, D, D] bf16/fp32 or None (written in-place).
+        cu_seqlens: [N+1] int32/int64 for variable-length, or None.
+        state_transposed: False -> [N,H,V,K] (default), True -> [N,H,K,V].
     """
     global _WARNED_CUTE_FALLBACK, _LAST_PROBLEM_KEY, _LAST_PROBLEM
 
@@ -654,22 +580,10 @@ def _dispatch_cute(
     q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state, final_state, cu_seqlens, problem: _PrefillProblem,
     *, state_transposed: bool = False,
 ):
-    """Launch K1 + K2 (CuteDSL ports of FlashKDA C++).
-
-    K1 is being built up phase-by-phase. K2 (warp-specialized recurrence)
-    follows once K1 produces the correct workspace.
-
-    Until K2 lands, the dispatcher refuses to run end-to-end (raises). To
-    drive K1 development, use the unit tests in
-    ``tests/test_flashkda_k1_phases.py`` which validate each K1 phase against
-    a torch reference by reading the per-tile workspace dump.
-    """
+    """Launch K1 + K2."""
     K1_CHUNK, K1_D, launch_k1 = _get_k1_symbols()
 
-    # Native arbitrary-varlen support path:
-    # Existing K1/K2 kernels require per-sequence CHUNK alignment. For arbitrary
-    # varlen, repack each sequence to an aligned length with mathematically inert
-    # padded tokens, then scatter outputs back to original ranges.
+    # Varlen: pad unaligned sequences to CHUNK boundary, scatter back after.
     scatter_back_target = None
     scatter_back_idx = None
     k2_cu_seqlens_tiles_cached = None
@@ -708,8 +622,6 @@ def _dispatch_cute(
                 torch.index_select(beta, 1, gather_idx, out=beta_pad)
 
                 if pad_idx.numel() > 0:
-                    # For padded timesteps, beta~0 already nulls updates; q/k/v values do not
-                    # affect valid outputs and need not be rewritten.
                     beta_pad.index_fill_(1, pad_idx, -80.0)
                 _LAST_VARLEN_REPACK_REFS = _make_tensor_refs(repack_srcs)
 
@@ -741,42 +653,30 @@ def _dispatch_cute(
 
     B, T, H = problem.B, problem.T, problem.H
 
-    # Determine T_total and cu_seqlens_tiles for K2.
     if problem.is_varlen:
-        # Varlen: B=1, q.shape=(1, T_total, H, D); cu_seqlens is provided.
-        # Require all sequence lengths to be multiples of K1_CHUNK (CHUNK=16).
         assert cu_seqlens is not None
         assert B == 1
-        T_total = T  # T is already T_total for B=1
-        # cu_seqlens_tiles: prefix sum of per-sequence tile counts (int32).
+        T_total = T
         if k2_cu_seqlens_tiles_cached is not None:
             k2_cu_seqlens_tiles = k2_cu_seqlens_tiles_cached
         else:
             k2_cu_seqlens_tiles = _get_or_build_cu_tiles(cu_seqlens, K1_CHUNK)
     else:
         T_total = B * T
-        k2_cu_seqlens_tiles = None  # launch_k2 builds uniform tiles internally
+        k2_cu_seqlens_tiles = None
 
     total_tiles = T_total // K1_CHUNK
 
-    # Allocate K2-shaped workspaces (separate buffers per tensor).
     n_qk = total_tiles * H * K1_CHUNK * K1_D
     n_cc = total_tiles * H * K1_CHUNK * K1_CHUNK
-    # K1 writes every element of these workspaces before K2 reads them, so
-    # ``torch.empty`` is sufficient and avoids the 5 zero-fill kernels per call
-    # (these buffers total ~200 MB at H=64,T=8192). Workspaces are cached per
-    # (n_qk,n_cc,total_tiles*H,device) key so repeated calls with the same
-    # shape skip the cudaMalloc as well as the zero-fill.
     ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat = _get_or_alloc_workspaces(
         n_qk, n_cc, total_tiles * H * K1_D, T_total * H, q.device, beta.dtype
     )
 
-    # Beta arrives as [B, T, H]; K1/K2 expect head-major [H, B*T] flat.
     _copy_beta_flat(beta, beta_flat, H, T_total)
 
     k2_initial_state = None
     if problem.has_state_in:
-        # K2 state path uses fp32; keep conversion outside graph replay.
         k2_initial_state = initial_state.to(torch.float32).contiguous() if initial_state.dtype != torch.float32 else initial_state
 
     def _run_k1k2(out_tensor: torch.Tensor, k2_final_state_tensor: torch.Tensor | None) -> None:
@@ -812,25 +712,14 @@ def _dispatch_cute(
             state_transposed=state_transposed,
         )
 
-    # CUDA Graph path: amortizes Python/CuTeDSL dispatch overhead by capturing
-    # K1+K2 launches into a graph that replays in a single CUDA call. Applies
-    # to BOTH varlen (cu_seqlens != None) and fixed-mode (B, T) inputs. Skipped
-    # when initial state is provided (state path bypasses the capture for now).
+    # CUDA Graph path (skipped when initial state is provided).
     use_cuda_graph = (
         (not problem.has_state_in)
         and os.environ.get("CULA_FLASHKDA_VARLEN_CUDAGRAPH", "1") != "0"
     )
     if use_cuda_graph:
         global _LAST_VARLEN_GRAPH_KEY, _LAST_VARLEN_GRAPH, _LAST_VARLEN_GRAPH_OUT, _LAST_VARLEN_GRAPH_STATE
-        # When scatter_back is needed (varlen with unaligned seq lens), the
-        # captured graph must write into a private padded buffer that we
-        # index_select from afterwards. When NOT scatter_back, capture writes
-        # directly into the user's `out` so replay needs no follow-up copy.
-        # The user's out.data_ptr() therefore participates in graph_key, so a
-        # different output buffer triggers re-capture rather than silently
-        # writing to a stale tensor.
         bind_user_out = scatter_back_target is None
-        # Same logic for final_state (fp32 fast path skips the dtype cast copy).
         bind_user_state = (
             problem.has_state_out
             and final_state is not None
@@ -855,9 +744,6 @@ def _dispatch_cute(
             problem.N,
             scale,
             lower_bound,
-            # state_transposed switches the GMEM access pattern inside K2 — its
-            # JIT-compiled binary differs per value, so the captured graph is
-            # only valid for the matching layout. Must invalidate on change.
             state_transposed,
         )
         if graph_key != _LAST_VARLEN_GRAPH_KEY:
@@ -870,7 +756,6 @@ def _dispatch_cute(
                 )
             else:
                 graph_state = None
-            # Warmup once so allocations and JITed kernels are outside capture.
             _run_k1k2(graph_out, graph_state)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -908,32 +793,10 @@ def _dispatch_cute(
 
 
 # ============================================================================
-# K1 Prepare kernel (skeleton — to be filled in next commits)
+# K1 Prepare kernel (skeleton)
 # ============================================================================
 class FlashKDAPrepare:
-    """K1 Prepare kernel.
-
-    Grid: (total_tiles, H)
-    Threads/CTA: 256 (8 warps), `__launch_bounds__(256, 8)`.
-
-    For each (head, chunk) tile:
-        1. TMA load q, k, beta, g_bf16, dt_bias (single-shot).
-        2. L2-normalize q and k along K dim.
-        3. Compute fused gate cumsum:
-              g_val = gate_scale * sigmoid(A_exp[h] * (g_raw + dt_bias))
-              cumsum along chunk; g_total[k] = sum of all rows.
-        4. decay_apply (vectorized 8 elem/thread):
-              q_decayed  = q * exp(g_cumsum) * scale
-              k_decayed  = k * exp(g_cumsum)
-              k_inv      = k * exp(-g_cumsum)
-              k_restored = k_inv * exp(g_total)
-        5. L_Mqk = single-warp 16x16 GEMMs (fp16 acc for L, bf16 acc for Mqk).
-        6. Apply tril mask, beta scaling; INV = I - L.
-        7. Neumann series (4 powers in fp16): INV = (I - L)^(-1).
-        8. TMA store workspace (kd, qd, kr, gt, INV, Mqk).
-
-    NOTE: This is a skeleton. The full implementation is the next deliverable.
-    """
+    """K1 Prepare kernel. Grid: (total_tiles, H), 256 threads."""
 
     def __init__(self):
         self.chunk = CHUNK
@@ -945,22 +808,10 @@ class FlashKDAPrepare:
 
 
 # ============================================================================
-# K2 Recurrence kernel (skeleton — to be filled in next commits)
+# K2 Recurrence kernel (skeleton)
 # ============================================================================
 class FlashKDARecurrence:
-    """K2 Recurrence kernel.
-
-    Grid: (N, H). Warp-specialized:
-        warps 0-3 (128 threads): MMA compute
-        warp 4: TMA LOAD producer
-        warp 5: TMA STORE consumer
-
-    Per-chunk inner loop (Phase 1-6) follows the C++ reference closely. Most
-    inner-loop perf depends on the MOVM_T transpose (movm_t_b16 above) keeping
-    intermediate U fragments in registers across the four MMA stages.
-
-    NOTE: This is a skeleton. The full implementation is the next deliverable.
-    """
+    """K2 Recurrence kernel. Grid: (N, H), warp-specialized."""
 
     def __init__(self):
         self.chunk = CHUNK
