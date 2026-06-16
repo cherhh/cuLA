@@ -84,7 +84,7 @@ def k2_kernel(
     kd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
     qd_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
     kr_stage_layout = cute.tile_to_shape(v_kinter_atom, (CHUNK, D, STAGES), order=(0, 1, 2))
-    # MN_INTER transposed view of sKr for Phase 6 (same bytes, transposed swizzle).
+    # MN_INTER transposed view of sKr for state update (same bytes, transposed swizzle).
     kr_mninter_atom = make_smem_layout_atom(SmemLayoutAtomKind.MN_INTER, cutlass.BFloat16)
     kr_t_stage_layout = cute.tile_to_shape(kr_mninter_atom, (D, CHUNK, STAGES), order=(1, 0, 2))
 
@@ -245,14 +245,14 @@ def k2_kernel(
     smem_tiled_store_C = cute.make_tiled_copy_C_atom(copy_atom_stsm, tiled_mma)
     smem_thr_store_C = smem_tiled_store_C.get_slice(tidx)
 
-    tiled_mma6 = cute.make_tiled_mma(
+    tiled_mma_state = cute.make_tiled_mma(
         mma_atom,
         atom_layout_mnk=(1, 4, 1),
         permutation_mnk=(16, 32, 16),
     )
-    thr_mma6 = tiled_mma6.get_slice(tidx)
-    smem_tiled_copy_A6 = cute.make_tiled_copy_A(copy_atom_B_T, tiled_mma6)
-    smem_thr_copy_A6 = smem_tiled_copy_A6.get_slice(tidx)
+    thr_mma_state = tiled_mma_state.get_slice(tidx)
+    smem_tiled_copy_A_state = cute.make_tiled_copy_A(copy_atom_B_T, tiled_mma_state)
+    smem_thr_copy_A_state = smem_tiled_copy_A_state.get_slice(tidx)
 
     # Reference sub-tiles (stage 0) for fragment construction.
     sKd_s0 = sKd[(None, None, 0)]
@@ -283,19 +283,19 @@ def k2_kernel(
     tCrMqk = thr_mma.make_fragment_A(thr_mma.partition_A(sMqk_ref))
     tCrMqk_cv = smem_thr_copy_A.retile(tCrMqk)
 
-    # Phase 6: MN_INTER transposed view of sKr.
+    # State update: MN_INTER transposed view of sKr.
     sKr_T_view = cute.make_tensor(sKr.iterator, kr_t_stage_layout)
     sKr_T_view_s0 = sKr_T_view[(None, None, 0)]
     sKr_T_ref = cute.flat_divide(sKr_T_view_s0, (D, CHUNK))[None, None, 0, 0]
 
-    # Phase 6 blocked (D, D) GEMM.
+    # State update blocked (D, D) GEMM.
     sKr_T_blk_for_frag = cute.flat_divide(sKr_T_view_s0, (CHUNK, CHUNK))[None, None, 0, 0]
-    tCrKrA6_blk = thr_mma6.make_fragment_A(thr_mma6.partition_A(sKr_T_blk_for_frag))
-    tCrKrA6_blk_cv = smem_thr_copy_A6.retile(tCrKrA6_blk)
-    tCrUpd_blk = thr_mma6.make_fragment_C(tiled_mma6.partition_shape_C((CHUNK, D)))
+    tCrKrA_state_blk = thr_mma_state.make_fragment_A(thr_mma_state.partition_A(sKr_T_blk_for_frag))
+    tCrKrA_state_blk_cv = smem_thr_copy_A_state.retile(tCrKrA_state_blk)
+    tCrUpd_blk = thr_mma_state.make_fragment_C(tiled_mma_state.partition_shape_C((CHUNK, D)))
     sState_blk_tile = cute.flat_divide(sState, (CHUNK, D))
     coord_state_blk = cute.make_identity_tensor((CHUNK, D))
-    tCcState_blk = thr_mma6.partition_C(coord_state_blk)
+    tCcState_blk = thr_mma_state.partition_C(coord_state_blk)
 
     tCrU_T = thr_mma.make_fragment_B(thr_mma.partition_B(sKr_T_ref))
 
@@ -440,20 +440,20 @@ def k2_kernel(
                 smem_thr_store_C.partition_D(sOut_s),
             )
 
-            # Phase 6: state = state*gt + kr^T @ U (blocked M-loop)
+            # State update: state = state*gt + kr^T @ U (blocked M-loop)
             M_BLOCKS_6: cutlass.Constexpr[int] = D // CHUNK
             for mi in cutlass.range_constexpr(M_BLOCKS_6):
                 sKr_T_blk_s = sKr_T_blk_tile_s[None, None, mi, 0]
                 cute.copy(
-                    smem_tiled_copy_A6,
-                    smem_thr_copy_A6.partition_S(sKr_T_blk_s),
-                    tCrKrA6_blk_cv,
+                    smem_tiled_copy_A_state,
+                    smem_thr_copy_A_state.partition_S(sKr_T_blk_s),
+                    tCrKrA_state_blk_cv,
                 )
                 tCrUpd_blk.fill(0.0)
-                cute.gemm(tiled_mma6, tCrUpd_blk, tCrKrA6_blk, tCrU_T_post, tCrUpd_blk)
+                cute.gemm(tiled_mma_state, tCrUpd_blk, tCrKrA_state_blk, tCrU_T_post, tCrUpd_blk)
 
                 sState_blk = sState_blk_tile[None, None, mi, 0]
-                tCsState_blk = thr_mma6.partition_C(sState_blk)
+                tCsState_blk = thr_mma_state.partition_C(sState_blk)
                 state_frag_blk = cute.make_fragment_like(tCsState_blk, cutlass.BFloat16)
                 gt_frag_blk = cute.make_fragment_like(tCsState_blk, cutlass.Float32)
                 m_off: cutlass.Constexpr[int] = mi * CHUNK
