@@ -19,7 +19,7 @@ import os
 import pytest
 import torch
 
-from cula.ops.flashkda.prefill import (
+from cula.ops.flashkda.sm90.prefill import (
     CHUNK,
     WORKSPACE_BYTES_PER_TILE,
     D,

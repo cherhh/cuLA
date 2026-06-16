@@ -14,7 +14,7 @@ import warnings
 import torch
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
-from cula.ops.flashkda.prefill import flash_kda_prefill
+from cula.ops.flashkda.sm90.prefill import flash_kda_prefill
 from cula.utils import assert_hopper
 
 

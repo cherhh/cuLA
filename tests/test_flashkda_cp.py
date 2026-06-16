@@ -11,8 +11,8 @@ import torch
 os.environ["CULA_FLASHKDA_USE_CUTE"] = "1"
 os.environ.setdefault("CULA_FLASHKDA_STRICT_CUTE", "1")
 
-from cula.ops.flashkda.cp import _merge_carries_, _plan_segments, flash_kda_prefill_cp  # noqa: E402
-from cula.ops.flashkda.prefill import D, flash_kda_prefill  # noqa: E402
+from cula.ops.flashkda.sm90.cp import _merge_carries_, _plan_segments, flash_kda_prefill_cp  # noqa: E402
+from cula.ops.flashkda.sm90.prefill import D, flash_kda_prefill  # noqa: E402
 
 H = 8
 SCALE = D**-0.5

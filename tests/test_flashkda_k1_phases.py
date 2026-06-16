@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _make_inputs(B: int, T: int, H: int, *, seed: int = 0):
-    from cula.ops.flashkda.prefill import D as HEAD_DIM
+    from cula.ops.flashkda.sm90.prefill import D as HEAD_DIM
 
     g = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(B, T, H, HEAD_DIM, generator=g, device="cuda", dtype=torch.bfloat16) * 0.5
@@ -29,7 +29,7 @@ def _make_inputs(B: int, T: int, H: int, *, seed: int = 0):
 
 def test_k1():
     """K1 pipeline producing all 6 K2-ready workspace tensors."""
-    from cula.ops.flashkda.k1 import CHUNK, D, launch_k1
+    from cula.ops.flashkda.sm90.k1 import CHUNK, D, launch_k1
 
     B, T, H = 1, 32, 2
     scale = 0.125
