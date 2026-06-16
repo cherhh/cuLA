@@ -155,14 +155,6 @@ if not DISABLE_SM100 or not DISABLE_SM103:
             "csrc/kda/sm100/kda_fwd_sm100.cu",
         ]
     )
-if not DISABLE_SM90:
-    cuda_sources.extend(
-        [
-            "csrc/api/kda_sm90.cu",
-            "csrc/kda/sm90/kda_fwd_sm90.cu",
-            "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
-        ]
-    )
 
 ext_modules = []
 ext_modules.append(
