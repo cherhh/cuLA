@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Smoke tests for cula.ops.flashkda.prefill (CuteDSL port WIP)."""
+"""Smoke tests for cula.ops.sm90.flashkda.prefill (CuteDSL port)."""
 
 import os
 
