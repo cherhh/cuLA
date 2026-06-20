@@ -9,13 +9,19 @@ Gate preprocessing, L2-norm, and sigmoid(beta) are all handled inside K1;
 callers pass raw inputs.
 """
 
-import warnings
-
 import torch
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
-from cula.ops.sm90.flashkda.prefill import flash_kda_prefill
+from cula.ops.sm90.fwd import flash_kda_fwd
 from cula.utils import assert_hopper
+
+
+def _cast_g_bf16(g: torch.Tensor) -> torch.Tensor:
+    return g if g.dtype == torch.bfloat16 else g.to(torch.bfloat16)
+
+
+def _beta_logits_bf16(beta: torch.Tensor) -> torch.Tensor:
+    return torch.logit(beta.float(), eps=1e-6).to(torch.bfloat16)
 
 
 class HopperChunkKDAFunction(torch.autograd.Function):
@@ -52,20 +58,23 @@ class HopperChunkKDAFunction(torch.autograd.Function):
                 dtype=torch.float32, device=q.device,
             )
 
-        g = g.to(torch.bfloat16)
-        beta = beta.to(torch.bfloat16)
+        g = _cast_g_bf16(g)
+        # FLA convention: beta is post-sigmoid [0,1].
+        # cuLA kernel applies sigmoid internally, so convert to pre-sigmoid logits.
+        beta = _beta_logits_bf16(beta)
 
-        flash_kda_prefill(
+        flash_kda_fwd(
             q, k, v, g, beta,
             scale=scale,
             out=out,
             A_log=A_log,
             dt_bias=dt_bias,
-            lower_bound=lower_bound if lower_bound is not None else -5.0,
+            lower_bound=lower_bound,
             initial_state=initial_state,
             final_state=final_state,
             cu_seqlens=cu_seqlens,
-            state_transposed=True,
+            state_transposed=False,
+            use_gate_in_kernel=True,
         )
 
         return out.to(q.dtype), final_state
@@ -88,7 +97,7 @@ def cula_kda_prefill(
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
-    use_gate_in_kernel: bool = False,
+    use_gate_in_kernel: bool = True,
     safe_gate: bool = False,
     lower_bound: float | None = None,
     cu_seqlens: torch.IntTensor | None = None,
@@ -99,9 +108,10 @@ def cula_kda_prefill(
     Hopper (SM90) KDA forward prefill using CuTeDSL two-kernel pipeline.
 
     Gate preprocessing (A_log, dt_bias, lower_bound) and L2-norm are handled
-    internally by the K1 kernel. The ``use_qk_l2norm_in_kernel`` and
-    ``use_gate_in_kernel`` parameters are accepted for API compatibility but
-    ignored (the CuTeDSL path always processes raw inputs).
+    internally by the K1 kernel. This SM90 CuTeDSL path supports only the safe
+    in-kernel gate mode: ``use_gate_in_kernel=True`` and ``safe_gate=True``.
+    ``use_qk_l2norm_in_kernel`` is accepted for API compatibility; CuTeDSL
+    always applies L2-norm internally.
 
     Args:
         q (torch.Tensor):
@@ -126,13 +136,12 @@ def cula_kda_prefill(
             Accepted for API compatibility; CuTeDSL always applies L2-norm
             internally. Default: `False`.
         use_gate_in_kernel (bool):
-            Accepted for API compatibility; CuTeDSL always computes the gate
-            internally. Default: `False`.
+            Must be `True`; CuTeDSL computes the gate internally. Default: `True`.
         safe_gate (bool):
-            Whether the kernel can assume the input gate values `g` are in a safe range.
-            Default: `False`.
+            Must be `True`; unsupported unsafe gate inputs are rejected. Default: `False`.
         lower_bound (Optional[float]):
-            Lower bound for the forget gate activation function. Default: `None`.
+            Lower bound for the forget gate activation function. Required when
+            `safe_gate=True`; must be in `[-5, 0)`. Default: `None`.
         cu_seqlens (torch.IntTensor):
             Cumulative sequence lengths of shape `[N+1]`, int32.
         chunk_indices (torch.IntTensor):
@@ -145,6 +154,17 @@ def cula_kda_prefill(
             Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
     """
     assert_hopper()
+    if not use_gate_in_kernel:
+        raise NotImplementedError(
+            "SM90 CuTeDSL KDA prefill only supports use_gate_in_kernel=True. "
+            "Passing preprocessed gates would otherwise fall back to the slow reference path."
+        )
+    if not safe_gate:
+        raise NotImplementedError("SM90 CuTeDSL KDA prefill only supports safe_gate=True.")
+    if lower_bound is None:
+        raise ValueError("`lower_bound` must be specified when `safe_gate=True` and `use_gate_in_kernel=True`.")
+    if not (-5 <= lower_bound < 0):
+        raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
@@ -157,27 +177,47 @@ def cula_kda_prefill(
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
     if initial_state is not None:
-        assert initial_state.dtype == torch.float32, "initial_state must be in float32."
+        if initial_state.dtype != torch.float32:
+            raise TypeError("initial_state must be in float32.")
 
-    num_heads, head_dim = q.shape[2], q.shape[3]
+    num_qk_heads, head_dim = q.shape[2], q.shape[3]
+    num_kv_heads = v.shape[2]
     A_log = kwargs.pop("A_log", None)
     dt_bias = kwargs.pop("dt_bias", None)
     kwargs.pop("cu_seqlens_cpu", None)
     if kwargs:
         raise TypeError(f"cula_kda_prefill got unexpected keyword arguments: {set(kwargs)}")
     if A_log is None:
-        A_log = torch.zeros(num_heads, dtype=torch.float32, device=q.device)
+        raise ValueError("A_log must be provided when use_gate_in_kernel=True.")
     if dt_bias is None:
-        dt_bias = torch.zeros(num_heads, head_dim, dtype=torch.float32, device=q.device)
+        raise ValueError("dt_bias must be provided when use_gate_in_kernel=True.")
     elif dt_bias.ndim == 1:
-        dt_bias = dt_bias.view(num_heads, head_dim)
+        dt_bias = dt_bias.view(num_kv_heads, head_dim)
 
-    assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
-    assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
-    assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
-    assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
-    assert beta.dtype == torch.bfloat16 or beta.dtype == torch.float32, "beta must be in bfloat16 or float32."
-    assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Currently we only support head dim of 128 for KDA"
+    if q.shape != k.shape:
+        raise ValueError(f"q and k must have the same shape, got q={tuple(q.shape)}, k={tuple(k.shape)}")
+    if g.shape != v.shape:
+        raise ValueError(f"g and v must have the same shape, got g={tuple(g.shape)}, v={tuple(v.shape)}")
+    if beta.shape != v.shape[:3]:
+        raise ValueError(f"beta must have shape {tuple(v.shape[:3])}, got {tuple(beta.shape)}")
+    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+        raise TypeError("q, k, v must be in bfloat16.")
+    if beta.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError("beta must be in bfloat16 or float32.")
+    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
+        raise ValueError("Currently we only support head dim of 128 for KDA.")
+    if num_kv_heads % num_qk_heads != 0:
+        raise ValueError(
+            f"num_kv_heads must be a multiple of num_qk_heads, got num_kv_heads={num_kv_heads}, "
+            f"num_qk_heads={num_qk_heads}."
+        )
+
+    if num_kv_heads != num_qk_heads:
+        # KDA uses value/state heads; q/k heads may be shared across multiple state heads.
+        heads_per_group = num_kv_heads // num_qk_heads
+        q = q.repeat_interleave(heads_per_group, dim=2)
+        k = k.repeat_interleave(heads_per_group, dim=2)
+
     if scale is None:
         scale = k.shape[-1] ** -0.5
     o, final_state = HopperChunkKDAFunction.apply(

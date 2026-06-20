@@ -347,12 +347,12 @@ def intracard_merge(
     For split seq [s0, s1, ..., s_{n-1}]: h0_sj = m_{j-1} @ h0_{j-1} + he_{j-1}.
     Returns (initial_states_merge [num_non_first, H, K, V] fp32, num_non_first).
     """
-    from cula.ops.sm100.cp.merge import merge_fwd
+    from cula.ops.sm100.cp.merge import launch_merge
 
     if num_non_first == 0:
         return None, 0
 
-    initial_states_merge = merge_fwd(
+    initial_states_merge = launch_merge(
         hm=hm,
         seq_starts=merge_seq_starts,
         seq_counts=merge_seq_counts,

@@ -13,19 +13,12 @@
 # limitations under the License.
 
 from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
+from cula.kda.chunk import chunk_kda
 from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
 
 __all__ = [
+    "chunk_kda",
     "kda_decode",
     "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",
 ]
-
-try:
-    from cula.kda.chunk import chunk_kda
-
-    __all__.append("chunk_kda")
-except ImportError as _exc:
-    import logging as _logging
-
-    _logging.getLogger(__name__).debug("chunk_kda unavailable: %s", _exc)

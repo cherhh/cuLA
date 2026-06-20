@@ -1,5 +1,20 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Copyright (c) 2026 MoonshotAI
+# Licensed under the MIT License.
+# Based on MoonshotAI/FlashKDA (https://github.com/MoonshotAI/FlashKDA)
 
 """FlashKDA intracard-CP prefill driver.
 
@@ -14,14 +29,16 @@ import os
 
 import torch
 
-from cula.ops.sm90.flashkda.k1 import launch_k1
-from cula.ops.sm90.flashkda.k2 import CHUNK, D, launch_k2
-from cula.ops.sm90.flashkda.prefill import (
+from cula.ops.sm90.k1 import launch_k1
+from cula.ops.sm90.k2 import CHUNK, D, launch_k2
+from cula.ops.sm90.cp.pre_scan import launch_pre_scan
+from cula.ops.sm90.cp.merge import launch_merge
+from cula.ops.sm90.fwd import (
     _copy_beta_flat,
-    _ensure_cute_arch_for_device,
+    _cute_arch_for_device,
     _get_or_alloc_workspaces,
     _get_or_build_seq_lens,
-    flash_kda_prefill,
+    flash_kda_fwd,
 )
 
 MIN_SEG_TILES = int(os.environ.get("CULA_FLASHKDA_CP_MIN_SEG_TILES", "4"))
@@ -76,52 +93,22 @@ def _plan_segments(
 
 
 # ---------------------------------------------------------------------------
-# Merge (host)
-# ---------------------------------------------------------------------------
-def _merge_carries_(
-    carries: torch.Tensor,  # [S, H, D, D] fp32 scratch, fully overwritten
-    m_seg: torch.Tensor,  # [S, H, D, D] fp32, bhvk (= M_seg^T per head)
-    b_seg: torch.Tensor,  # [S, H, D, D] fp32, bhvk (= B_seg^T per head)
-    per_seq: list[tuple[int, int]],
-    init_bhvk: torch.Tensor | None,  # [N, H, D, D] fp32 or None
-) -> torch.Tensor:
-    """Per-sequence affine fold: carries[i] = state entering segment i (bhvk)."""
-    for s, (first, n_seg) in enumerate(per_seq):
-        if init_bhvk is None:
-            carries[first].zero_()
-        else:
-            carries[first].copy_(init_bhvk[s])
-        for i in range(first, first + n_seg - 1):
-            # G_S' = G_S @ G_M + G_B  (right-multiply in bhvk layout)
-            torch.baddbmm(b_seg[i], carries[i], m_seg[i], out=carries[i + 1])
-    return carries
-
-
-# ---------------------------------------------------------------------------
 # Cached helpers
 # ---------------------------------------------------------------------------
-_EYE_CACHE: dict = {}
 _SCRATCH_CACHE: dict = {}
 _PLAN_TENSOR_CACHE: dict = {}
+_SCRATCH_CACHE_MAXSIZE = 8
+_PLAN_TENSOR_CACHE_MAXSIZE = 64
 
 
 def _get_plan_tensor(values: tuple, dtype, device: torch.device) -> torch.Tensor:
-    """Cached small host-derived index tensor (seg_cu_tiles, last-segment idx)."""
     key = (values, dtype, str(device))
     cached = _PLAN_TENSOR_CACHE.get(key)
     if cached is None:
+        if len(_PLAN_TENSOR_CACHE) >= _PLAN_TENSOR_CACHE_MAXSIZE:
+            _PLAN_TENSOR_CACHE.pop(next(iter(_PLAN_TENSOR_CACHE)))
         cached = torch.tensor(values, dtype=dtype, device=device)
         _PLAN_TENSOR_CACHE[key] = cached
-    return cached
-
-
-def _get_eye(n_seg: int, H: int, device: torch.device) -> torch.Tensor:
-    key = (n_seg, H, str(device))
-    cached = _EYE_CACHE.get(key)
-    if cached is None:
-        eye = torch.eye(D, dtype=torch.float32, device=device)
-        cached = eye.expand(n_seg, H, D, D).contiguous()
-        _EYE_CACHE[key] = cached
     return cached
 
 
@@ -129,27 +116,25 @@ def _get_scratch(key_name: str, shape: tuple, dtype, device, zero_on_alloc: bool
     key = (key_name, shape, dtype, str(device))
     cached = _SCRATCH_CACHE.get(key)
     if cached is None:
+        if len(_SCRATCH_CACHE) >= _SCRATCH_CACHE_MAXSIZE:
+            _SCRATCH_CACHE.pop(next(iter(_SCRATCH_CACHE)))
         alloc = torch.zeros if zero_on_alloc else torch.empty
         cached = alloc(shape, dtype=dtype, device=device)
         _SCRATCH_CACHE[key] = cached
     return cached
 
 
-def _get_prescan_launcher():
-    if os.environ.get("CULA_FLASHKDA_CP_V0", "0") == "1":
-        return None
-    try:
-        from cula.ops.sm90.flashkda.k2_prescan import launch_k2_prescan
-
-        return launch_k2_prescan
-    except ImportError:
-        return None
-
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def flash_kda_prefill_cp(
+def flash_kda_fwd_cp(*args, **kwargs) -> None:
+    q = args[0] if args else kwargs["q"]
+    with _cute_arch_for_device(q.device):
+        _flash_kda_fwd_cp_impl(*args, **kwargs)
+
+
+def _flash_kda_fwd_cp_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -168,14 +153,13 @@ def flash_kda_prefill_cp(
 ) -> None:
     """FlashKDA prefill with intracard sequence parallelism.
 
-    Same semantics as ``flash_kda_prefill``, restricted to CHUNK-aligned
+    Same semantics as ``flash_kda_fwd``, restricted to CHUNK-aligned
     sequence lengths. ``s_split`` caps segments per sequence (None = auto).
     """
     assert q.is_cuda and q.dtype == torch.bfloat16
     B, T, H, K = q.shape
     assert K == D
     device = q.device
-    _ensure_cute_arch_for_device(device)
 
     if cu_seqlens is None:
         assert T % CHUNK == 0, f"T={T} must be a multiple of {CHUNK}"
@@ -188,7 +172,7 @@ def flash_kda_prefill_cp(
         n_seqs = len(seq_lens)
         assert all(sl % CHUNK == 0 for sl in seq_lens), (
             "intracard-CP requires CHUNK-aligned sequence lengths; "
-            "use flash_kda_prefill for the padded-repack path"
+            "use flash_kda_fwd for the padded-repack path"
         )
         seq_tiles = [sl // CHUNK for sl in seq_lens]
         T_total = T
@@ -204,7 +188,7 @@ def flash_kda_prefill_cp(
     # Bypass: <= 2 segments per sequence => CP overhead outweighs parallelism.
     max_n_seg = max(n_seg for _, n_seg in per_seq)
     if n_seg_total == n_seqs or max_n_seg <= 2:
-        flash_kda_prefill(
+        flash_kda_fwd(
             q, k, v, g, beta, scale=scale, out=out, A_log=A_log,
             dt_bias=dt_bias, lower_bound=lower_bound,
             initial_state=initial_state, final_state=final_state,
@@ -239,24 +223,12 @@ def flash_kda_prefill_cp(
     m_seg = _get_scratch("m_seg", (n_seg_total, H, D, D), torch.float32, device)
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
 
-    prescan = _get_prescan_launcher()
-    if prescan is not None:
-        prescan(v_flat, beta_flat, ws_kd, ws_kr, ws_gt, ws_inv,
-                b_seg, m_seg, seg_cu_tiles)
-    else:
-        scratch_out = _get_scratch("scratch_out", v_flat.shape, torch.bfloat16, device)
-        launch_k2(v_flat, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk,
-                  scratch_out, seg_cu_tiles,
-                  initial_state=None, final_state=b_seg, state_transposed=False)
-        zeros_v = _get_scratch("zeros_v", v_flat.shape, torch.bfloat16, device, zero_on_alloc=True)
-        launch_k2(zeros_v, beta_flat, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk,
-                  scratch_out, seg_cu_tiles,
-                  initial_state=_get_eye(n_seg_total, H, device), final_state=m_seg,
-                  state_transposed=False)
+    launch_pre_scan(v_flat, beta_flat, ws_kd, ws_kr, ws_gt, ws_inv,
+                      b_seg, m_seg, seg_cu_tiles)
 
     # ---- stage 2: merge ----
     carries = _get_scratch("carries", (n_seg_total, H, D, D), torch.float32, device)
-    _merge_carries_(carries, m_seg, b_seg, per_seq, init_bhvk)
+    launch_merge(carries, m_seg, b_seg, per_seq, init_bhvk)
 
     # ---- stage 3: rerun ----
     out_flat = out.view(1, T_total, H, D) if B > 1 else out

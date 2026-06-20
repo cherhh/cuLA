@@ -1,7 +1,7 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Intracard-CP correctness: flash_kda_prefill_cp vs serial CuTeDSL prefill."""
+"""Intracard-CP correctness: flash_kda_fwd_cp vs serial CuTeDSL prefill."""
 
 import os
 
@@ -11,8 +11,9 @@ import torch
 os.environ["CULA_FLASHKDA_USE_CUTE"] = "1"
 os.environ.setdefault("CULA_FLASHKDA_STRICT_CUTE", "1")
 
-from cula.ops.sm90.flashkda.cp import _merge_carries_, _plan_segments, flash_kda_prefill_cp  # noqa: E402
-from cula.ops.sm90.flashkda.prefill import D, flash_kda_prefill  # noqa: E402
+from cula.ops.sm90.cp import flash_kda_fwd_cp  # noqa: E402
+from cula.ops.sm90.cp.flashkda import _plan_segments  # noqa: E402
+from cula.ops.sm90.fwd import D, flash_kda_fwd  # noqa: E402
 
 H = 8
 SCALE = D**-0.5
@@ -50,7 +51,7 @@ def _run_serial(q, k, v, g, beta, init, want_final, cu=None, transposed=False):
         if want_final
         else None
     )
-    flash_kda_prefill(
+    flash_kda_fwd(
         q, k, v, g, beta, scale=SCALE, out=out,
         A_log=_run_serial.A_log, dt_bias=_run_serial.dt_bias, lower_bound=LB,
         initial_state=init, final_state=fin, cu_seqlens=cu,
@@ -69,7 +70,7 @@ def _run_cp(q, k, v, g, beta, init, want_final, cu=None, transposed=False, s_spl
         if want_final
         else None
     )
-    flash_kda_prefill_cp(
+    flash_kda_fwd_cp(
         q, k, v, g, beta, scale=SCALE, out=out,
         A_log=_run_cp.A_log, dt_bias=_run_cp.dt_bias, lower_bound=LB,
         initial_state=init, final_state=fin, cu_seqlens=cu,
@@ -81,6 +82,16 @@ def _run_cp(q, k, v, g, beta, init, want_final, cu=None, transposed=False, s_spl
 # ---------------------------------------------------------------------------
 # Merge unit test (no kernels): right-multiply bhvk convention
 # ---------------------------------------------------------------------------
+def _merge_carries_ref(out, m_seg, b_seg, per_seq, init):
+    """Pure-PyTorch reference: sequential prefix scan over carry recurrence."""
+    for s, (first, n_seg) in enumerate(per_seq):
+        carry = init[s].clone()
+        for i in range(first, first + n_seg):
+            out[i] = carry
+            carry = torch.baddbmm(b_seg[i], carry, m_seg[i])
+    return out
+
+
 def test_merge_unit():
     torch.manual_seed(1)
     S, Hh = 6, 3
@@ -89,7 +100,7 @@ def test_merge_unit():
     b_seg = torch.randn(S, Hh, 16, 16, dtype=torch.float64)
     init = torch.randn(2, Hh, 16, 16, dtype=torch.float64)
 
-    carries = _merge_carries_(torch.empty_like(b_seg), m_seg, b_seg, per_seq, init)
+    carries = _merge_carries_ref(torch.empty_like(b_seg), m_seg, b_seg, per_seq, init)
 
     for s, (first, n_seg) in enumerate(per_seq):
         carry = init[s].clone()

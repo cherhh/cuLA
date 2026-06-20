@@ -12,20 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Smoke tests for cula.ops.sm90.flashkda.prefill (CuteDSL port)."""
+"""Smoke tests for cula.ops.sm90.fwd (CuteDSL port)."""
 
 import os
 
 import pytest
 import torch
 
-from cula.ops.sm90.flashkda.prefill import (
+from cula.ops.sm90.fwd import (
     CHUNK,
     WORKSPACE_BYTES_PER_TILE,
     D,
+    _cute_arch_for_device,
     _flashkda_torch_reference,
     allocate_workspace,
-    flash_kda_prefill,
+    flash_kda_fwd,
 )
 
 
@@ -63,7 +64,7 @@ def test_torch_reference_runs_fixed_len():
     B, T, H = 2, 32, 2
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(B, T, H)
     out = torch.empty_like(v)
-    flash_kda_prefill(
+    flash_kda_fwd(
         q,
         k,
         v,
@@ -83,13 +84,77 @@ def test_torch_reference_runs_fixed_len():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_empty_sequence_rejected():
+    B, T, H = 1, 0, 1
+    q, k, v, g, beta, A_log, dt_bias = _make_inputs(B, T, H)
+    out = torch.empty_like(v)
+    with pytest.raises(ValueError, match="B, T and H must be positive"):
+        flash_kda_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=D**-0.5,
+            out=out,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=-5.0,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_forced_cudagraph_env_non_aligned_t_still_writes_out(monkeypatch):
+    monkeypatch.setenv("CULA_FLASHKDA_VARLEN_CUDAGRAPH", "1")
+    B, T, H = 1, 17, 1
+    q, k, v, g, beta, A_log, dt_bias = _make_inputs(B, T, H, seed=11)
+    out = torch.empty_like(v)
+    flash_kda_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=D**-0.5,
+        out=out,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=-5.0,
+    )
+    ref, _ = _flashkda_torch_reference(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=D**-0.5,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=-5.0,
+        initial_state=None,
+        cu_seqlens=None,
+        output_final_state=False,
+    )
+    assert torch.isfinite(out.float()).all()
+    assert (out.float() - ref.float()).abs().max().item() < 3e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cute_arch_env_is_scoped(monkeypatch):
+    monkeypatch.delenv("CUTE_DSL_ARCH", raising=False)
+    with _cute_arch_for_device(torch.device("cuda")):
+        assert os.environ["CUTE_DSL_ARCH"] == "sm_90a"
+    assert "CUTE_DSL_ARCH" not in os.environ
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_torch_reference_runs_with_state():
     B, T, H = 1, 16, 2
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(B, T, H)
     initial_state = torch.zeros(B, H, D, D, dtype=torch.bfloat16, device="cuda")
     final_state = torch.zeros_like(initial_state)
     out = torch.empty_like(v)
-    flash_kda_prefill(
+    flash_kda_fwd(
         q,
         k,
         v,
@@ -126,10 +191,10 @@ def test_cute_dispatch_bridges_to_cpp():
     os.environ.pop("CULA_FLASHKDA_USE_CUTE", None)
     import importlib
 
-    import cula.ops.sm90.flashkda.prefill as mod
+    import cula.ops.sm90.fwd as mod
 
     importlib.reload(mod)
-    mod.flash_kda_prefill(
+    mod.flash_kda_fwd(
         q, k, v, g, beta,
         scale=D**-0.5, out=out_ref,
         A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
@@ -138,7 +203,7 @@ def test_cute_dispatch_bridges_to_cpp():
     os.environ["CULA_FLASHKDA_USE_CUTE"] = "1"
     try:
         importlib.reload(mod)
-        mod.flash_kda_prefill(
+        mod.flash_kda_fwd(
             q, k, v, g, beta,
             scale=D**-0.5, out=out_cute,
             A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,

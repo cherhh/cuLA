@@ -1,10 +1,24 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Copyright (c) 2026 MoonshotAI
+# Licensed under the MIT License.
+# Based on MoonshotAI/FlashKDA (https://github.com/MoonshotAI/FlashKDA)
 
 """
-FlashKDA K1 (Prepare) — CuteDSL port of ``fwd_kernel1.cuh``.
+CuteDSL port of FlashKDA K1.
 
-Grid = (total_tiles, H), 256 threads per CTA, sm_90+ (TMA, mbarrier).
 Produces 6 workspace tensors consumed by K2: ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk.
 """
 
@@ -18,7 +32,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import from_dlpack
 
-from cula.ops.sm90.flashkda.prefill import add_f16x2_u32, movm_t_b16
+from cula.ops.sm90.fwd import add_f16x2_u32, movm_t_b16
 
 
 CHUNK: int = 16
@@ -69,24 +83,24 @@ def k1_kernel(
     # Input tiles (plain layout, TMA load targets)
     sQ = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sK = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
-    sGbf = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
-    sGcs = smem.allocate_tensor(cutlass.Float32, qk_layout, 128)
+    sG_raw = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
+    sG_cumsum = smem.allocate_tensor(cutlass.Float32, qk_layout, 128)
     s_g_total = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 128)
     # Outputs (K_INTER swizzled, alias input bytes after barrier)
-    s_k_inv = cute.make_tensor(cute.recast_ptr(sGcs.iterator, dtype=cutlass.BFloat16), kinter_qk_layout)
+    s_k_inv = cute.make_tensor(cute.recast_ptr(sG_cumsum.iterator, dtype=cutlass.BFloat16), kinter_qk_layout)
     s_q_decayed = cute.make_tensor(sQ.iterator, kinter_qk_layout)
     s_k_decayed = cute.make_tensor(sK.iterator, kinter_qk_layout)
-    s_k_restored = cute.make_tensor(sGbf.iterator, kinter_qk_layout)
+    s_k_restored = cute.make_tensor(sG_raw.iterator, kinter_qk_layout)
     # L/Mqk MMA outputs
     sL_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     sMqk_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     sBetaSig = smem.allocate_tensor(cutlass.Float32, cute.make_layout((CHUNK,)), 128)
-    # Neumann buffers (alias sGcs after decay_apply barrier)
-    sGcs_fp16_ptr = cute.recast_ptr(sGcs.iterator, dtype=cutlass.Float16)
-    sGcs_bf16_ptr = cute.recast_ptr(sGcs.iterator, dtype=cutlass.BFloat16)
-    sL_fp16 = cute.make_tensor(sGcs_fp16_ptr, cc_layout)
-    sINV_fp16 = cute.make_tensor(sGcs_fp16_ptr + (CHUNK * CHUNK), cc_layout)
-    sINV_bf16 = cute.make_tensor(sGcs_bf16_ptr + (2 * CHUNK * CHUNK), cc_layout)
+    # Neumann buffers (alias sG_cumsum after decay_apply barrier)
+    sG_cumsum_fp16_ptr = cute.recast_ptr(sG_cumsum.iterator, dtype=cutlass.Float16)
+    sG_cumsum_bf16_ptr = cute.recast_ptr(sG_cumsum.iterator, dtype=cutlass.BFloat16)
+    sL_fp16 = cute.make_tensor(sG_cumsum_fp16_ptr, cc_layout)
+    sINV_fp16 = cute.make_tensor(sG_cumsum_fp16_ptr + (CHUNK * CHUNK), cc_layout)
+    sINV_bf16 = cute.make_tensor(sG_cumsum_bf16_ptr + (2 * CHUNK * CHUNK), cc_layout)
     sMbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((1,)), 8)
     sMbar_ptr = sMbar.iterator
 
@@ -118,7 +132,7 @@ def k1_kernel(
         tma_atom_g,
         0,
         cute.make_layout(1),
-        cute.group_modes(sGbf, 0, 2),
+        cute.group_modes(sG_raw, 0, 2),
         cute.group_modes(gSrc_g, 0, 2),
     )
 
@@ -212,11 +226,11 @@ def k1_kernel(
         dt = cutlass.Float32(dt_bias[head_idx, col_c])
         s = cutlass.Float32(0.0)
         for r in cutlass.range_constexpr(CHUNK):
-            x = cutlass.Float32(sGbf[r, col_c]) + dt
+            x = cutlass.Float32(sG_raw[r, col_c]) + dt
             x = a_log_exp * x
             sig = cutlass.Float32(0.5) * (cute.tanh(x * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
             s = s + cutlass.Float32(gate_scale) * sig
-            sGcs[r, col_c] = s
+            sG_cumsum[r, col_c] = s
         s_g_total[col_c] = cute.exp(s, fastmath=True)
     cute.arch.barrier()
 
@@ -226,32 +240,32 @@ def k1_kernel(
         sBetaSig[tidx] = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
 
     # decay_apply
-    lane_d = tidx % 32
-    warp_d = tidx // 32
-    g_d = lane_d // 4
-    t_d = lane_d % 4
+    lane = tidx % 32
+    warp_id = tidx // 32
+    group = lane // 4
+    t_in_group = lane % 4
     N_M: cutlass.Constexpr[int] = CHUNK // 8  # = 2
     N_N: cutlass.Constexpr[int] = D // 64  # = 2
     N_TILES: cutlass.Constexpr[int] = N_M * N_N  # = 4
 
     # Phase A: load g/q/k/g_total into regs
-    reg_g_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.Float32)
-    reg_q_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
-    reg_k_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
-    reg_gt_da = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.Float32)
-    sGcs_zipped = cute.zipped_divide(sGcs, (1, 2))
+    reg_g = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.Float32)
+    reg_q = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
+    reg_k = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
+    reg_gt = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.Float32)
+    sG_cumsum_zipped = cute.zipped_divide(sG_cumsum, (1, 2))
     sQ_zipped = cute.zipped_divide(sQ, (1, 2))
     sK_zipped = cute.zipped_divide(sK, (1, 2))
     s_g_total_zipped = cute.zipped_divide(s_g_total, (2,))
     for m_blk in cutlass.range_constexpr(0, CHUNK, 8):
         for n_blk in cutlass.range_constexpr(0, D, 64):
             tile_idx_d: cutlass.Constexpr[int] = (m_blk // 8) * N_N + (n_blk // 64)
-            row_d = m_blk + ((warp_d + g_d) % 8)
-            col_d = n_blk + g_d * 8 + t_d * 2
-            cute.autovec_copy(sGcs_zipped[None, (row_d, col_d // 2)], reg_g_da[tile_idx_d, None])
-            cute.autovec_copy(sQ_zipped[None, (row_d, col_d // 2)], reg_q_da[tile_idx_d, None])
-            cute.autovec_copy(sK_zipped[None, (row_d, col_d // 2)], reg_k_da[tile_idx_d, None])
-            cute.autovec_copy(s_g_total_zipped[None, col_d // 2], reg_gt_da[tile_idx_d, None])
+            row = m_blk + ((warp_id + group) % 8)
+            col = n_blk + group * 8 + t_in_group * 2
+            cute.autovec_copy(sG_cumsum_zipped[None, (row, col // 2)], reg_g[tile_idx_d, None])
+            cute.autovec_copy(sQ_zipped[None, (row, col // 2)], reg_q[tile_idx_d, None])
+            cute.autovec_copy(sK_zipped[None, (row, col // 2)], reg_k[tile_idx_d, None])
+            cute.autovec_copy(s_g_total_zipped[None, col // 2], reg_gt[tile_idx_d, None])
 
     cute.arch.barrier()
 
@@ -267,24 +281,24 @@ def k1_kernel(
     for m_blk in cutlass.range_constexpr(0, CHUNK, 8):
         for n_blk in cutlass.range_constexpr(0, D, 64):
             tile_idx_d: cutlass.Constexpr[int] = (m_blk // 8) * N_N + (n_blk // 64)
-            row_d = m_blk + ((warp_d + g_d) % 8)
-            col_d = n_blk + g_d * 8 + t_d * 2
+            row = m_blk + ((warp_id + group) % 8)
+            col = n_blk + group * 8 + t_in_group * 2
             for v in cutlass.range_constexpr(2):
                 vv: cutlass.Constexpr[int] = v
-                gv = reg_g_da[tile_idx_d, vv]
-                qv = cutlass.Float32(reg_q_da[tile_idx_d, vv])
-                kv = cutlass.Float32(reg_k_da[tile_idx_d, vv])
-                gtv = reg_gt_da[tile_idx_d, vv]
+                gv = reg_g[tile_idx_d, vv]
+                qv = cutlass.Float32(reg_q[tile_idx_d, vv])
+                kv = cutlass.Float32(reg_k[tile_idx_d, vv])
+                gtv = reg_gt[tile_idx_d, vv]
                 exp_pos = cute.exp(gv, fastmath=True)
                 inv_pos = cutlass.Float32(1.0) / exp_pos
                 r_qd_pack[0, vv] = cutlass.BFloat16(qv * exp_pos * cutlass.Float32(scale))
                 r_kd_pack[0, vv] = cutlass.BFloat16(kv * exp_pos)
                 r_ki_pack[0, vv] = cutlass.BFloat16(kv * inv_pos)
                 r_kr_pack[0, vv] = cutlass.BFloat16(kv * gtv * inv_pos)
-            cute.autovec_copy(r_qd_pack, s_q_decayed_zipped[None, (row_d, col_d // 2)])
-            cute.autovec_copy(r_kd_pack, s_k_decayed_zipped[None, (row_d, col_d // 2)])
-            cute.autovec_copy(r_ki_pack, s_k_inv_zipped[None, (row_d, col_d // 2)])
-            cute.autovec_copy(r_kr_pack, s_k_restored_zipped[None, (row_d, col_d // 2)])
+            cute.autovec_copy(r_qd_pack, s_q_decayed_zipped[None, (row, col // 2)])
+            cute.autovec_copy(r_kd_pack, s_k_decayed_zipped[None, (row, col // 2)])
+            cute.autovec_copy(r_ki_pack, s_k_inv_zipped[None, (row, col // 2)])
+            cute.autovec_copy(r_kr_pack, s_k_restored_zipped[None, (row, col // 2)])
 
     if tidx < 128:
         gt_base = (head_idx * total_tiles + tile_idx) * D
@@ -399,11 +413,11 @@ def k1_kernel(
 
     # Neumann inverse
     i = tidx // CHUNK
-    j2 = tidx % CHUNK
-    l_bf = cutlass.Float32(sL_bf16[i, j2])
-    sL_fp16[i, j2] = cutlass.Float16(l_bf)
-    inv_init = cutlass.Float32(1.0 if i == j2 else 0.0) - l_bf
-    sINV_fp16[i, j2] = cutlass.Float16(inv_init)
+    col = tidx % CHUNK
+    l_bf = cutlass.Float32(sL_bf16[i, col])
+    sL_fp16[i, col] = cutlass.Float16(l_bf)
+    inv_init = cutlass.Float32(1.0 if i == col else 0.0) - l_bf
+    sINV_fp16[i, col] = cutlass.Float16(inv_init)
     cute.arch.barrier()
 
     if warp_idx == 0:
@@ -637,7 +651,41 @@ def run_k1(
 
 
 _compiled_cache_k1: dict = {}
+_compiled_call_style_k1: dict = {}
 _CU_STREAM_CACHE: dict[int, object] = {}
+_COMPILED_CACHE_MAXSIZE = 32
+_CU_STREAM_CACHE_MAXSIZE = 64
+
+
+def _store_compiled_k1(key, compiled_fn) -> None:
+    if len(_compiled_cache_k1) >= _COMPILED_CACHE_MAXSIZE:
+        evict_key = next(iter(_compiled_cache_k1))
+        _compiled_cache_k1.pop(evict_key, None)
+        _compiled_call_style_k1.pop(evict_key, None)
+    _compiled_cache_k1[key] = compiled_fn
+
+
+def _is_runtime_signature_error(exc: Exception) -> bool:
+    return "input args/kwargs length does not match runtime function signature" in repr(exc)
+
+
+def _call_compiled_k1(key, compiled_fn, compact_args, full_args) -> None:
+    style = _compiled_call_style_k1.get(key)
+    if style == "compact":
+        compiled_fn(*compact_args)
+        return
+    if style == "full":
+        compiled_fn(*full_args)
+        return
+
+    try:
+        compiled_fn(*compact_args)
+        _compiled_call_style_k1[key] = "compact"
+    except Exception as exc:
+        if not _is_runtime_signature_error(exc):
+            raise
+        _compiled_call_style_k1[key] = "full"
+        compiled_fn(*full_args)
 
 
 def _get_current_custream():
@@ -645,6 +693,8 @@ def _get_current_custream():
     cached = _CU_STREAM_CACHE.get(stream_ptr)
     if cached is not None:
         return cached
+    if len(_CU_STREAM_CACHE) >= _CU_STREAM_CACHE_MAXSIZE:
+        _CU_STREAM_CACHE.pop(next(iter(_CU_STREAM_CACHE)))
     cached = cuda_drv.CUstream(stream_ptr)
     _CU_STREAM_CACHE[stream_ptr] = cached
     return cached
@@ -682,7 +732,7 @@ def launch_k1(
         q_flat = q.view(T_total, H, D)
         k_flat = k.view(T_total, H, D)
         g_flat = g.view(T_total, H, D)
-        _compiled_cache_k1[key] = cute.compile(
+        compiled = cute.compile(
             run_k1,
             from_dlpack(q_flat.detach(), assumed_align=16),
             from_dlpack(k_flat.detach(), assumed_align=16),
@@ -704,25 +754,21 @@ def launch_k1(
             stream=stream,
             options="--opt-level=3",
         )
+        _store_compiled_k1(key, compiled)
 
     stream = _get_current_custream()
     q_flat = q.view(T_total, H, D)
     k_flat = k.view(T_total, H, D)
     g_flat = g.view(T_total, H, D)
-    _compiled_cache_k1[key](
-        q_flat,
-        k_flat,
-        g_flat,
-        A_log,
-        dt_bias,
-        beta,
-        ws_qd,
-        ws_kd,
-        ws_kr,
-        ws_gt,
-        ws_inv,
-        ws_mqk,
+    compact_args = (
+        q_flat, k_flat, g_flat, A_log, dt_bias, beta,
+        ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk,
         stream,
     )
-
+    full_args = (
+        q_flat, k_flat, g_flat, A_log, dt_bias, beta,
+        ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk,
+        H, total_tiles, T_total, scale, gate_scale, stream,
+    )
+    _call_compiled_k1(key, _compiled_cache_k1[key], compact_args, full_args)
 
