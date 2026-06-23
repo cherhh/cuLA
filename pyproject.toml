@@ -84,9 +84,6 @@ force-sort-within-sections = false
 "cula/kda/blackwell_fused_fwd.py" = ["F821"]
 
 [tool.setuptools_scm]
-# write generated version into package for runtime access
 write_to = "cula/_version.py"
-# add a date-based local suffix when needed
-local_scheme = "node-and-date"
-# fallback for non-git sources
+local_scheme = "no-local-version"
 fallback_version = "0.1.0"
