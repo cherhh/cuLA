@@ -2068,23 +2068,27 @@ def chunk_gated_delta_rule_fwd_h(
         no_cp=_no_cp,
     )
     if cp_decision.enabled:
+        from cula.ops.kda.policy import NotSplittableError
         from cula.ops.kda.sm100.cp.chunk_delta_h import intracard_fwd_h
 
-        return intracard_fwd_h(
-            k=k,
-            w=w,
-            u=u,
-            gk=gk,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            chunk_size=chunk_size,
-            save_new_value=save_new_value,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            allow_fallback=not cp_decision.force,
-            skip_precheck=True,
-        )
+        try:
+            return intracard_fwd_h(
+                k=k,
+                w=w,
+                u=u,
+                gk=gk,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                chunk_size=chunk_size,
+                save_new_value=save_new_value,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            )
+        except NotSplittableError:
+            if cp_decision.force:
+                raise
+            # "auto" path: shape not splittable -- fall through to the serial body below.
 
     B, T, H, K_dim = k.shape
     HV = u.shape[2]

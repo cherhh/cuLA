@@ -413,13 +413,13 @@ def intracard_fwd_h(
     cu_seqlens_cpu: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     max_splits: int = 32,
-    allow_fallback: bool = True,
-    skip_precheck: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Intra-card CP chunk_delta_h forward; drop-in replacement for chunk_gated_delta_rule_fwd_h.
+    """Intra-card CP chunk_delta_h forward; splits long sequences and runs
+    pre_scan -> merge -> fwd_h on the sub-sequences.
 
-    Splits long sequences, runs pre_scan → merge → fwd_h on sub-sequences.
-    Falls back to the non-CP path when guards indicate no benefit.
+    Pure CP executor: raises NotSplittableError when the shape cannot be
+    meaningfully split. The caller owns the fallback-vs-raise policy (the
+    pre-split heuristic lives in sm100_intracard_cp_decision, not here).
     """
     assert cu_seqlens is not None, "intracard_fwd_h requires cu_seqlens (varlen mode)"
 
@@ -430,23 +430,6 @@ def intracard_fwd_h(
 
     if cu_seqlens_cpu is None:
         cu_seqlens_cpu = cu_seqlens.cpu()
-
-    if not skip_precheck and not should_use_intracard_cp(cu_seqlens_cpu, num_sms, H, chunk_size):
-        if not allow_fallback:
-            raise ValueError("SM100 intracard CP is rejected by the pre-split dispatch policy.")
-        return _get_fwd_h()(
-            k=k,
-            w=w,
-            u=u,
-            gk=gk,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            chunk_size=chunk_size,
-            save_new_value=save_new_value,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            _no_cp=True,
-        )
 
     cu_list = cu_seqlens_cpu.tolist()
     num_seqs = len(cu_list) - 1
@@ -477,21 +460,9 @@ def intracard_fwd_h(
         split_info = False
 
     if not split_info:
-        if not allow_fallback:
-            raise ValueError("SM100 intracard CP is not meaningfully splittable for this shape.")
-        return _get_fwd_h()(
-            k=k,
-            w=w,
-            u=u,
-            gk=gk,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            chunk_size=chunk_size,
-            save_new_value=save_new_value,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            _no_cp=True,
-        )
+        from cula.ops.kda.policy import NotSplittableError
+
+        raise NotSplittableError("SM100 intracard CP is not meaningfully splittable for this shape.")
 
     N_orig = len(cu_seqlens_cpu) - 1
 

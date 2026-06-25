@@ -22,6 +22,14 @@ class IntracardCPDecision:
     force: bool = False
 
 
+class NotSplittableError(ValueError):
+    """Raised when intracard CP cannot meaningfully split the given shape.
+
+    Subclasses ValueError so existing ``except ValueError`` callers keep working,
+    while new code can catch it narrowly and fall back to the serial path.
+    """
+
+
 def normalize_intracard_cp_mode(mode: IntracardCPMode) -> IntracardCPMode:
     # Identity checks (not `in`): `1 == True` / `0 == False` would otherwise let stray
     # ints slip past validation and be mishandled downstream (silently treated like "auto").
