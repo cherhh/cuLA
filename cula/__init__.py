@@ -17,8 +17,14 @@ try:
 except ImportError:
     __version__ = "0.1.0"
 
-from cula.ops.lightning_attn_sm100 import LinearAttentionChunkwiseDecay
-
 __all__ = [
     "LinearAttentionChunkwiseDecay",
 ]
+
+
+def __getattr__(name):
+    if name == "LinearAttentionChunkwiseDecay":
+        from cula.ops.lightning.prefill_sm100 import LinearAttentionChunkwiseDecay
+
+        return LinearAttentionChunkwiseDecay
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

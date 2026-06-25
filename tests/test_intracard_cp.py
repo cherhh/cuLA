@@ -32,13 +32,13 @@ if str(_REPO_ROOT) not in sys.path:
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h  # noqa: E402
 from fla.utils import assert_close  # noqa: E402  (RMSE-relative + atol short-circuit + NaN check)
 
-from cula.ops.chunk_delta_h_sm100 import chunk_gated_delta_rule_fwd_h  # noqa: E402
-from cula.ops.cp.chunk_delta_h import (  # noqa: E402
+from cula.ops.kda.sm100.cp.chunk_delta_h import (  # noqa: E402
     compute_subseq_len,
     intracard_fwd_h,
     prepare_subseq_cu_seqlens,
     should_use_intracard_cp,
 )
+from cula.ops.kda.sm100.delta_h import chunk_gated_delta_rule_fwd_h  # noqa: E402
 from cula.utils import get_device_sm_count  # noqa: E402
 
 # Constants & tolerances — aligned with existing cuLA tests (see below).
