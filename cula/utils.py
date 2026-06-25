@@ -83,7 +83,7 @@ def assert_hopper(device: torch.device | str | int | None = None) -> None:
 def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
     """Return the appropriate ``kda_prefill`` implementation for *device*.
 
-    - sm100/sm103 (Blackwell) → cula.kda.kda_prefill_blackwell
+    - sm100/sm103 (Blackwell) → not yet available (raises NotImplementedError)
     - sm90  (Hopper)          → cula.kda.kda_prefill_hopper
 
     Args:
@@ -94,9 +94,11 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
     """
     major, minor = get_device_sm_version(device)
     if major == 10 and minor in (0, 3):
-        from cula.kda import kda_prefill_blackwell
-
-        return kda_prefill_blackwell
+        # TODO
+        raise NotImplementedError(
+            "The Blackwell implementation of fused prefill is not yet available. "
+            "Please use a sm90a (Hopper) device or wait for future updates."
+        )
     elif major == 9 and minor == 0:
         from cula.kda.hopper_fused_fwd import cula_kda_prefill
 

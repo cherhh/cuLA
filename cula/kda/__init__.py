@@ -16,7 +16,6 @@
 
 __all__ = [
     "chunk_kda",
-    "kda_prefill_blackwell",
     "kda_decode",
     "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",
@@ -24,7 +23,6 @@ __all__ = [
 
 _LAZY = {
     "chunk_kda": ("cula.kda.chunk", "chunk_kda"),
-    "kda_prefill_blackwell": ("cula.ops.kda.experimental.sm100_fused.wrapper", "flash_kda_prefill"),
     "kda_prefill_hopper": ("cula.kda.hopper_fused_fwd", "cula_kda_prefill"),
     "kda_decode": ("cula.ops.kda.decode.cute", "kda_decode"),
     "fused_sigmoid_gating_delta_rule_update": (
