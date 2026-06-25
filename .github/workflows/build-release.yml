@@ -61,8 +61,25 @@ jobs:
       - name: Install Python dependencies
         run: |
           python3.12 -m pip install --no-cache-dir --upgrade pip
-          python3.12 -m pip install --no-cache-dir torch --index-url ${{ matrix.cuda == 'cu129' && 'https://download.pytorch.org/whl/cu129' || 'https://download.pytorch.org/whl/cu130' }}
+          python3.12 -m pip install --no-cache-dir torch==2.9.1 --index-url ${{ matrix.cuda == 'cu129' && 'https://download.pytorch.org/whl/cu129' || 'https://download.pytorch.org/whl/cu130' }}
           python3.12 -m pip install --no-cache-dir setuptools wheel "setuptools_scm>=6.0" build ninja auditwheel patchelf
+
+      - name: Expose PyTorch CUDA libraries
+        # The nvidia/cuda devel image ships the CUDA toolkit but not cuDNN.
+        # torch's pip wheels bundle cuDNN inside site-packages/nvidia/*/lib/,
+        # which is not on the linker search path — add it so torch._C can load.
+        run: |
+          LIB_DIRS="$(python3.12 <<'EOF'
+          import glob, os, site
+          dirs = []
+          for sp in site.getsitepackages():
+              for p in [os.path.join(sp, "torch", "lib")] + glob.glob(os.path.join(sp, "nvidia", "*", "lib")):
+                  if os.path.isdir(p):
+                      dirs.append(p)
+          print(":".join(dirs))
+          EOF
+          )"
+          echo "LD_LIBRARY_PATH=${LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - name: Compute version
         id: version
