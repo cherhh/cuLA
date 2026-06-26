@@ -214,16 +214,11 @@ def cula_kda_prefill(
         raise TypeError("beta must be in bfloat16 or float32.")
     if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
         raise ValueError("Currently we only support head dim of 128 for KDA.")
-    if num_kv_heads % num_qk_heads != 0:
-        raise ValueError(
-            f"num_kv_heads must be a multiple of num_qk_heads, got num_kv_heads={num_kv_heads}, num_qk_heads={num_qk_heads}."
-        )
-
     if num_kv_heads != num_qk_heads:
-        # KDA uses value/state heads; q/k heads may be shared across multiple state heads.
-        heads_per_group = num_kv_heads // num_qk_heads
-        q = q.repeat_interleave(heads_per_group, dim=2)
-        k = k.repeat_interleave(heads_per_group, dim=2)
+        raise NotImplementedError(
+            "SM90 CuTeDSL KDA prefill does not support grouped-value attention yet "
+            f"(num_kv_heads={num_kv_heads} != num_qk_heads={num_qk_heads}); native GVA is a follow-up change."
+        )
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
