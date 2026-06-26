@@ -19,8 +19,9 @@ lazy (PEP 562) and pull no CuTeDSL/CUDA at import time.
 
 **Not exported:**
 - `flash_kda_prefill` (`cula/ops/kda/experimental/sm100_fused/wrapper.py`) — `[exp]` **unwired / dead path**. No live caller; the Blackwell fused prefill is not yet wired. Backend: `…/experimental/sm100_fused/kda_fully_fused_wip.py` (~6k lines).
+- `intracard_prefill` (`cula/ops/kda/sm90/cp/driver.py`) — SM90 intracard-CP backend, reached from the SM90 wrapper when `use_cp` selects it (see §5).
 
-## The pipelines
+## The five pipelines
 
 ### 1. Modular chunked — `chunk_kda` (SM100, train + Blackwell prefill)
 ```
@@ -48,7 +49,8 @@ kda_prefill_hopper = cula_kda_prefill     hopper_prefill.py  (HopperChunkKDAFunc
       CuTe DSL, CHUNK=16, D=128. Handles varlen padding/repack. CUDA graph disabled.
 ```
 > **Note:** this is a **two-kernel pipeline** (K1 prepare → 6 workspace tensors →
-> K2 recurrence), *not* a single fused kernel.
+> K2 recurrence), *not* a single fused kernel. The
+> K1/K2 split is what enables SM90 CP (K1 once → K2 rerun, §5).
 
 ### 3. Fused prefill (Blackwell) — `flash_kda_prefill` `[exp]`, not exported
 ```
@@ -64,29 +66,28 @@ ops/kda/decode/cute.py   — small / large / varlen kernel variants + a fast den
    Independent of the sm90/sm100 prefill paths. (FLA reference: ops/kda/decode/reference_fla.py.)
 ```
 
-### 5. Context Parallel (intracard, SM100) — `use_intracard_cp` / `use_cp`
-Surfaced via an explicit `use_intracard_cp: "auto" | bool` (alias `use_cp`) on `chunk_kda`;
-**default off**. Decision logic is centralized in `cula/ops/kda/policy.py`
-(`sm100_intracard_cp_decision`): force (`True`) raises on unsupported/unsplittable, `"auto"`
-runs only when supported + heuristically beneficial else falls back, `False` disables.
-`cp_context` (FLA *cross-rank* CP) is orthogonal: when a `cp_context` is passed, forcing
-`use_intracard_cp=True` **raises** (the two cannot be combined), while `"auto"`/`False`/default
-force intracard CP **off** and let `cp_context` proceed.
+### 5. Context Parallel (intracard) — `use_intracard_cp` / `use_cp`
+Surfaced via an explicit `use_intracard_cp: "auto" | bool` (alias `use_cp`) on both prefill
+entries; **default off**. Decision logic is centralized in `cula/ops/kda/policy.py`
+(`sm90_intracard_cp_decision`, `sm100_intracard_cp_decision`): force (`True`) raises on
+unsupported/unsplittable, `"auto"` runs only when supported + heuristically beneficial else
+falls back, `False` disables. `cp_context` (FLA *cross-rank* CP) is orthogonal: when a
+`cp_context` is passed, forcing `use_intracard_cp=True` **raises** (the two cannot be combined),
+while `"auto"`/`False`/default force intracard CP **off** and let `cp_context` proceed.
 
-| | SM100 CP |
-|--|----------|
-| Entry | `chunk_kda(use_cp=...)` → inside `chunk_gated_delta_rule_fwd_h` |
-| Pipeline | `intracard_fwd_h`: `pre_scan` → `merge` → `fwd_h` on sub-seqs (recurses with `_no_cp=True`) |
-| Default | off (`None`→env `CULA_INTRACARD_CP`) |
-| Backend | `ops/kda/sm100/cp/{chunk_delta_h,pre_scan,merge}.py` |
-
-> The Hopper two-kernel prefill (§2) is forward-only and **serial** here; its single-card
-> CP variant is a separate change.
+| | SM90 CP | SM100 CP |
+|--|---------|----------|
+| Entry | `cula_kda_prefill(use_cp=...)` → `intracard_prefill` | `chunk_kda(use_cp=...)` → inside `chunk_gated_delta_rule_fwd_h` |
+| Pipeline | K1 once → `pre_scan` → `merge` → K2 rerun | `intracard_fwd_h`: `pre_scan` → `merge` → `fwd_h` on sub-seqs (recurses with `_no_cp=True`) |
+| Default | off (`None`→off) | off (`None`→env `CULA_INTRACARD_CP`) |
+| Backend | `ops/kda/sm90/cp/{driver,pre_scan,merge,plan}.py` | `ops/kda/sm100/cp/{chunk_delta_h,pre_scan,merge}.py` |
 
 ## Gotchas / known rough edges
 
 - **`cp_context` (FLA cross-rank CP) ≠ `use_cp` (cuLA single-card intracard CP).** Both
   live on `chunk_kda`; they are orthogonal. `cp_context` comes from `fla.ops.cp` (FLA ≥ 0.5.0).
+- **Two CP backends are asymmetric in scope:** SM90 CP parallelizes the whole K1+K2 prefill;
+  SM100 CP parallelizes only the recurrence (`fwd_h`).
 - **SM100 paths not CI-runtime-verified here:** this box is Hopper (no SM100 GPU, `cula.cudac`
   not built). SM100 (`chunk_kda`, decode, intracard-CP) is import/compile-verified; SM90 is
   kernel-test verified.
@@ -96,6 +97,6 @@ force intracard CP **off** and let `cp_context` proceed.
 | Runtime | Where |
 |---------|-------|
 | CUDA C++ (`cula.cudac`) | chunk intra fwd + recompute_w_u (`csrc/kda/sm100/`) |
-| CuTe DSL / TVM-FFI | SM90 prefill (k1/k2), SM100 recurrence/output/bwd-fused, decode, SM100 CP backend |
+| CuTe DSL / TVM-FFI | SM90 prefill (k1/k2), SM100 recurrence/output/bwd-fused, decode, both CP backends |
 | Triton | bwd intra (`chunk_intra.py`), bwd dAv/wy_dqkg (`chunk_bwd.py`) |
 | FLA (`third_party/`) | gate cumsum/bwd, `chunk_gated_delta_rule_bwd_dhu`, cross-rank CP pre/post-process |
