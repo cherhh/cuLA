@@ -57,10 +57,11 @@ pip install -e third_party/flash-linear-attention
 pip install -e . --no-build-isolation
 ```
 
-**Build fat wheel (SM90 + SM100 + SM103):**
+**Build fat wheel (default builds all archs):**
 
 ```bash
-CULA_BUILD_ALL_ARCHS=1 python -m build --wheel --no-isolation
+python -m build --wheel --no-isolation
+# Opt out per-arch: CULA_DISABLE_SM100=1 / CULA_DISABLE_SM103=1
 ```
 
 ## Quick Start
