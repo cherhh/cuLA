@@ -41,8 +41,6 @@ from cula.utils import USE_FAST_MATH, assert_blackwell, get_device_sm_count
 COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verbose'"
 
 
-
-
 # in FLA, cumsum returns int64 tensor by default
 @tensor_cache
 def prepare_chunk_offsets_i32(

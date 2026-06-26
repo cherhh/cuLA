@@ -3,10 +3,10 @@
 
 """KDA backend kernels migrated to the arch-first layout.
 
-  sm100/          SM100 (Blackwell) modular-chunk recurrence/output/bwd kernels
-  decode/         single-token decode (CuTe DSL + FLA reference)
-  experimental/   unwired fully-fused WIP
-  policy.py       CP dispatch policy (use_cp / use_intracard_cp)
+sm100/          SM100 (Blackwell) modular-chunk recurrence/output/bwd kernels
+decode/         single-token decode (CuTe DSL + FLA reference)
+experimental/   unwired fully-fused WIP
+policy.py       CP dispatch policy (use_cp / use_intracard_cp)
 
 """
 
