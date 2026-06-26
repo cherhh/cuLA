@@ -180,8 +180,8 @@ def _validate_inputs(
     if has_state_out:
         if final_state.shape != (N, H, D, D):
             raise ValueError(f"final_state shape must be ({N}, {H}, {D}, {D}), got {tuple(final_state.shape)}")
-        if not final_state.is_cuda or final_state.dtype not in (torch.bfloat16, torch.float32):
-            raise TypeError("final_state must be a CUDA bf16 or fp32 tensor")
+        if not final_state.is_cuda or final_state.dtype != torch.float32:
+            raise TypeError("final_state must be a CUDA float32 tensor")
         if has_state_in:
             if final_state.dtype != initial_state.dtype:
                 raise TypeError("initial_state and final_state dtype must match")
@@ -615,15 +615,11 @@ def _dispatch_cute(
 
     k2_initial_state = None
     if problem.has_state_in:
-        k2_initial_state = (
-            initial_state.to(torch.float32).contiguous() if initial_state.dtype != torch.float32 else initial_state
-        )
+        k2_initial_state = initial_state.contiguous()
 
     k2_final_state = None
     if problem.has_state_out:
-        k2_final_state = (
-            final_state if final_state.dtype == torch.float32 else torch.empty_like(final_state, dtype=torch.float32)
-        )
+        k2_final_state = final_state
 
     launch_k1(
         k1_q,
@@ -662,8 +658,6 @@ def _dispatch_cute(
         v_tile_starts=k2_v_tile_starts,
         v_tile_actual_lens=k2_v_tile_actual_lens,
     )
-    if problem.has_state_out and final_state.dtype != torch.float32:
-        final_state.copy_(k2_final_state.to(final_state.dtype))
 
     if need_t_pad:
         out_orig.copy_(out[:, :T_orig])
