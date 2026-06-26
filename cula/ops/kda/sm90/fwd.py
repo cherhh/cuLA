@@ -141,8 +141,8 @@ def _validate_inputs(
             raise ValueError(f"varlen requires B=1, got B={B}")
         if not cu_seqlens.is_cuda or cu_seqlens.ndim != 1:
             raise ValueError("cu_seqlens must be a 1D CUDA tensor")
-        if cu_seqlens.dtype not in (torch.int32, torch.int64):
-            raise TypeError(f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}")
+        if cu_seqlens.dtype != torch.int32:
+            raise TypeError(f"cu_seqlens must be int32, got {cu_seqlens.dtype}")
         if cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must contain at least two entries")
         if cu_seqlens_cpu is not None and (
@@ -174,8 +174,8 @@ def _validate_inputs(
     if has_state_in:
         if initial_state.shape != (N, H, D, D):
             raise ValueError(f"initial_state shape must be ({N}, {H}, {D}, {D}), got {tuple(initial_state.shape)}")
-        if not initial_state.is_cuda or initial_state.dtype not in (torch.bfloat16, torch.float32):
-            raise TypeError("initial_state must be a CUDA bf16 or fp32 tensor")
+        if not initial_state.is_cuda or initial_state.dtype != torch.float32:
+            raise TypeError("initial_state must be a CUDA float32 tensor")
         state_fp32 = initial_state.dtype == torch.float32
     if has_state_out:
         if final_state.shape != (N, H, D, D):

@@ -320,7 +320,7 @@ def test_cute_dispatch_unaligned_varlen_matches_reference():
 def test_torch_reference_runs_with_state():
     B, T, H = 1, 16, 2
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(B, T, H)
-    initial_state = torch.zeros(B, H, D, D, dtype=torch.bfloat16, device="cuda")
+    initial_state = torch.zeros(B, H, D, D, dtype=torch.float32, device="cuda")
     final_state = torch.zeros_like(initial_state)
     out = torch.empty_like(v)
     flash_kda_fwd(
