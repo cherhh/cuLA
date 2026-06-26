@@ -5,7 +5,7 @@ Legend: `[exp]` experimental / unwired · `[non-KDA]` other operator.
 ```
 cuLA/
 ├── cula/                         # Python package (pip install -e .)
-│   ├── __init__.py               # lazy (PEP 562): LinearAttentionChunkwiseDecay
+│   ├── __init__.py
 │   ├── utils.py                  # arch asserts, get_pre_scan, cu_seqlens helpers, ...
 │   ├── cudac.py                  # re-export shim over the compiled C++ extension(s)
 │   │
@@ -18,7 +18,7 @@ cuLA/
 │   │   ├── chunk_bwd.py          # chunk_kda_bwd — Triton + FLA + CuTeDSL + C++ mix
 │   │   └── hopper_fused_fwd.py   # cula_kda_prefill (=kda_prefill_hopper) — SM90 prefill via the C++ kernel (cula.cudac)
 │   │
-│   ├── lightning/                # [non-KDA] Lightning Attention operator (package stub)
+│   ├── lightning/                # [non-KDA] Lightning Attention operator (LinearAttentionChunkwiseDecay, lightning_attn_fwd, linear_attention_decode)
 │   │   └── __init__.py
 │   │
 │   └── ops/                      # backend kernels (CuTe DSL / TVM-FFI) + shared helpers
@@ -28,7 +28,7 @@ cuLA/
 │       │   └── ptx.py            #   shared PTX helpers (used by KDA + lightning kernels)
 │       │
 │       ├── kda/                  # ★ KDA Python backends — by arch (sm100 today)
-│       │   ├── policy.py         # SM100 CP dispatch policy: use_cp:"auto"|bool
+│       │   ├── policy.py         # SM100 CP dispatch policy: use_intracard_cp:"auto"|bool
 │       │   ├── sm100/            # SM100 (Blackwell) modular-chunk kernels
 │       │   │   ├── delta_h.py    #   recurrence (chunk_gated_delta_rule_fwd_h)
 │       │   │   ├── fwd_o.py      #   output (chunk_gla_fwd_o)
@@ -41,7 +41,7 @@ cuLA/
 │       │       ├── kda_fully_fused_wip.py   #   KDAChunkwise (~6k lines)
 │       │       └── wrapper.py                #   flash_kda_prefill (dead path; raises on SM100 dispatch)
 │       │
-│       ├── lightning/            # [non-KDA] moved out of the KDA neighborhood
+│       ├── lightning/            # [non-KDA] Lightning/linear attention kernels
 │       │   ├── prefill_sm100.py  #   Lightning Attn prefill (LinearAttentionChunkwiseDecay, lightning_attn_fwd[_varlen])
 │       │   └── decode.py         #   linear_attention_decode
 │       └── experimental/
@@ -53,8 +53,7 @@ cuLA/
 │   ├── kda/sm100/                # Blackwell KDA C++ kernels (CUTLASS 3.x + UMMA)
 │   └── kerutils/include/         # shared C++ headers (generic device helpers sm80/sm90/sm100, host)
 │
-├── benchmarks/  tests/  docs/    # flat, not yet grouped by operator
-├── profile/                      # scratch profiling/experiment dirs (working area)
+├── benchmarks/  tests/  docs/
 ├── scripts/build_wheel.sh
 ├── third_party/flash-linear-attention/      # FLA submodule (baseline + reused gate/CP ops)
 ├── README.md  USAGE.md  REPO_LAYOUT.md  RECOMMENDED_CODING_STYLE.md
@@ -65,9 +64,9 @@ cuLA/
 
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| `cula/kda/` | Python | KDA **public API only** — autograd + dispatch, no kernels. Two prefill entries: modular chunk `chunk_kda` (SM100) and `kda_prefill_hopper` (SM90, driving the C++ kernel). Lazy `__init__` (no CuTeDSL pulled at import). |
+| `cula/kda/` | Python | KDA **public API only** — autograd + dispatch, no kernels. Two prefill entries: modular chunk `chunk_kda` (SM100) and `kda_prefill_hopper` (SM90, driving the C++ kernel). |
 | `cula/ops/kda/` | Python (CuTe DSL) | **KDA Python backends**, by arch: `sm100/` (+cp), `decode/`, `experimental/`, plus `policy.py` (CP dispatch). |
-| `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTe DSL) | `[non-KDA]` Lightning/linear attention kernels, moved out of the KDA neighborhood. |
+| `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTe DSL) | `[non-KDA]` Lightning/linear attention kernels. |
 | `cula/ops/{inv,ptx}.py`, `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers (kept in place; not KDA-specific). |
 | `csrc/kda/{sm90,sm100}/` · `csrc/api/` | CUDA C++ | Hopper SM90 prefill + Blackwell SM100 (chunk intra + recompute_w_u), exposed as `cula.cudac`. |
 
