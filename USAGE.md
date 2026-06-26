@@ -11,7 +11,7 @@ cuLA provides two KDA kernel implementations targeting different GPU architectur
 | Kernel | GPU | Import |
 |---|---|---|
 | Modular Forward | Blackwell (SM100) | `from cula.kda import chunk_kda` |
-| Fused Forward | Hopper (SM90) | `from cula.kda import kda_prefill_hopper` |
+| Two-Kernel Prefill | Hopper (SM90) | `from cula.kda import kda_prefill_hopper` |
 
 Both are drop-in replacements for [FLA](https://github.com/fla-org/flash-linear-attention)'s `chunk_kda` — just change the import.
 
@@ -70,9 +70,9 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 ---
 
-### Fused Forward (SM90 — Hopper)
+### Two-Kernel Prefill (SM90 — Hopper)
 
-The fused forward kernel fuses intra-chunk attention, inter-chunk state propagation, and output computation into a single kernel for maximum throughput. **Forward-only; backward is not yet implemented.**
+The SM90 prefill is a **two-kernel pipeline** — K1 (Prepare) → K2 (Recurrence) — *not* a single fused kernel (despite the `hopper_fused_fwd.py` filename). Intra-chunk attention, inter-chunk state propagation, and output are computed across the two kernels. **Forward-only; backward is not yet implemented.**
 
 #### Example
 
