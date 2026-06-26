@@ -172,13 +172,13 @@ def _validate_inputs(
     if has_state_in:
         if initial_state.shape != (N, H, D, D):
             raise ValueError(f"initial_state shape must be ({N}, {H}, {D}, {D}), got {tuple(initial_state.shape)}")
-        if not initial_state.is_cuda or initial_state.dtype != torch.float32:
-            raise TypeError("initial_state must be a CUDA float32 tensor")
+        if not initial_state.is_cuda or initial_state.dtype != torch.float32 or not initial_state.is_contiguous():
+            raise TypeError("initial_state must be a contiguous CUDA float32 tensor")
     if has_state_out:
         if final_state.shape != (N, H, D, D):
             raise ValueError(f"final_state shape must be ({N}, {H}, {D}, {D}), got {tuple(final_state.shape)}")
-        if not final_state.is_cuda or final_state.dtype != torch.float32:
-            raise TypeError("final_state must be a CUDA float32 tensor")
+        if not final_state.is_cuda or final_state.dtype != torch.float32 or not final_state.is_contiguous():
+            raise TypeError("final_state must be a contiguous CUDA float32 tensor")
 
     return _PrefillProblem(
         B=B,
