@@ -256,9 +256,7 @@ def assert_cp_splits(cu, H, total_T):
 
 
 def test_forced_cp_not_splittable_raises():
-    """use_intracard_cp=True on an unsplittable shape must raise NotSplittableError,
-    not silently fall back to serial — the forced-CP contract that the refactor moved
-    from intracard_fwd_h's silent fallback to a caller-owned decision."""
+    """use_intracard_cp=True on an unsplittable shape must raise NotSplittableError."""
     from cula.ops.kda.policy import NotSplittableError
 
     # A single one-chunk sequence cannot be meaningfully split.

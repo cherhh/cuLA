@@ -41,9 +41,6 @@ from cula.utils import USE_FAST_MATH, assert_blackwell, get_device_sm_count
 COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verbose'"
 
 
-# Intracard CP dispatch policy lives in cula.ops.kda.policy
-# (sm100_intracard_cp_decision). Env CULA_INTRACARD_CP is honored there as the
-# legacy default when the caller passes no explicit mode.
 
 
 # in FLA, cumsum returns int64 tensor by default
