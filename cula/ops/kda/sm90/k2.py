@@ -45,7 +45,7 @@ def _make_state_smem_layout():
     return cute.tile_to_shape(atom, (D, D), (0, 1))
 
 
-from cula.ops.kda.sm90.fwd import _wrap_input, movm_t_b16  # noqa: E402
+from cula.ops.kda.sm90._common import _wrap_input, movm_t_b16  # noqa: E402
 
 
 def _make_out_kinter_one_stage():
@@ -825,8 +825,8 @@ def launch_k2(
     ws_mqk: torch.Tensor,
     out: torch.Tensor,
     cu_seqlens_tiles: torch.Tensor | None = None,
-    initial_state: torch.Tensor | None = None,  # [N, H, V, K] fp32/bf16 bhvk
-    final_state: torch.Tensor | None = None,  # [N, H, V, K] fp32/bf16 bhvk (written in-place)
+    initial_state: torch.Tensor | None = None,  # [N, H, V, K] fp32 bhvk
+    final_state: torch.Tensor | None = None,  # [N, H, V, K] fp32 bhvk (written in-place)
     state_transposed: bool = False,
     v_tile_starts: torch.Tensor | None = None,
     v_tile_actual_lens: torch.Tensor | None = None,
@@ -884,17 +884,15 @@ def launch_k2(
         assert initial_state.shape == (N_seqs, H, D, D), (
             f"initial_state shape must be ({N_seqs}, {H}, {D}, {D}), got {initial_state.shape}"
         )
-        initial_state_fp32 = initial_state.to(torch.float32).contiguous().reshape(-1)
+        initial_state_fp32 = initial_state.contiguous().reshape(-1)
     else:
         initial_state_fp32 = _dummy
     if has_final_state_flag:
         assert final_state.shape == (N_seqs, H, D, D), (
             f"final_state shape must be ({N_seqs}, {H}, {D}, {D}), got {final_state.shape}"
         )
-        if final_state.dtype == torch.float32:
-            final_state_fp32 = final_state.reshape(-1)
-        else:
-            final_state_fp32 = torch.empty(N_seqs * H * D * D, dtype=torch.float32, device=v.device)
+        assert final_state.dtype == torch.float32, f"final_state must be fp32, got {final_state.dtype}"
+        final_state_fp32 = final_state.reshape(-1)
     else:
         final_state_fp32 = _dummy
 
@@ -1001,6 +999,3 @@ def launch_k2(
         stream,
     )
     _call_compiled_k2(key, _compiled_cache_k2[key], compact_args, full_args)
-
-    if has_final_state_flag and final_state.dtype != torch.float32:
-        final_state.copy_(final_state_fp32.reshape(N_seqs, H, D, D).to(final_state.dtype))

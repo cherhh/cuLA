@@ -29,12 +29,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-import cutlass
 import torch
-from cutlass import Int32
-from cutlass._mlir.dialects import llvm as _llvm
-from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import T as _T
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -53,48 +48,6 @@ WORKSPACE_BYTES_PER_TILE: int = _BYTES_KD + _BYTES_QD + _BYTES_KR + _BYTES_GT + 
 
 _CUTE_ARCH_BY_CC = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a"}
 _VARLEN_LAYOUT_CACHE_MAXSIZE = 64
-
-
-# ============================================================================
-# NVVM helpers
-# ============================================================================
-
-
-@cutlass.dsl_user_op
-def movm_t_b16(src_u32: Int32, *, loc=None, ip=None) -> Int32:
-    """``movmatrix.sync.aligned.m8n8.trans.b16`` -- register-file 8x8 b16 transpose."""
-    result = _llvm.inline_asm(
-        _T.i32(),
-        [Int32(src_u32).ir_value(loc=loc, ip=ip)],
-        "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;",
-        "=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(result)
-
-
-@cutlass.dsl_user_op
-def add_f16x2_u32(a_u32: Int32, b_u32: Int32, *, loc=None, ip=None) -> Int32:
-    """Packed ``add.f16x2`` on two u32 registers."""
-    result = _llvm.inline_asm(
-        _T.i32(),
-        [
-            Int32(a_u32).ir_value(loc=loc, ip=ip),
-            Int32(b_u32).ir_value(loc=loc, ip=ip),
-        ],
-        "add.f16x2 $0, $1, $2;",
-        "=r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(result)
 
 
 # ============================================================================
@@ -140,7 +93,6 @@ class _PrefillProblem:
     is_varlen: bool
     has_state_in: bool
     has_state_out: bool
-    state_fp32: bool
     varlen_meta: _VarlenMetadata | None = None
 
 
@@ -188,8 +140,8 @@ def _validate_inputs(
             raise ValueError(f"varlen requires B=1, got B={B}")
         if not cu_seqlens.is_cuda or cu_seqlens.ndim != 1:
             raise ValueError("cu_seqlens must be a 1D CUDA tensor")
-        if cu_seqlens.dtype not in (torch.int32, torch.int64):
-            raise TypeError(f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}")
+        if cu_seqlens.dtype != torch.int32:
+            raise TypeError(f"cu_seqlens must be int32, got {cu_seqlens.dtype}")
         if cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must contain at least two entries")
         if cu_seqlens_cpu is not None and (
@@ -217,23 +169,16 @@ def _validate_inputs(
 
     has_state_in = initial_state is not None
     has_state_out = final_state is not None
-    state_fp32 = False
     if has_state_in:
         if initial_state.shape != (N, H, D, D):
             raise ValueError(f"initial_state shape must be ({N}, {H}, {D}, {D}), got {tuple(initial_state.shape)}")
-        if not initial_state.is_cuda or initial_state.dtype not in (torch.bfloat16, torch.float32):
-            raise TypeError("initial_state must be a CUDA bf16 or fp32 tensor")
-        state_fp32 = initial_state.dtype == torch.float32
+        if not initial_state.is_cuda or initial_state.dtype != torch.float32 or not initial_state.is_contiguous():
+            raise TypeError("initial_state must be a contiguous CUDA float32 tensor")
     if has_state_out:
         if final_state.shape != (N, H, D, D):
             raise ValueError(f"final_state shape must be ({N}, {H}, {D}, {D}), got {tuple(final_state.shape)}")
-        if not final_state.is_cuda or final_state.dtype not in (torch.bfloat16, torch.float32):
-            raise TypeError("final_state must be a CUDA bf16 or fp32 tensor")
-        if has_state_in:
-            if final_state.dtype != initial_state.dtype:
-                raise TypeError("initial_state and final_state dtype must match")
-        else:
-            state_fp32 = final_state.dtype == torch.float32
+        if not final_state.is_cuda or final_state.dtype != torch.float32 or not final_state.is_contiguous():
+            raise TypeError("final_state must be a contiguous CUDA float32 tensor")
 
     return _PrefillProblem(
         B=B,
@@ -244,7 +189,6 @@ def _validate_inputs(
         is_varlen=is_varlen,
         has_state_in=has_state_in,
         has_state_out=has_state_out,
-        state_fp32=state_fp32,
         varlen_meta=varlen_meta,
     )
 
@@ -296,31 +240,6 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
     ws_mqk = torch.empty_like(ws_inv)
     beta_flat = torch.empty(n_beta, dtype=dtype, device=device)
     return ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat
-
-
-_WRAP_CACHE: dict = {}
-_WRAP_CACHE_MAXSIZE = 512
-
-
-def _wrap_input(t: torch.Tensor, align: int, *, view_shape=None, cache: bool = False):
-    """Wrap a tensor as a CuTe tensor via from_dlpack.
-
-    ``cache=True``: reuse across launches, keyed by (id, _version, align, view_shape)
-    and verified by weakref. Use ``cache=False`` for per-call buffers (workspaces, states).
-    """
-    if not cache:
-        src = t if view_shape is None else t.view(view_shape)
-        return from_dlpack(src.detach(), assumed_align=align)
-    ckey = (id(t), t._version, align, view_shape)
-    entry = _WRAP_CACHE.get(ckey)
-    if entry is not None and entry[0]() is t:
-        return entry[1]
-    src = t if view_shape is None else t.view(view_shape)
-    w = from_dlpack(src.detach(), assumed_align=align)
-    if len(_WRAP_CACHE) >= _WRAP_CACHE_MAXSIZE:
-        _WRAP_CACHE.pop(next(iter(_WRAP_CACHE)))
-    _WRAP_CACHE[ckey] = (weakref.ref(t), w)
-    return w
 
 
 def _copy_beta_flat(beta: torch.Tensor, beta_flat: torch.Tensor, H: int, T_total: int) -> None:
@@ -586,7 +505,6 @@ def _dispatch_cute(
             is_varlen=False,
             has_state_in=problem.has_state_in,
             has_state_out=problem.has_state_out,
-            state_fp32=problem.state_fp32,
         )
 
     k1_q, k1_k, k1_g, k1_beta = q, k, g, beta
@@ -646,7 +564,6 @@ def _dispatch_cute(
                 is_varlen=True,
                 has_state_in=problem.has_state_in,
                 has_state_out=problem.has_state_out,
-                state_fp32=problem.state_fp32,
             )
             beta, cu_seqlens, problem = beta_pad, cu_pad, problem_pad
         else:
@@ -687,15 +604,11 @@ def _dispatch_cute(
 
     k2_initial_state = None
     if problem.has_state_in:
-        k2_initial_state = (
-            initial_state.to(torch.float32).contiguous() if initial_state.dtype != torch.float32 else initial_state
-        )
+        k2_initial_state = initial_state.contiguous()
 
     k2_final_state = None
     if problem.has_state_out:
-        k2_final_state = (
-            final_state if final_state.dtype == torch.float32 else torch.empty_like(final_state, dtype=torch.float32)
-        )
+        k2_final_state = final_state
 
     launch_k1(
         k1_q,
@@ -734,8 +647,6 @@ def _dispatch_cute(
         v_tile_starts=k2_v_tile_starts,
         v_tile_actual_lens=k2_v_tile_actual_lens,
     )
-    if problem.has_state_out and final_state.dtype != torch.float32:
-        final_state.copy_(k2_final_state.to(final_state.dtype))
 
     if need_t_pad:
         out_orig.copy_(out[:, :T_orig])
