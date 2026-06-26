@@ -25,6 +25,7 @@ __all__ = [
     "kda_prefill_hopper",
     "kda_prefill_hopper_opt",
     "kda_prefill_hopper_auto",
+    "kda_prefill_hopper_cutedsl",
 ]
 
 _LAZY = {
@@ -32,6 +33,7 @@ _LAZY = {
     "kda_prefill_hopper": ("cula.kda.hopper_fused_fwd", "cula_kda_prefill"),
     "kda_prefill_hopper_opt": ("cula.kda.hopper_fused_fwd_opt", "cula_kda_prefill_opt"),
     "kda_prefill_hopper_auto": ("cula.kda.auto_route", "cula_kda_prefill_auto"),
+    "kda_prefill_hopper_cutedsl": ("cula.kda.hopper_prefill", "cula_kda_prefill"),
     "kda_decode": ("cula.ops.kda.decode.cute", "kda_decode"),
     "kda_decode_mtp": ("cula.ops.kda.decode.mtp", "kda_decode_mtp"),
     "kda_decode_mtp_recurrent": ("cula.ops.kda.decode.mtp", "kda_decode_mtp_recurrent"),
