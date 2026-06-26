@@ -72,7 +72,7 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 ### Two-Kernel Prefill (SM90 — Hopper)
 
-The SM90 prefill is a **two-kernel pipeline** — K1 (Prepare) → K2 (Recurrence) — *not* a single fused kernel (despite the `hopper_fused_fwd.py` filename). Intra-chunk attention, inter-chunk state propagation, and output are computed across the two kernels. **Forward-only; backward is not yet implemented.**
+The SM90 prefill is a **two-kernel pipeline** — K1 (Prepare) → K2 (Recurrence) — *not* a single fused kernel. Intra-chunk attention, inter-chunk state propagation, and output are computed across the two kernels. **Forward-only; backward is not yet implemented.**
 
 #### Example
 

@@ -13,7 +13,7 @@ lazy (PEP 562) and pull no CuTeDSL/CUDA at import time.
 | Symbol | API wrapper | Backend (arch) | Notes |
 |--------|-------------|--------|-------|
 | `chunk_kda` | `chunk.py` | modular chunk (`ops/kda/sm100/`) | Full fwd **+ bwd** autograd. Default training & Blackwell prefill path. |
-| `kda_prefill_hopper` | `hopper_fused_fwd.py` (`= cula_kda_prefill`) | two-kernel prefill (`ops/kda/sm90/`, K1+K2) | Forward-only. Hopper. Two-kernel pipeline, *not* a fused kernel. |
+| `kda_prefill_hopper` | `hopper_prefill.py` (`= cula_kda_prefill`) | two-kernel prefill (`ops/kda/sm90/`, K1+K2) | Forward-only. Hopper. Two-kernel pipeline, *not* a fused kernel. |
 | `kda_decode` | wraps `cula/ops/kda/decode/cute.py` | **decode** | Single-token decode. |
 | `fused_sigmoid_gating_delta_rule_update` | wraps `cula/ops/kda/decode/cute.py` | **decode** | Decode state update. |
 
@@ -42,13 +42,13 @@ chunk_kda                         chunk.py            (autograd: ChunkKDAFunctio
 
 ### 2. Two-kernel (K1+K2) prefill (Hopper) — `kda_prefill_hopper` (SM90, fwd-only)
 ```
-kda_prefill_hopper = cula_kda_prefill     hopper_fused_fwd.py  (HopperChunkKDAFunction)
+kda_prefill_hopper = cula_kda_prefill     hopper_prefill.py  (HopperChunkKDAFunction)
 └ flash_kda_fwd                           ops/kda/sm90/fwd.py
    └ _dispatch_cute → launch_k1 (…/sm90/k1.py) + launch_k2 (…/sm90/k2.py)
       CuTe DSL, CHUNK=16, D=128. Handles varlen padding/repack. CUDA graph disabled.
 ```
-> **Naming:** despite the file `hopper_fused_fwd.py`, this is a **two-kernel pipeline**
-> (K1 prepare → 6 workspace tensors → K2 recurrence), *not* a single fused kernel.
+> **Note:** this is a **two-kernel pipeline** (K1 prepare → 6 workspace tensors →
+> K2 recurrence), *not* a single fused kernel.
 
 ### 3. Fused prefill (Blackwell) — `flash_kda_prefill` `[exp]`, not exported
 ```
@@ -87,8 +87,6 @@ force intracard CP **off** and let `cp_context` proceed.
 
 - **`cp_context` (FLA cross-rank CP) ≠ `use_cp` (cuLA single-card intracard CP).** Both
   live on `chunk_kda`; they are orthogonal. `cp_context` comes from `fla.ops.cp` (FLA ≥ 0.5.0).
-- **`utils → cula.kda` layering inversion:** `cula/utils.py` imports `cula.kda.hopper_fused_fwd`
-  (utils should be a leaf). Phase-3 cleanup item.
 - **SM100 paths not CI-runtime-verified here:** this box is Hopper (no SM100 GPU, `cula.cudac`
   not built). SM100 (`chunk_kda`, decode, intracard-CP) is import/compile-verified; SM90 is
   kernel-test verified.

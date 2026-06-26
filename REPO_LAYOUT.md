@@ -15,7 +15,7 @@ cuLA/
 │   │   ├── chunk_fwd.py          # chunk_kda_fwd — fwd orchestration (lazy-imports kernels)
 │   │   ├── chunk_intra.py        # fwd intra (C++ ext) + bwd intra (Triton)
 │   │   ├── chunk_bwd.py          # chunk_kda_bwd — Triton + FLA + CuTeDSL + C++ mix
-│   │   └── hopper_fused_fwd.py   # cula_kda_prefill (=kda_prefill_hopper) — SM90 two-kernel K1+K2 prefill, fwd-only
+│   │   └── hopper_prefill.py   # cula_kda_prefill (=kda_prefill_hopper) — SM90 two-kernel K1+K2 prefill, fwd-only
 │   │
 │   ├── lightning/                # [non-KDA] Lightning Attention operator (LinearAttentionChunkwiseDecay, lightning_attn_fwd, linear_attention_decode)
 │   │   └── __init__.py
