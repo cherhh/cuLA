@@ -29,12 +29,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-import cutlass
 import torch
-from cutlass import Int32
-from cutlass._mlir.dialects import llvm as _llvm
-from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import T as _T
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -53,48 +48,6 @@ WORKSPACE_BYTES_PER_TILE: int = _BYTES_KD + _BYTES_QD + _BYTES_KR + _BYTES_GT + 
 
 _CUTE_ARCH_BY_CC = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a"}
 _VARLEN_LAYOUT_CACHE_MAXSIZE = 64
-
-
-# ============================================================================
-# NVVM helpers
-# ============================================================================
-
-
-@cutlass.dsl_user_op
-def movm_t_b16(src_u32: Int32, *, loc=None, ip=None) -> Int32:
-    """``movmatrix.sync.aligned.m8n8.trans.b16`` -- register-file 8x8 b16 transpose."""
-    result = _llvm.inline_asm(
-        _T.i32(),
-        [Int32(src_u32).ir_value(loc=loc, ip=ip)],
-        "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;",
-        "=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(result)
-
-
-@cutlass.dsl_user_op
-def add_f16x2_u32(a_u32: Int32, b_u32: Int32, *, loc=None, ip=None) -> Int32:
-    """Packed ``add.f16x2`` on two u32 registers."""
-    result = _llvm.inline_asm(
-        _T.i32(),
-        [
-            Int32(a_u32).ir_value(loc=loc, ip=ip),
-            Int32(b_u32).ir_value(loc=loc, ip=ip),
-        ],
-        "add.f16x2 $0, $1, $2;",
-        "=r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(result)
 
 
 # ============================================================================
@@ -296,31 +249,6 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
     ws_mqk = torch.empty_like(ws_inv)
     beta_flat = torch.empty(n_beta, dtype=dtype, device=device)
     return ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat
-
-
-_WRAP_CACHE: dict = {}
-_WRAP_CACHE_MAXSIZE = 512
-
-
-def _wrap_input(t: torch.Tensor, align: int, *, view_shape=None, cache: bool = False):
-    """Wrap a tensor as a CuTe tensor via from_dlpack.
-
-    ``cache=True``: reuse across launches, keyed by (id, _version, align, view_shape)
-    and verified by weakref. Use ``cache=False`` for per-call buffers (workspaces, states).
-    """
-    if not cache:
-        src = t if view_shape is None else t.view(view_shape)
-        return from_dlpack(src.detach(), assumed_align=align)
-    ckey = (id(t), t._version, align, view_shape)
-    entry = _WRAP_CACHE.get(ckey)
-    if entry is not None and entry[0]() is t:
-        return entry[1]
-    src = t if view_shape is None else t.view(view_shape)
-    w = from_dlpack(src.detach(), assumed_align=align)
-    if len(_WRAP_CACHE) >= _WRAP_CACHE_MAXSIZE:
-        _WRAP_CACHE.pop(next(iter(_WRAP_CACHE)))
-    _WRAP_CACHE[ckey] = (weakref.ref(t), w)
-    return w
 
 
 def _copy_beta_flat(beta: torch.Tensor, beta_flat: torch.Tensor, H: int, T_total: int) -> None:

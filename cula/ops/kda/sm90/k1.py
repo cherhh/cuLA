@@ -31,7 +31,7 @@ import torch
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 
-from cula.ops.kda.sm90.fwd import _wrap_input, add_f16x2_u32, movm_t_b16
+from cula.ops.kda.sm90._common import _wrap_input, add_f16x2_u32, movm_t_b16
 
 CHUNK: int = 16
 D: int = 128

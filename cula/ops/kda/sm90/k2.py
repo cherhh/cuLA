@@ -45,7 +45,7 @@ def _make_state_smem_layout():
     return cute.tile_to_shape(atom, (D, D), (0, 1))
 
 
-from cula.ops.kda.sm90.fwd import _wrap_input, movm_t_b16  # noqa: E402
+from cula.ops.kda.sm90._common import _wrap_input, movm_t_b16  # noqa: E402
 
 
 def _make_out_kinter_one_stage():
