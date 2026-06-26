@@ -18,7 +18,7 @@ lazy (PEP 562) and pull no CuTeDSL/CUDA at import time.
 | `fused_sigmoid_gating_delta_rule_update` | wraps `cula/ops/kda/decode/cute.py` | **decode** | Decode state update. |
 
 **Not exported:**
-- `flash_kda_prefill` (`cula/ops/kda/experimental/sm100_fused/wrapper.py`) — `[exp]` **unwired / dead path**. No live caller: `get_kda_fused_fwd()` raises `NotImplementedError` on SM100/SM103. Backend: `…/experimental/sm100_fused/kda_fully_fused_wip.py` (~6k lines).
+- `flash_kda_prefill` (`cula/ops/kda/experimental/sm100_fused/wrapper.py`) — `[exp]` **unwired / dead path**. No live caller; the Blackwell fused prefill is not yet wired. Backend: `…/experimental/sm100_fused/kda_fully_fused_wip.py` (~6k lines).
 
 ## The pipelines
 
@@ -55,7 +55,7 @@ kda_prefill_hopper = cula_kda_prefill     hopper_fused_fwd.py  (HopperChunkKDAFu
 flash_kda_prefill   ops/kda/experimental/sm100_fused/wrapper.py
                       → KDAChunkwise  ops/kda/experimental/sm100_fused/kda_fully_fused_wip.py (~6k lines)
 ```
-**Unwired / dead** — no live caller (`get_kda_fused_fwd()` raises `NotImplementedError`).
+**Unwired / dead** — no live caller; the Blackwell fused prefill is not yet wired.
 The **production** Blackwell prefill is the modular `chunk_kda` (§1), not this.
 
 ### 4. Decode — `kda_decode` / `fused_sigmoid_gating_delta_rule_update`
