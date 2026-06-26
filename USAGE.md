@@ -109,15 +109,38 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 **Notes**
 
-- Mainly **suitable for large-batch inference**; performance is limited when both batch size and head count are small, because we do not parallelize over the sequence-length dimension.
+- Mainly **suitable for large-batch inference**. When both batch size and head count are small, throughput on long sequences is recovered by enabling **intra-card CP** (`use_intracard_cp`), which parallelizes the sequence-length dimension on a single GPU — see [Intra-Card Context Parallel](#intra-card-context-parallel).
 - **Matrix inversion uses fp16 precision**, which is faster and occupies less shared memory but introduces minor numerical differences compared to tf32 inversion.
 - **Intra-subchunk attention uses g-first as anchor**, which causes some numerical differences compared with the FLA Triton implementation (FLA uses g-half as anchor in the diagonal).
 
 ---
 
-## Intra-Card Context Parallel (chunk_delta_h)
+## Intra-Card Context Parallel
 
-cuLA includes an intra-card context parallel (CP) path for `chunk_gated_delta_rule_fwd_h`. Long sequences are split into sub-sequences, processed independently in parallel, then merged via a prefix-scan step — unlocking sequence-dimension parallelism on a single GPU.
+Long sequences can be split into sub-sequences, processed in parallel on one GPU, and merged via a prefix scan — unlocking sequence-dimension parallelism (≈3–7× on long single sequences where `batch × heads` under-utilises the SMs). **Default off; inference-only.** Two surfaces:
+
+### SM90 — via `kda_prefill_hopper(use_intracard_cp=...)`
+
+Pass `use_intracard_cp` (alias `use_cp`) to the Hopper prefill:
+
+- **`"auto"`** — the auto-router enables CP only when it predicts a speedup, otherwise runs serial (no error, no regression).
+- **`True`** — force CP; raises if the shape cannot be meaningfully split.
+- **`False`** (default) — CP off.
+
+Works with **any sequence length** (non-CHUNK-aligned is handled internally) and **dense or varlen** input. Tunable via `CULA_KDA_CP_MIN_SEG` (the auto-router skips CP below this many segments per sequence).
+
+```python
+o, final_state = kda_prefill_hopper(
+    q=q, k=k, v=v, g=g, beta=beta, A_log=A_log, dt_bias=dt_bias,
+    cu_seqlens=cu_seqlens,              # varlen packed (int32); omit for dense
+    output_final_state=True, use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0,
+    use_intracard_cp="auto",           # "auto" | True | False  (default False)
+)
+```
+
+### SM100 — low-level `chunk_gated_delta_rule_fwd_h`
+
+cuLA also exposes intra-card CP directly on the SM100 recurrence `chunk_gated_delta_rule_fwd_h`, gated by an environment variable.
 
 **Requirements**
 

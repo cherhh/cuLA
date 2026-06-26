@@ -3,9 +3,16 @@
 
 """SM90 KDA prefill wrapper for the two-kernel K1+K2 CuTeDSL path"""
 
+from typing import Literal
+
 import torch
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
+from cula.ops.kda.policy import (
+    IntracardCPMode,
+    resolve_intracard_cp_mode,
+    sm90_intracard_cp_decision,
+)
 from cula.ops.kda.sm90.fwd import flash_kda_fwd
 from cula.utils import assert_hopper
 
@@ -37,6 +44,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         lower_bound: float | None = None,
         cu_seqlens: torch.IntTensor | None = None,
         cu_seqlens_cpu: torch.IntTensor | None = None,
+        use_intracard_cp: IntracardCPMode | None = None,
     ):
         batch_size, seq_len, num_heads, head_dim = q.shape
 
@@ -62,24 +70,46 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         # cuLA kernel applies sigmoid internally, so convert to pre-sigmoid logits.
         beta = _beta_logits_bf16(beta)
 
-        flash_kda_fwd(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale=scale,
-            out=out,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            lower_bound=lower_bound,
-            initial_state=initial_state,
-            final_state=final_state,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            state_transposed=False,
-            use_gate_in_kernel=True,
-        )
+        cp_decision = sm90_intracard_cp_decision(q, cu_seqlens, cu_seqlens_cpu, use_intracard_cp)
+        if cp_decision.enabled:
+            from cula.ops.kda.sm90.cp.driver import intracard_prefill
+
+            intracard_prefill(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=scale,
+                out=out,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                initial_state=initial_state,
+                final_state=final_state,
+                cu_seqlens=cu_seqlens,
+                state_transposed=False,
+                allow_fallback=False,
+            )
+        else:
+            flash_kda_fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=scale,
+                out=out,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                initial_state=initial_state,
+                final_state=final_state,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                state_transposed=False,
+                use_gate_in_kernel=True,
+            )
 
         return out.to(q.dtype), final_state
 
@@ -106,6 +136,7 @@ def cula_kda_prefill(
     lower_bound: float | None = None,
     cu_seqlens: torch.IntTensor | None = None,
     chunk_indices: torch.IntTensor | None = None,
+    use_intracard_cp: Literal["auto"] | bool | None = None,
     **kwargs,
 ):
     r"""
@@ -154,6 +185,11 @@ def cula_kda_prefill(
             not verified (FLA convention). Default: `None`.
         chunk_indices (torch.IntTensor):
             Accepted for API compatibility; unused by CuTeDSL.
+        use_intracard_cp (Literal["auto"] | bool):
+            Whether to use the SM90 intracard-CP path when profitable. ``True``
+            requires CP support and raises on rejection, ``"auto"`` falls back
+            to the serial K1+K2 path, and ``False`` disables CP. ``use_cp`` is
+            accepted as a compatibility alias.
 
     Returns:
         o (torch.Tensor):
@@ -193,6 +229,8 @@ def cula_kda_prefill(
     A_log = kwargs.pop("A_log", None)
     dt_bias = kwargs.pop("dt_bias", None)
     cu_seqlens_cpu = kwargs.pop("cu_seqlens_cpu", None)
+    use_cp_alias = kwargs.pop("use_cp", None)
+    use_intracard_cp = resolve_intracard_cp_mode(use_intracard_cp, use_cp_alias)
     if kwargs:
         raise TypeError(f"cula_kda_prefill got unexpected keyword arguments: {set(kwargs)}")
     if A_log is None:
@@ -236,5 +274,6 @@ def cula_kda_prefill(
         lower_bound,
         cu_seqlens,
         cu_seqlens_cpu,
+        use_intracard_cp,
     )
     return o, final_state
