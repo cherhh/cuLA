@@ -354,6 +354,8 @@ def chunk_kda(
         )
     """
 
+    # just for backward compatibility, resolve the deprecated `use_cp` argument
+    # TODO: maybe we can remove this in the future
     use_cp_alias = kwargs.pop("use_cp", None)
     use_intracard_cp = resolve_intracard_cp_mode(use_intracard_cp, use_cp_alias)
 
