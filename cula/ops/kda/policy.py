@@ -6,11 +6,15 @@
 from __future__ import annotations
 
 import os
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
+
+from cula.ops.kda.sm90.cp.plan import CHUNK as SM90_CP_CHUNK
+from cula.ops.kda.sm90.cp.plan import MIN_BENEFICIAL_SEG, auto_plan_segments
 
 IntracardCPMode = Literal["auto"] | bool
 
@@ -53,6 +57,84 @@ def _reject_or_disable(mode: IntracardCPMode, reason: str) -> IntracardCPDecisio
     if mode is True:
         raise ValueError(reason)
     return IntracardCPDecision(False, reason)
+
+
+_SEQ_LENS_CACHE: dict = {}
+
+
+def _seq_lens_from_cu(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None) -> list[int]:
+    """Per-sequence lengths from cu_seqlens, cached by tensor identity so the auto router
+    pays a GPU->host sync only on a cache miss, not on every decision. Passing
+    cu_seqlens_cpu avoids the sync entirely even on a miss."""
+    key = id(cu_seqlens)
+    stamp = (cu_seqlens.data_ptr(), int(cu_seqlens._version), cu_seqlens.numel())
+    cached = _SEQ_LENS_CACHE.get(key)
+    if cached is not None:
+        ref, cstamp, seq_lens = cached
+        if ref() is cu_seqlens and cstamp == stamp:
+            return seq_lens
+        _SEQ_LENS_CACHE.pop(key, None)
+    src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.cpu()
+    cu_list = [int(x) for x in src.tolist()]
+    seq_lens = [cu_list[i + 1] - cu_list[i] for i in range(len(cu_list) - 1)]
+    if len(_SEQ_LENS_CACHE) >= 32:
+        _SEQ_LENS_CACHE.pop(next(iter(_SEQ_LENS_CACHE)))
+    _SEQ_LENS_CACHE[key] = (weakref.ref(cu_seqlens), stamp, seq_lens)
+    return seq_lens
+
+
+def _sm90_seq_tiles(
+    q: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None,
+    mode: IntracardCPMode,
+) -> list[int] | IntracardCPDecision:
+    # Non-CHUNK-aligned lengths are supported by the backend (pad-before-CP), so the
+    # per-sequence tile count is the ceil; no alignment rejection here.
+    B, T, _H, _K = q.shape
+    if cu_seqlens is None:
+        return [(T + SM90_CP_CHUNK - 1) // SM90_CP_CHUNK] * B
+
+    if B != 1:
+        return _reject_or_disable(mode, "SM90 intracard CP varlen mode requires packed B=1.")
+    seq_lens = _seq_lens_from_cu(cu_seqlens, cu_seqlens_cpu)
+    return [(sl + SM90_CP_CHUNK - 1) // SM90_CP_CHUNK for sl in seq_lens]
+
+
+def sm90_intracard_cp_decision(
+    q: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None,
+    mode: IntracardCPMode | None,
+) -> IntracardCPDecision:
+    # SM90 has no env-gated legacy default; unspecified (None) means CP off.
+    if mode is None:
+        mode = False
+    mode = normalize_intracard_cp_mode(mode)
+    if mode is False:
+        return IntracardCPDecision(False, "disabled")
+
+    seq_tiles_or_decision = _sm90_seq_tiles(q, cu_seqlens, cu_seqlens_cpu, mode)
+    if isinstance(seq_tiles_or_decision, IntracardCPDecision):
+        return seq_tiles_or_decision
+    seq_tiles = seq_tiles_or_decision
+    if not seq_tiles:
+        return _reject_or_disable(mode, "SM90 intracard CP requires at least one sequence.")
+
+    _s_split, seg_cu, per_seq = auto_plan_segments(q.device, seq_tiles, q.shape[2])
+    n_seg_total = len(seg_cu) - 1
+    max_n_seg = max(n_seg for _first, n_seg in per_seq)
+    if n_seg_total == len(seq_tiles) or max_n_seg <= 2:
+        return _reject_or_disable(
+            mode,
+            "SM90 intracard CP is not meaningfully splittable for this shape.",
+        )
+    # Perf heuristic (auto only): a few segments per sequence don't amortize CP's
+    # pre_scan/merge overhead (measured: <=4 segments/seq regresses vs serial).
+    # force (mode is True) still runs since the shape IS splittable.
+    if max_n_seg < MIN_BENEFICIAL_SEG and mode is not True:
+        return IntracardCPDecision(False, f"intracard CP not beneficial: {max_n_seg} segments/seq (< {MIN_BENEFICIAL_SEG})")
+    return IntracardCPDecision(True)
 
 
 def _sm100_env_cp_enabled() -> bool:
