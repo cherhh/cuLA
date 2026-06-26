@@ -93,7 +93,6 @@ class _PrefillProblem:
     is_varlen: bool
     has_state_in: bool
     has_state_out: bool
-    state_fp32: bool
     varlen_meta: _VarlenMetadata | None = None
 
 
@@ -170,23 +169,16 @@ def _validate_inputs(
 
     has_state_in = initial_state is not None
     has_state_out = final_state is not None
-    state_fp32 = False
     if has_state_in:
         if initial_state.shape != (N, H, D, D):
             raise ValueError(f"initial_state shape must be ({N}, {H}, {D}, {D}), got {tuple(initial_state.shape)}")
         if not initial_state.is_cuda or initial_state.dtype != torch.float32:
             raise TypeError("initial_state must be a CUDA float32 tensor")
-        state_fp32 = initial_state.dtype == torch.float32
     if has_state_out:
         if final_state.shape != (N, H, D, D):
             raise ValueError(f"final_state shape must be ({N}, {H}, {D}, {D}), got {tuple(final_state.shape)}")
         if not final_state.is_cuda or final_state.dtype != torch.float32:
             raise TypeError("final_state must be a CUDA float32 tensor")
-        if has_state_in:
-            if final_state.dtype != initial_state.dtype:
-                raise TypeError("initial_state and final_state dtype must match")
-        else:
-            state_fp32 = final_state.dtype == torch.float32
 
     return _PrefillProblem(
         B=B,
@@ -197,7 +189,6 @@ def _validate_inputs(
         is_varlen=is_varlen,
         has_state_in=has_state_in,
         has_state_out=has_state_out,
-        state_fp32=state_fp32,
         varlen_meta=varlen_meta,
     )
 
@@ -514,7 +505,6 @@ def _dispatch_cute(
             is_varlen=False,
             has_state_in=problem.has_state_in,
             has_state_out=problem.has_state_out,
-            state_fp32=problem.state_fp32,
         )
 
     k1_q, k1_k, k1_g, k1_beta = q, k, g, beta
@@ -574,7 +564,6 @@ def _dispatch_cute(
                 is_varlen=True,
                 has_state_in=problem.has_state_in,
                 has_state_out=problem.has_state_out,
-                state_fp32=problem.state_fp32,
             )
             beta, cu_seqlens, problem = beta_pad, cu_pad, problem_pad
         else:
