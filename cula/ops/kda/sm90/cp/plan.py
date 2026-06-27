@@ -11,11 +11,19 @@ import torch
 
 CHUNK = 16  # match k2.CHUNK
 MIN_SEG_TILES = int(os.environ.get("CULA_KDA_CP_MIN_SEG_TILES", "4"))
-AUTO_MIN_SEG_TILES = int(os.environ.get("CULA_KDA_CP_AUTO_MIN_SEG_TILES", "128"))
+# Per-segment tile floor for auto planning. Low enough that a single long sequence
+# can split into ~SM_count/H segments (one full SM wave) instead of staying coarse.
+AUTO_MIN_SEG_TILES = int(os.environ.get("CULA_KDA_CP_AUTO_MIN_SEG_TILES", "32"))
 # Auto-router perf gate: skip CP when a sequence plans into fewer than this many
 # segments — measured to regress vs serial (pre_scan/merge overhead > parallelism)
 # at <=4 segments/seq. force (use_cp=True) ignores this and still runs.
 MIN_BENEFICIAL_SEG = int(os.environ.get("CULA_KDA_CP_MIN_SEG", "5"))
+# Auto-router perf gate: CP only engages once the longest sequence reaches this many
+# tiles. Below this the serial K1+K2 already finishes fast (its short per-(seq,head)
+# chain isn't the bottleneck), so CP's pre_scan/merge overhead is a net loss. This is
+# decoupled from AUTO_MIN_SEG_TILES so the split can be fine (fill SMs) while the
+# engage threshold stays where serial actually starts to lose.
+ENGAGE_MIN_TILES = int(os.environ.get("CULA_KDA_CP_ENGAGE_MIN_TILES", "640"))
 
 _SM_COUNT_CACHE: dict[int, int] = {}
 
@@ -31,7 +39,9 @@ def _sm_count(device: torch.device) -> int:
 
 def _auto_s_split(device: torch.device, seq_tiles: list[int], H: int) -> int:
     sm_count = _sm_count(device)
-    target_ctas = 2 * sm_count
+    # Target one full SM wave (not two): fill the array while keeping the segment
+    # count — and thus the pre_scan/merge work — as low as possible.
+    target_ctas = sm_count
     n_seqs = len(seq_tiles)
     # Short sequences (< 2*AUTO_MIN_SEG_TILES) get 1 segment; exclude from SM budget.
     n_nosplit = sum(1 for r in seq_tiles if r < 2 * AUTO_MIN_SEG_TILES)
