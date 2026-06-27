@@ -128,12 +128,14 @@ def _bench_one(common):
     o_cula, _ = run_cula(**common)
     torch.cuda.synchronize()
     rel_rmse, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(o_fla, o_cula)
+    # iqr_mean: a stray transient iteration must not poison the reported mean.
     ms_fla = benchmark_cuda_mode_fn(
         lambda: run_fla(**common),
         default_warmup=WARMUP,
         default_rep=N_ITERS,
         ncu_mode=NCU_MODE,
         sanitizer_mode=SANITIZER_MODE,
+        aggregate="iqr_mean",
     )
     ms_cula = benchmark_cuda_mode_fn(
         lambda: run_cula(**common),
@@ -141,6 +143,7 @@ def _bench_one(common):
         default_rep=N_ITERS,
         ncu_mode=NCU_MODE,
         sanitizer_mode=SANITIZER_MODE,
+        aggregate="iqr_mean",
     )
     speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
     del o_fla, o_cula
