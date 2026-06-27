@@ -108,15 +108,21 @@ def benchmark_cuda_mode_fn(
     ncu_mode=False,
     sanitizer_mode=False,
     setup_fn=None,
+    aggregate="mean",
 ):
-    """Benchmark a CUDA callable using standard repo warmup/repeat mode rules."""
+    """Benchmark a CUDA callable using standard repo warmup/repeat mode rules.
+
+    ``aggregate`` controls how per-iteration times are reduced: ``"mean"`` (default)
+    or ``"iqr_mean"`` (interquartile mean — robust to a stray transient iteration
+    that would otherwise poison the mean).
+    """
     warmup, rep = resolve_benchmark_repeats(
         default_warmup,
         default_rep,
         ncu_mode=ncu_mode,
         sanitizer_mode=sanitizer_mode,
     )
-    return benchmark_cuda_fn(fn, setup_fn=setup_fn, warmup=warmup, rep=rep, aggregate="mean")
+    return benchmark_cuda_fn(fn, setup_fn=setup_fn, warmup=warmup, rep=rep, aggregate=aggregate)
 
 
 def triton_bench_fn(fn, **kwargs):
