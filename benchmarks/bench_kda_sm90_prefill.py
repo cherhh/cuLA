@@ -115,7 +115,6 @@ def run_cula(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lo
         dt_bias=dt_bias,
         initial_state=init_state,
         output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
         cu_seqlens=cu_seqlens,
         use_gate_in_kernel=True,
         safe_gate=True,
