@@ -14,7 +14,7 @@ from typing import Literal
 import torch
 
 from cula.ops.kda.sm90.cp.plan import CHUNK as SM90_CP_CHUNK
-from cula.ops.kda.sm90.cp.plan import MIN_BENEFICIAL_SEG, auto_plan_segments
+from cula.ops.kda.sm90.cp.plan import ENGAGE_MIN_TILES, MIN_BENEFICIAL_SEG, auto_plan_segments
 
 IntracardCPMode = Literal["auto"] | bool
 
@@ -120,6 +120,14 @@ def sm90_intracard_cp_decision(
     seq_tiles = seq_tiles_or_decision
     if not seq_tiles:
         return _reject_or_disable(mode, "SM90 intracard CP requires at least one sequence.")
+
+    # Perf gate (auto only): CP only helps once the longest sequence is long enough
+    # that the serial K1+K2 under-fills the SM array; below this serial is already
+    # fast and CP's pre_scan/merge overhead is a net loss. force (True) ignores this.
+    if mode is not True and max(seq_tiles) < ENGAGE_MIN_TILES:
+        return IntracardCPDecision(
+            False, f"intracard CP not beneficial: longest sequence {max(seq_tiles)} tiles (< {ENGAGE_MIN_TILES})"
+        )
 
     _s_split, seg_cu, per_seq = auto_plan_segments(q.device, seq_tiles, q.shape[2])
     n_seg_total = len(seg_cu) - 1
