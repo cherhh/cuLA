@@ -571,7 +571,7 @@ def _call_compiled_prescan(key, compiled_fn, compact_args, full_args) -> None:
 
 def launch_pre_scan(
     v: torch.Tensor,
-    beta_flat: torch.Tensor,
+    beta: torch.Tensor,
     ws_kd: torch.Tensor,
     ws_kr: torch.Tensor,
     ws_gt: torch.Tensor,
@@ -598,7 +598,7 @@ def launch_pre_scan(
         _compiled_cache_prescan[key] = cute.compile(
             run_pre_scan,
             from_dlpack(v_flat.detach(), assumed_align=16),
-            from_dlpack(beta_flat.detach(), assumed_align=16),
+            from_dlpack(beta.detach(), assumed_align=16),
             from_dlpack(ws_kd.detach(), assumed_align=16),
             from_dlpack(ws_kr.detach(), assumed_align=16),
             from_dlpack(ws_gt.detach(), assumed_align=16),
@@ -616,7 +616,7 @@ def launch_pre_scan(
     stream = _get_current_custream()
     compact_args = (
         v_flat,
-        beta_flat,
+        beta,
         ws_kd,
         ws_kr,
         ws_gt,
@@ -628,7 +628,7 @@ def launch_pre_scan(
     )
     full_args = (
         v_flat,
-        beta_flat,
+        beta,
         ws_kd,
         ws_kr,
         ws_gt,
