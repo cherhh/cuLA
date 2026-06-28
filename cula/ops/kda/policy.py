@@ -121,9 +121,8 @@ def sm90_intracard_cp_decision(
     if not seq_tiles:
         return _reject_or_disable(mode, "SM90 intracard CP requires at least one sequence.")
 
-    # Perf gate (auto only): CP only helps once the longest sequence is long enough
-    # that the serial K1+K2 under-fills the SM array; below this serial is already
-    # fast and CP's pre_scan/merge overhead is a net loss. force (True) ignores this.
+    # auto-only gate: below ENGAGE_MIN_TILES the serial K1+K2 still fills the SM array,
+    # so CP's pre_scan/merge overhead would be a net loss. force (True) ignores it.
     if mode is not True and max(seq_tiles) < ENGAGE_MIN_TILES:
         return IntracardCPDecision(
             False, f"intracard CP not beneficial: longest sequence {max(seq_tiles)} tiles (< {ENGAGE_MIN_TILES})"
@@ -137,9 +136,8 @@ def sm90_intracard_cp_decision(
             mode,
             "SM90 intracard CP is not meaningfully splittable for this shape.",
         )
-    # Perf heuristic (auto only): a few segments per sequence don't amortize CP's
-    # pre_scan/merge overhead (measured: <=4 segments/seq regresses vs serial).
-    # force (mode is True) still runs since the shape IS splittable.
+    # auto-only gate: too few segments/seq don't amortize CP's pre_scan/merge overhead
+    # (<=4 measured to regress); force (True) still runs since the shape IS splittable.
     if max_n_seg < MIN_BENEFICIAL_SEG and mode is not True:
         return IntracardCPDecision(False, f"intracard CP not beneficial: {max_n_seg} segments/seq (< {MIN_BENEFICIAL_SEG})")
     return IntracardCPDecision(True)
