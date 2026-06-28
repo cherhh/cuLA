@@ -773,16 +773,7 @@ def launch_k1(
     B, T, H, K = q.shape
     assert K == D
     T_total = B * T
-    if is_varlen:
-        assert B == 1
-        assert total_tiles is not None
-        assert tile_starts is not None and tile_actual_lens is not None
-        assert tile_starts.dtype == torch.int32 and tile_starts.is_cuda and tile_starts.is_contiguous()
-        assert tile_actual_lens.dtype == torch.int32 and tile_actual_lens.is_cuda and tile_actual_lens.is_contiguous()
-        assert tile_starts.numel() == total_tiles
-        assert tile_actual_lens.numel() == total_tiles
-    else:
-        assert T % CHUNK == 0
+    if not is_varlen:
         total_tiles = (B * T) // CHUNK
         dummy = _get_dummy_int32(q.device)
         tile_starts = dummy

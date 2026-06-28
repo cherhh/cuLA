@@ -408,7 +408,6 @@ def launch_merge(
     """CuTeDSL merge: SMEM-resident carry, TF32 MMA."""
     n_seqs = len(per_seq)
     H = carries.shape[1]
-    assert carries.shape[2] == carries.shape[3] == D
     device = carries.device
 
     firsts = torch.tensor([f for f, _ in per_seq], dtype=torch.int32, device=device)
