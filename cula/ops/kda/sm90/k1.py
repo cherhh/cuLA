@@ -62,6 +62,7 @@ def k1_kernel(
     ws_gt: cute.Tensor,
     ws_inv: cute.Tensor,
     ws_mqk: cute.Tensor,
+    ws_beta: cute.Tensor,
     tile_starts: cute.Tensor,
     tile_actual_lens: cute.Tensor,
     H: cutlass.Constexpr[int],
@@ -265,6 +266,9 @@ def k1_kernel(
         if actual_len > tidx:
             bv = cutlass.Float32(beta[head_idx * T_total + token_start + tidx])
         sBetaSig[tidx] = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
+        # Emit raw beta into the compact wt_l workspace (tail rows = -80 -> sigmoid~0),
+        # so K2 reads it like the other K1 outputs instead of a host-padded buffer.
+        ws_beta[(head_idx * total_tiles + tile_idx) * CHUNK + tidx] = cutlass.BFloat16(bv)
 
     # decay_apply
     lane = tidx % 32
@@ -575,6 +579,7 @@ def run_k1(
     ws_gt: cute.Tensor,
     ws_inv: cute.Tensor,
     ws_mqk: cute.Tensor,
+    ws_beta: cute.Tensor,
     tile_starts: cute.Tensor,
     tile_actual_lens: cute.Tensor,
     H: cutlass.Constexpr[int],
@@ -666,6 +671,7 @@ def run_k1(
         ws_gt,
         ws_inv,
         ws_mqk,
+        ws_beta,
         tile_starts,
         tile_actual_lens,
         H,
@@ -759,6 +765,7 @@ def launch_k1(
     ws_gt: torch.Tensor,
     ws_inv: torch.Tensor,
     ws_mqk: torch.Tensor,
+    ws_beta: torch.Tensor,
     *,
     tile_starts: torch.Tensor | None = None,
     tile_actual_lens: torch.Tensor | None = None,
@@ -796,6 +803,7 @@ def launch_k1(
     sgt = _wrap_input(ws_gt, 16)
     sinv = _wrap_input(ws_inv, 16)
     smqk = _wrap_input(ws_mqk, 16)
+    sws_beta = _wrap_input(ws_beta, 16)
     sts = _wrap_input(tile_starts, 4, cache=True)
     stal = _wrap_input(tile_actual_lens, 4, cache=True)
 
@@ -814,6 +822,7 @@ def launch_k1(
             sgt,
             sinv,
             smqk,
+            sws_beta,
             sts,
             stal,
             H=H,
@@ -840,6 +849,7 @@ def launch_k1(
         sgt,
         sinv,
         smqk,
+        sws_beta,
         sts,
         stal,
         stream,
@@ -857,6 +867,7 @@ def launch_k1(
         sgt,
         sinv,
         smqk,
+        sws_beta,
         sts,
         stal,
         H,
