@@ -520,13 +520,9 @@ def _dispatch_cute(
     k2_v_tile_starts = None
     k2_v_tile_actual_lens = None
     if problem.is_varlen:
-        assert cu_seqlens is not None
-        assert problem.varlen_meta is not None
         varlen_meta = problem.varlen_meta
         seq_lens_list = varlen_meta.seq_lens
         if varlen_meta.needs_padding:
-            assert problem.B == 1, "varlen path expects packed B=1"
-
             total_aligned = varlen_meta.total_aligned
 
             k1_q = q.contiguous()
@@ -574,13 +570,10 @@ def _dispatch_cute(
     B, T, H = problem.B, problem.T, problem.H
 
     if problem.is_varlen:
-        assert cu_seqlens is not None
-        assert B == 1
         T_total = T
         if k2_cu_seqlens_tiles_cached is not None:
             k2_cu_seqlens_tiles = k2_cu_seqlens_tiles_cached
         else:
-            assert problem.varlen_meta is not None
             k2_cu_seqlens_tiles = _get_or_build_cu_tiles(cu_seqlens, K1_CHUNK)
     else:
         T_total = B * T

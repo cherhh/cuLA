@@ -585,13 +585,8 @@ def launch_pre_scan(
     B, T, H, K = v.shape
     assert K == D
     T_total = B * T
-    assert T_total % CHUNK == 0
     total_tiles = T_total // CHUNK
-    assert seg_cu_tiles.dtype == torch.int32 and seg_cu_tiles.is_cuda
     S_total = seg_cu_tiles.numel() - 1
-    for t in (b_state, m_state):
-        assert t.dtype == torch.float32 and t.is_contiguous()
-        assert t.numel() == S_total * H * D * D
 
     b_flat = b_state.reshape(-1)
     m_flat = m_state.reshape(-1)

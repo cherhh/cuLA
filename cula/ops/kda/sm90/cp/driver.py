@@ -298,17 +298,12 @@ def _intracard_prefill_impl(
             return
 
     if cu_seqlens is None:
-        assert T % CHUNK == 0, f"T={T} must be a multiple of {CHUNK}"
         n_seqs = B
         seq_tiles = [T // CHUNK] * B
         T_total = B * T
     else:
-        assert B == 1, "varlen requires packed B=1"
         seq_lens = _get_or_build_seq_lens(cu_seqlens)
         n_seqs = len(seq_lens)
-        assert all(sl % CHUNK == 0 for sl in seq_lens), (
-            "intracard-CP requires CHUNK-aligned sequence lengths; use flash_kda_fwd for the padded-repack path"
-        )
         seq_tiles = [sl // CHUNK for sl in seq_lens]
         T_total = T
 
