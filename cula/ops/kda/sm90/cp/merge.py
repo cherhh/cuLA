@@ -207,7 +207,6 @@ class Merge:
             )
 
         # ---- Pre-declare scalars for type stability ----
-        r = t_m
         seg_idx = cutlass.Int32(0)
         idx = cutlass.Int32(0)
 

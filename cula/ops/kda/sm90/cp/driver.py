@@ -118,6 +118,12 @@ def _get_or_build_cp_pad_layout(cu_seqlens: torch.Tensor, seq_lens, device: torc
     return val
 
 
+def _pad_cp_inputs(pad, q, k, v, g, beta):
+    """Pad the 5 KDA inputs with no-op CP sentinels via pad(tensor, fill):
+    q/k/v=0, g=-1e6 (decay~1 keeps state), beta=-80 (sigmoid~0, no update)."""
+    return pad(q, 0.0), pad(k, 0.0), pad(v, 0.0), pad(g, -1e6), pad(beta, -80.0)
+
+
 def _intracard_prefill_padded_varlen(
     q,
     k,
@@ -147,13 +153,14 @@ def _intracard_prefill_padded_varlen(
         buf.index_copy_(0, o2p, flat)
         return buf.reshape(1, total_aligned, *tail)
 
+    pq, pk, pv, pg, pbeta = _pad_cp_inputs(_pad, q, k, v, g, beta)
     pout = out.new_empty((1, total_aligned, H, D))
     _intracard_prefill_impl(
-        _pad(q, 0.0),
-        _pad(k, 0.0),
-        _pad(v, 0.0),
-        _pad(g, -1e6),
-        _pad(beta, -80.0),
+        pq,
+        pk,
+        pv,
+        pg,
+        pbeta,
         scale,
         pout,
         A_log,
@@ -188,12 +195,12 @@ def _intracard_prefill_padded_dense(
 ) -> None:
     B, T, H, _ = q.shape
     pad_t = ((T + CHUNK - 1) // CHUNK) * CHUNK - T
-    pad = torch.nn.functional.pad
-    pq = pad(q, (0, 0, 0, 0, 0, pad_t))
-    pk = pad(k, (0, 0, 0, 0, 0, pad_t))
-    pv = pad(v, (0, 0, 0, 0, 0, pad_t))
-    pg = pad(g, (0, 0, 0, 0, 0, pad_t), value=-1e6)
-    pbeta = pad(beta, (0, 0, 0, pad_t), value=-80.0)
+
+    def _pad(x: torch.Tensor, fill: float) -> torch.Tensor:
+        spec = (0, 0, 0, pad_t) if x.ndim == 3 else (0, 0, 0, 0, 0, pad_t)
+        return torch.nn.functional.pad(x, spec, value=fill)
+
+    pq, pk, pv, pg, pbeta = _pad_cp_inputs(_pad, q, k, v, g, beta)
     pout = out.new_empty((B, T + pad_t, H, D))
     _intracard_prefill_impl(
         pq,
@@ -236,21 +243,19 @@ def _intracard_prefill_impl(
 ) -> None:
     """Prefill with intracard sequence parallelism.
 
-    Same semantics as ``flash_kda_fwd`` for any input: non-CHUNK-aligned sequence
-    lengths are padded up to CHUNK (no-op sentinels) and run through the aligned CP
-    pipeline. ``s_split`` caps segments per sequence (None = auto).
+    Non-CHUNK-aligned sequence lengths are padded up to CHUNK and 
+    run through the aligned CP pipeline. 
+    
+    ``s_split`` caps subsequences per sequence (None = auto).
     """
     assert q.is_cuda and q.dtype == torch.bfloat16
     B, T, H, K = q.shape
     assert K == D
     device = q.device
 
-    # --- Partial-tile support (Approach A: pad-before-CP, no kernel changes) ---
-    # Non-CHUNK-aligned sequences are padded up to a CHUNK multiple with no-op
-    # sentinels (g=-1e6 -> decay~1 preserves state; beta=-80 -> sigmoid~0 no update;
-    # identical to flash_kda_fwd's tested dense pad); the aligned CP pipeline then runs
-    # unchanged and valid outputs are scattered back. (Native ceil+mask that removes the
-    # <=CHUNK-1 pad rows/seq is a future perf optimization.)
+    # Partial-tile support (Approach A): pad non-CHUNK-aligned seqs to a CHUNK multiple
+    # with no-op sentinels (see _pad_cp_inputs), run the aligned pipeline, scatter back.
+    # (A native ceil+mask that skips the pad rows is a future perf optimization.)
     if cu_seqlens is None:
         if T % CHUNK != 0:
             _intracard_prefill_padded_dense(
@@ -347,9 +352,8 @@ def _intracard_prefill_impl(
     ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta = _get_or_alloc_workspaces(
         n_qk, n_cc, total_tiles * H * D, T_total * H, device, beta.dtype
     )
-    # K1 reads beta from its transposed layout (beta_flat) and emits raw beta into the
-    # compact ws_beta workspace; pre_scan and K2 read ws_beta. For the CHUNK-aligned
-    # data CP handles, ws_beta is byte-identical to beta_flat.
+    # K1 emits raw beta into the compact ws_beta workspace (read by pre_scan + K2);
+    # for the CHUNK-aligned data CP handles it is byte-identical to beta_flat.
     beta_flat = torch.empty(T_total * H, dtype=beta.dtype, device=device)
     _copy_beta_flat(beta, beta_flat, H, T_total)
     launch_k1(q, k, g, A_log, dt_bias, beta_flat, scale, lower_bound, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta)
