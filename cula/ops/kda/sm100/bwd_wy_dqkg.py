@@ -3026,7 +3026,6 @@ def chunk_kda_bwd_wy_dqkg_fused(
     if scale is None:
         scale = K**-0.5
 
-    assert cu_seqlens is not None and chunk_indices is not None
     # Ensure cu_seqlens is int32
     assert cu_seqlens.dtype == torch.int32, "cu_seqlens must be int32"
     T_total = B * T

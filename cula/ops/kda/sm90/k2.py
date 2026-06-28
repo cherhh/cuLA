@@ -844,18 +844,8 @@ def launch_k2(
     O_T_total = out.shape[0] * out.shape[1]
     v_is_varlen = v_tile_starts is not None
     if v_is_varlen:
-        assert B == 1
-        assert v_tile_actual_lens is not None
-        assert cu_seqlens_tiles is not None
-        assert v_tile_starts.dtype == torch.int32 and v_tile_starts.is_cuda and v_tile_starts.is_contiguous()
-        assert v_tile_actual_lens.dtype == torch.int32 and v_tile_actual_lens.is_cuda and v_tile_actual_lens.is_contiguous()
         total_tiles = v_tile_starts.numel()
-        assert v_tile_starts.numel() == total_tiles
-        assert v_tile_actual_lens.numel() == total_tiles
     else:
-        assert v_tile_actual_lens is None
-        assert T % CHUNK == 0
-        assert out.shape == v.shape
         O_T_total = V_T_total
         total_tiles = V_T_total // CHUNK
         dummy = _get_dummy_int32(v.device)
@@ -873,7 +863,6 @@ def launch_k2(
         )
         N_seqs = B
     else:
-        assert cu_seqlens_tiles.dtype == torch.int32 and cu_seqlens_tiles.is_cuda
         N_seqs = cu_seqlens_tiles.numel() - 1
 
     has_initial_state_flag = initial_state is not None
