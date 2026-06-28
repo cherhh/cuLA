@@ -344,11 +344,15 @@ def _intracard_prefill_impl(
     # ---- K1 once ----
     n_qk = total_tiles * H * CHUNK * D
     n_cc = total_tiles * H * CHUNK * CHUNK
-    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat = _get_or_alloc_workspaces(
+    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta = _get_or_alloc_workspaces(
         n_qk, n_cc, total_tiles * H * D, T_total * H, device, beta.dtype
     )
+    # K1 reads beta from its transposed layout (beta_flat) and emits raw beta into the
+    # compact ws_beta workspace; pre_scan and K2 read ws_beta. For the CHUNK-aligned
+    # data CP handles, ws_beta is byte-identical to beta_flat.
+    beta_flat = torch.empty(T_total * H, dtype=beta.dtype, device=device)
     _copy_beta_flat(beta, beta_flat, H, T_total)
-    launch_k1(q, k, g, A_log, dt_bias, beta_flat, scale, lower_bound, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk)
+    launch_k1(q, k, g, A_log, dt_bias, beta_flat, scale, lower_bound, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta)
 
     # ---- initial_state -> bhvk fp32 ----
     init_bhvk = None
@@ -364,7 +368,7 @@ def _intracard_prefill_impl(
     m_seg = _get_scratch("m_seg", (n_seg_total, H, D, D), torch.float32, device)
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
 
-    launch_pre_scan(v_flat, beta_flat, ws_kd, ws_kr, ws_gt, ws_inv, b_seg, m_seg, seg_cu_tiles)
+    launch_pre_scan(v_flat, ws_beta, ws_kd, ws_kr, ws_gt, ws_inv, b_seg, m_seg, seg_cu_tiles)
 
     # ---- stage 2: merge ----
     carries = _get_scratch("carries", (n_seg_total, H, D, D), torch.float32, device)
@@ -377,7 +381,7 @@ def _intracard_prefill_impl(
         seg_final = _get_scratch("seg_final", (n_seg_total, H, D, D), torch.float32, device)
     launch_k2(
         v_flat,
-        beta_flat,
+        ws_beta,
         ws_qd,
         ws_kd,
         ws_kr,
