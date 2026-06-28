@@ -231,15 +231,19 @@ _K2_LAUNCHER = None
 
 
 def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, device, dtype):
-    """Allocate K1/K2 scratch tensors (ws_qd/kd/kr/gt/inv/mqk, beta_flat)."""
+    """Allocate K1/K2 scratch tensors (ws_qd/kd/kr/gt/inv/mqk, ws_beta).
+
+    ws_beta holds raw beta in the compact wt_l tile layout (K1 emits, K2 reads),
+    sized total_tiles*H*CHUNK == T_total*H.
+    """
     ws_qd = torch.empty(n_qk, dtype=torch.bfloat16, device=device)
     ws_kd = torch.empty_like(ws_qd)
     ws_kr = torch.empty_like(ws_qd)
     ws_gt = torch.empty(n_gt, dtype=torch.float32, device=device)
     ws_inv = torch.empty(n_cc, dtype=torch.bfloat16, device=device)
     ws_mqk = torch.empty_like(ws_inv)
-    beta_flat = torch.empty(n_beta, dtype=dtype, device=device)
-    return ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat
+    ws_beta = torch.empty(n_beta, dtype=dtype, device=device)
+    return ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta
 
 
 def _copy_beta_flat(beta: torch.Tensor, beta_flat: torch.Tensor, H: int, T_total: int) -> None:
@@ -248,35 +252,25 @@ def _copy_beta_flat(beta: torch.Tensor, beta_flat: torch.Tensor, H: int, T_total
 
 
 def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
+    """Padded per-sequence tile boundaries for non-aligned varlen K2 recurrence.
+
+    Returns (cu_pad, cu_tiles): CHUNK-aligned cumulative token offsets and the matching
+    cumulative tile counts. K1 emits ws_beta directly, so varlen no longer needs a
+    host-side beta gather/pad — only these boundaries are required.
+    """
     key = (seq_lens, str(device), cu_dtype)
     cached = _VARLEN_LAYOUT_CACHE.get(key)
     if cached is not None:
         return cached
 
-    idx_list: list[int] = []
-    valid_dst_list: list[int] = []
-    pad_idx_list: list[int] = []
     out_offsets = [0]
-
-    src_cursor = 0
-    dst_cursor = 0
     for sl in seq_lens:
         aligned = ((sl + CHUNK - 1) // CHUNK) * CHUNK
-        idx_list.extend(range(src_cursor, src_cursor + sl))
-        valid_dst_list.extend(range(dst_cursor, dst_cursor + sl))
-        if aligned > sl:
-            idx_list.extend([src_cursor] * (aligned - sl))
-            pad_idx_list.extend(range(dst_cursor + sl, dst_cursor + aligned))
-        src_cursor += sl
-        dst_cursor += aligned
-        out_offsets.append(dst_cursor)
+        out_offsets.append(out_offsets[-1] + aligned)
 
-    idx = torch.tensor(idx_list, dtype=torch.int32, device=device)
-    valid_dst = torch.tensor(valid_dst_list, dtype=torch.int32, device=device)
-    pad_idx = torch.tensor(pad_idx_list, dtype=torch.int64, device=device)
     cu_pad = torch.tensor(out_offsets, dtype=cu_dtype, device=device)
     cu_tiles = torch.tensor([off // CHUNK for off in out_offsets], dtype=torch.int32, device=device)
-    cached = (idx, valid_dst, pad_idx, cu_pad, cu_tiles, tuple(out_offsets))
+    cached = (cu_pad, cu_tiles)
     if len(_VARLEN_LAYOUT_CACHE) >= _VARLEN_LAYOUT_CACHE_MAXSIZE:
         _VARLEN_LAYOUT_CACHE.pop(next(iter(_VARLEN_LAYOUT_CACHE)))
     _VARLEN_LAYOUT_CACHE[key] = cached
@@ -537,19 +531,13 @@ def _dispatch_cute(
             k2_v_tile_starts = varlen_meta.tile_starts
             k2_v_tile_actual_lens = varlen_meta.tile_actual_lens
 
-            beta_pad = torch.empty((1, total_aligned, problem.H), dtype=beta.dtype, device=q.device)
-            gather_idx, _valid_dst_idx, pad_idx, cu_pad, k2_cu_seqlens_tiles_cached, _out_offsets = (
-                _get_or_build_varlen_layout(
-                    tuple(seq_lens_list),
-                    q.device,
-                    cu_seqlens.dtype,
-                )
+            # Padded tile boundaries for K2's per-sequence recurrence. K1 emits ws_beta
+            # directly, so varlen needs no host-side beta padding/gather.
+            cu_pad, k2_cu_seqlens_tiles_cached = _get_or_build_varlen_layout(
+                tuple(seq_lens_list),
+                q.device,
+                cu_seqlens.dtype,
             )
-
-            torch.index_select(beta, 1, gather_idx, out=beta_pad)
-
-            if pad_idx.numel() > 0:
-                beta_pad.index_fill_(1, pad_idx, -80.0)
 
             problem_pad = _PrefillProblem(
                 B=1,
@@ -561,7 +549,7 @@ def _dispatch_cute(
                 has_state_in=problem.has_state_in,
                 has_state_out=problem.has_state_out,
             )
-            beta, cu_seqlens, problem = beta_pad, cu_pad, problem_pad
+            cu_seqlens, problem = cu_pad, problem_pad
         else:
             k2_cu_seqlens_tiles_cached = varlen_meta.cu_tiles
 
@@ -583,17 +571,15 @@ def _dispatch_cute(
 
     n_qk = total_tiles * H * K1_CHUNK * K1_D
     n_cc = total_tiles * H * K1_CHUNK * K1_CHUNK
-    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, beta_flat = _get_or_alloc_workspaces(
+    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta = _get_or_alloc_workspaces(
         n_qk, n_cc, total_tiles * H * K1_D, T_total * H, q.device, beta.dtype
     )
 
-    _copy_beta_flat(beta, beta_flat, H, T_total)
-    k2_beta_flat = beta_flat
-    if k1_is_varlen:
-        k1_beta_flat = torch.empty(k1_T_total * H, dtype=k1_beta.dtype, device=k1_beta.device)
-        _copy_beta_flat(k1_beta, k1_beta_flat, H, k1_T_total)
-    else:
-        k1_beta_flat = k2_beta_flat
+    # K1 reads beta from its transposed original-packed layout and emits raw beta into
+    # the compact ws_beta workspace (tail rows = -80); K2 reads ws_beta directly, so
+    # varlen needs no host-side beta padding/gather.
+    k1_beta_flat = torch.empty(k1_T_total * H, dtype=k1_beta.dtype, device=k1_beta.device)
+    _copy_beta_flat(k1_beta, k1_beta_flat, H, k1_T_total)
 
     k2_initial_state = None
     if problem.has_state_in:
@@ -618,6 +604,7 @@ def _dispatch_cute(
         ws_gt,
         ws_inv,
         ws_mqk,
+        ws_beta,
         tile_starts=k1_tile_starts,
         tile_actual_lens=k1_tile_actual_lens,
         total_tiles=k1_total_tiles,
@@ -625,7 +612,7 @@ def _dispatch_cute(
     )
     _launch_k2(
         v,
-        k2_beta_flat,
+        ws_beta,
         ws_qd,
         ws_kd,
         ws_kr,
