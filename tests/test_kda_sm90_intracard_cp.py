@@ -18,7 +18,7 @@ from fla.ops.kda.chunk import chunk_kda as fla_chunk_kda
 
 from cula.kda import kda_prefill_hopper as cula_kda_prefill
 from cula.ops.kda.sm90.cp import intracard_prefill
-from cula.ops.kda.sm90.cp.driver import _plan_segments
+from cula.ops.kda.sm90.cp.plan import _plan_segments
 from cula.ops.kda.sm90.fwd import D, flash_kda_fwd
 
 H = 8
