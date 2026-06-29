@@ -1,200 +1,195 @@
 #!/usr/bin/env python3
 # Copyright 2025-2026 Ant Group Co., Ltd.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
 """
-bench_kda_sm90_cp.py — Benchmark: SM90 intracard context-parallel (CP) prefill.
+bench_kda_sm90_cp.py — Benchmark: SM90 intracard CP speedup (CP-on vs CP-off)
 
-Intracard CP only engages at LOW occupancy — FEW heads x SMALL batch x LONG
-sequence(s) — where the serial K1+K2 path leaves the SM array idle. This bench
-targets exactly that regime and compares MATCHED paths:
-
-  - non-CP : cuLA serial            vs FLA Triton (no CP)
-  - CP     : cuLA intracard CP (auto) vs FLA intracard CP
-
-FLA's intracard CP is gated by FLA_INTRACARD_CP and only runs under
-torch.inference_mode(); cuLA's auto policy decides engage vs fall back.
-At high head counts both fall back to serial (covered by bench_kda_sm90_prefill).
+Measures the speedup of the SM90 intracard context-parallel path against
+the serial K1+K2 baseline across varlen configurations.
 
 Usage:
-  python benchmarks/bench_kda_sm90_cp.py [--ncu] [--sanitizer]
+  python bench_kda_sm90_cp.py [--ncu] [--sanitizer]
+
+With --ncu, warmup=1 and iters=1 for ncu profiling:
+  ncu --set full -o report python bench_kda_sm90_cp.py --ncu
 """
 
 import argparse
-import os
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-os.environ.setdefault("CULA_INTRACARD_CP", "1")
-os.environ["FLA_INTRACARD_CP"] = "1"  # enable FLA's intracard-CP backend (before fla import)
-os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))
 
 import torch
-from fla.ops.kda import chunk_kda as fla_chunk_kda
 
-from benchmarks.utils import (
-    SEED,
-    benchmark_cuda_mode_fn,
-    exclusive_cumsum,
-    relative_rms_error_rel_max_mean_abs,
-    set_seed,
-)
+from benchmarks.utils import SEED, exclusive_cumsum, prepare_safe_gate_inputs, set_seed
 from cula.kda import kda_prefill_hopper as cula_kda_prefill
-from cula.ops.kda.policy import sm90_intracard_cp_decision
-from cula.utils import assert_hopper, get_device_sm_version
-
-_device = torch.device("cuda")
-assert_hopper(_device)
-_major, _minor = get_device_sm_version(_device)
-_SM_TAG = f"sm{_major}{_minor}"
+from cula.utils import assert_hopper, get_device_sm_count
 
 D = 128
-WARMUP = 20
-N_ITERS = 50
+H_VALUES = [4, 8]
+WARMUP = 10
+N_ITERS = 100
 NCU_MODE = False
 SANITIZER_MODE = False
 
-# CP regime: few heads (H>=4, the realistic minimum after tensor parallelism),
-# small batch (B=1), long sequence(s). Last row is a high-H control where both
-# fall back to serial.
+# (tag, seq_lens) — each entry is tested at every H in H_VALUES.
+# SM90 CHUNK=16, so sequences need to be long enough (>= ~8K tiles) for CP to pay off.
 CONFIGS = [
-    ("H=4  T=16384", 4, [16384]),
-    ("H=8  T=16384", 8, [16384]),
-    ("H=4  T=32768", 4, [32768]),
-    ("H=8  T=32768", 8, [32768]),
-    ("H=4  T=65536", 4, [65536]),
-    ("H=8  T=65536", 8, [65536]),
-    ("H=4  2-seq T=32768", 4, [16384, 16384]),
-    ("CTRL H=64 T=16384", 64, [16384]),
+    # --- single seq (ascending length) ---
+    ("T=4K", [4096]),
+    ("T=8K", [8192]),
+    ("T=16K", [16384]),
+    ("T=32K", [32768]),
+    ("T=64K", [65536]),
+    # --- multi-seq ---
+    ("2x16K", [16384, 16384]),
+    ("32K+4K", [32768, 4096]),
+    ("32K+1K", [32768, 1024]),
+    ("64K+1K", [65536, 1024]),
+    ("64K+2x1K", [65536, 1024, 1024]),
+    ("64K+5x1K", [65536] + [1024] * 5),
 ]
 
 
-def _make(H, seq_lens):
-    set_seed(SEED)
-    T = sum(seq_lens)
-    rnd = lambda: torch.rand(1, T, H, D, dtype=torch.bfloat16, device=_device)
-    raw_beta = torch.randn(1, T, H, dtype=torch.bfloat16, device=_device)
-    return dict(
-        q=rnd(),
-        k=rnd(),
-        v=rnd(),
-        g=torch.randn(1, T, H, D, dtype=torch.bfloat16, device=_device) * 0.1,
-        sig_beta=raw_beta.float().sigmoid().to(torch.bfloat16),
-        raw_beta=raw_beta,
-        A_log=torch.randn(H, dtype=torch.float32, device=_device) * 0.01,
-        dt_bias=torch.zeros(H * D, dtype=torch.float32, device=_device),
-        cu=torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=_device),
-        scale=D**-0.5,
-    )
+def time_kernel(fn, warmup=None, n_iters=None):
+    if warmup is None:
+        warmup = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
+    if n_iters is None:
+        n_iters = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    for _ in range(n_iters):
+        fn()
+    end_evt.record()
+    torch.cuda.synchronize()
+    return start_evt.elapsed_time(end_evt) / n_iters
 
 
-def _cula(d, mode):  # public wrapper takes post-sigmoid beta
-    o, _ = cula_kda_prefill(
-        q=d["q"],
-        k=d["k"],
-        v=d["v"],
-        g=d["g"],
-        beta=d["sig_beta"],
-        scale=d["scale"],
-        A_log=d["A_log"],
-        dt_bias=d["dt_bias"],
-        initial_state=None,
-        output_final_state=True,
-        cu_seqlens=d["cu"],
-        use_gate_in_kernel=True,
+def run_kernel(q, k, v, g, beta, scale, A_log, dt_bias, cu_seqlens, lower_bound, *, use_cp):
+    cula_kda_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=scale,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        cu_seqlens=cu_seqlens,
+        output_final_state=False,
         safe_gate=True,
-        lower_bound=-5.0,
-        use_intracard_cp=mode,
+        lower_bound=lower_bound,
+        use_intracard_cp="auto" if use_cp else False,
     )
-    return o
 
 
-def _fla(d):  # FLA's intracard CP engages only under inference_mode (+ FLA_INTRACARD_CP)
-    o, _ = fla_chunk_kda(
-        q=d["q"],
-        k=d["k"],
-        v=d["v"],
-        g=d["g"],
-        beta=d["raw_beta"],
-        scale=d["scale"],
-        A_log=d["A_log"],
-        dt_bias=d["dt_bias"],
-        initial_state=None,
-        output_final_state=True,
-        use_gate_in_kernel=True,
-        use_qk_l2norm_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        cu_seqlens=d["cu"],
-        safe_gate=True,
-        lower_bound=-5.0,
-        transpose_state_layout=True,
-    )
-    return o
+def bench_cp(h_values, configs):
+    print("\n" + "=" * 100)
+    print(" SM90 Intracard CP Benchmark: CP-on vs CP-off")
+    print("=" * 100)
+
+    device = torch.device("cuda")
+    assert_hopper(device)
+    num_sms = get_device_sm_count(device)
+    print(f" [Device] {torch.cuda.get_device_name(0)}  SMs={num_sms}")
+    results = []
+
+    for H in h_values:
+        for tag, seq_lens in configs:
+            set_seed(SEED)
+            torch.cuda.empty_cache()
+
+            total_T = sum(seq_lens)
+            cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+            inputs = prepare_safe_gate_inputs(1, total_T, H, D, device, cu_seqlens=cu_seqlens, seed=SEED)
+            q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+            A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
+            scale, lower_bound = inputs["scale"], inputs["lower_bound"]
+
+            common = dict(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                cu_seqlens=cu_seqlens,
+                lower_bound=lower_bound,
+            )
+
+            ms_off = time_kernel(lambda: run_kernel(**common, use_cp=False))
+            ms_on = time_kernel(lambda: run_kernel(**common, use_cp=True))
+
+            speedup = ms_off / ms_on if ms_on > 0 else float("inf")
+            r = dict(tag=tag, H=H, total_T=total_T, ms_off=ms_off, ms_on=ms_on, speedup=speedup)
+            results.append(r)
+
+            del q, k, v, g, beta, A_log, dt_bias, inputs
+            torch.cuda.empty_cache()
+
+    return results
 
 
-def _time(fn):
-    return benchmark_cuda_mode_fn(
-        fn,
-        default_warmup=WARMUP,
-        default_rep=N_ITERS,
-        ncu_mode=NCU_MODE,
-        sanitizer_mode=SANITIZER_MODE,
-        aggregate="iqr_mean",
-    )
+def print_report(results, h_values):
+    sep = "=" * 95
+    print(f"\n\n{sep}")
+    print("               BENCHMARK REPORT: SM90 Intracard CP")
+    print("               CP-on vs CP-off (intracard_prefill vs flash_kda_fwd)")
+    print(f"               D={D}  dtype=bf16  safe_gate=True")
+    wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
+    ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
+    mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
+    print(f"               Warmup={wu}  Iters={ni}{mode_tag}")
+    print(sep)
+
+    for H_val in h_values:
+        h_results = [r for r in results if r["H"] == H_val]
+        if not h_results:
+            continue
+        print(f"\n  [H={H_val}]")
+        print(f"  {'─' * 80}")
+        print(f"  {'config':<20s} {'T':>7s}  │  {'CP_off(ms)':>10s}  {'CP_on(ms)':>10s}  {'Speedup':>8s}")
+        print(f"  {'─' * 80}")
+        for r in h_results:
+            print(f"  {r['tag']:<20s} {r['total_T']:>7d}  │  {r['ms_off']:>10.4f}  {r['ms_on']:>10.4f}  {r['speedup']:>7.2f}x")
+        print(f"  {'─' * 80}")
+
+    speedups = [r["speedup"] for r in results]
+    if speedups:
+        geo = 1.0
+        for s in speedups:
+            geo *= s
+        geo = geo ** (1 / len(speedups))
+        print(f"\n  All configs: geo-mean={geo:.2f}x  best={max(speedups):.2f}x  worst={min(speedups):.2f}x")
+
+    print(f"\n{sep}\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="bench_kda_sm90_cp: SM90 intracard CP, matched cuLA-vs-FLA")
-    parser.add_argument("--ncu", action="store_true", help="NCU mode: warmup=1, iters=1")
+    parser = argparse.ArgumentParser(description="bench_kda_sm90_cp: SM90 intracard CP speedup")
+    parser.add_argument("--ncu", action="store_true", help="NCU profiling mode: warmup=1, iters=1")
     parser.add_argument("--sanitizer", action="store_true", help="Sanitizer mode: warmup=1, iters=1")
     args = parser.parse_args()
+
     global NCU_MODE, SANITIZER_MODE
-    NCU_MODE = args.ncu
-    SANITIZER_MODE = args.sanitizer
+    if args.ncu:
+        NCU_MODE = True
+        print("[NCU mode] warmup=1, iters=1")
+    if args.sanitizer:
+        SANITIZER_MODE = True
+        print("[Sanitizer mode] warmup=1, iters=1")
 
-    print(f"[Device] {torch.cuda.get_device_name(0)}  {_SM_TAG}  D={D}  dtype=bf16")
-    print("  SM90 intracard CP — matched comparison (non-CP vs non-CP, CP vs CP)\n")
-    print(
-        f"  {'config':20s} │ {'cuLA_ser':>8s} {'cuLA_CP':>8s} {'FLA_ser':>8s} {'FLA_CP':>8s} │ "
-        f"{'ser c/f':>8s} {'CP c/f':>8s} │ {'cuLA_dec':>8s} {'rrmse':>8s}"
-    )
-    print("  " + "─" * 104)
-
-    for label, H, sl in CONFIGS:
-        d = _make(H, sl)
-        dec = sm90_intracard_cp_decision(d["q"], d["cu"], None, "auto")
-        with torch.no_grad():
-            o_cs = _cula(d, False)
-            o_cc = _cula(d, "auto")
-            torch.cuda.synchronize()
-            rr, _, _ = relative_rms_error_rel_max_mean_abs(o_cs, o_cc)
-            ms_cs = _time(lambda: _cula(d, False))
-            ms_cc = _time(lambda: _cula(d, "auto"))
-            ms_fs = _time(lambda: _fla(d))  # FLA non-CP (not inference_mode -> backend declines)
-        with torch.inference_mode():
-            ms_fc = _time(lambda: _fla(d))  # FLA intracard CP (inference_mode + FLA_INTRACARD_CP)
-        print(
-            f"  {label:20s} │ {ms_cs:8.3f} {ms_cc:8.3f} {ms_fs:8.3f} {ms_fc:8.3f} │ "
-            f"{ms_fs / ms_cs:7.2f}x {ms_fc / ms_cc:7.2f}x │ {'ENGAGE' if dec.enabled else 'fallbk':>8s} {rr:8.5f}"
-        )
-        del d
-        torch.cuda.empty_cache()
-
-    print("  " + "─" * 104)
-    print("  ser c/f = FLA_ser/cuLA_ser, CP c/f = FLA_CP/cuLA_CP  (>1 = cuLA faster)")
-    print("  CP engages only at low H/batch + long seq; high-H control falls back to serial.\n")
+    results = bench_cp(H_VALUES, CONFIGS)
+    print_report(results, H_VALUES)
+    return results
 
 
 if __name__ == "__main__":
