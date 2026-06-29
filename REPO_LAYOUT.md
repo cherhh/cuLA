@@ -67,7 +67,7 @@ cuLA/
 | Directory | Language | Description |
 |-----------|----------|-------------|
 | `cula/kda/` | Python | KDA **public API only** — autograd + dispatch, no kernels. Two prefill entries: modular chunk `chunk_kda` (SM100) and two-kernel K1+K2 `kda_prefill_hopper` (SM90). See [`cula/kda/README.md`](cula/kda/README.md). |
-| `cula/ops/kda/` | Python (CuTe DSL) | **All KDA backends**, by arch: `sm100/` (+cp), `sm90/` (+cp), `decode/`, `experimental/`, plus `policy.py` (CP dispatch). Both prefill backends are chunked forward; arch is the discriminator (1 impl each), so no descriptive family layer. |
+| `cula/ops/kda/` | Python (CuTe DSL) | **All KDA backends**, by arch: `sm100/` (+cp), `sm90/` (+cp), `decode/`, `experimental/`, plus `policy.py` (CP dispatch). Both prefill backends are chunked forward; arch is the discriminator (1 impl each). |
 | `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTe DSL) | `[non-KDA]` Lightning/linear attention kernels. |
 | `cula/ops/{inv,ptx}.py`, `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers (kept in place; not KDA-specific). |
 | `csrc/kda/sm100/` · `csrc/api/` | CUDA C++ | Blackwell KDA C++ (chunk intra + recompute_w_u), exposed as `cula.cudac`. |

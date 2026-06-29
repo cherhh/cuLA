@@ -23,8 +23,6 @@ at entry/exit.
 
 from __future__ import annotations
 
-import weakref
-
 import torch
 
 from cula.ops.kda.sm90.cp.merge import launch_merge
@@ -34,7 +32,7 @@ from cula.ops.kda.sm90.fwd import (
     _copy_beta_flat,
     _cute_arch_for_device,
     _get_or_alloc_workspaces,
-    _get_or_build_seq_lens,
+    _get_or_build_varlen_metadata,
     flash_kda_fwd,
 )
 from cula.ops.kda.sm90.k1 import launch_k1
@@ -82,98 +80,13 @@ def intracard_prefill(*args, **kwargs) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Partial-tile (non-CHUNK-aligned) support — Approach A: pad-before-CP
+# Dense partial-tile (non-CHUNK-aligned) support — pad to a CHUNK multiple.
+# (Varlen is handled natively in _intracard_prefill_impl: ceil tiles + mask.)
 # ---------------------------------------------------------------------------
-_CP_PAD_LAYOUT_CACHE: dict = {}
-
-
-def _get_or_build_cp_pad_layout(cu_seqlens: torch.Tensor, seq_lens, device: torch.device):
-    """(orig->padded gather idx, CHUNK-aligned cu_seqlens, total_aligned), cached.
-
-    ``orig->padded`` maps each original packed token position to its slot in the
-    per-sequence CHUNK-aligned padded buffer. Keyed by cu_seqlens identity.
-    """
-    key = id(cu_seqlens)
-    cached = _CP_PAD_LAYOUT_CACHE.get(key)
-    if cached is not None:
-        ref, lens_key, val = cached
-        if ref() is cu_seqlens and lens_key == tuple(seq_lens):
-            return val
-        _CP_PAD_LAYOUT_CACHE.pop(key, None)
-    aligned = [((sl + CHUNK - 1) // CHUNK) * CHUNK for sl in seq_lens]
-    total_aligned = sum(aligned)
-    o2p_list: list[int] = []
-    cu_pad_list = [0]
-    pbos = 0
-    for sl, al in zip(seq_lens, aligned):
-        o2p_list.extend(range(pbos, pbos + sl))
-        pbos += al
-        cu_pad_list.append(pbos)
-    o2p = torch.tensor(o2p_list, dtype=torch.int64, device=device)
-    cu_pad = torch.tensor(cu_pad_list, dtype=torch.int32, device=device)
-    val = (o2p, cu_pad, total_aligned)
-    if len(_CP_PAD_LAYOUT_CACHE) >= 8:
-        _CP_PAD_LAYOUT_CACHE.pop(next(iter(_CP_PAD_LAYOUT_CACHE)))
-    _CP_PAD_LAYOUT_CACHE[key] = (weakref.ref(cu_seqlens), tuple(seq_lens), val)
-    return val
-
-
 def _pad_cp_inputs(pad, q, k, v, g, beta):
     """Pad the 5 KDA inputs with no-op CP sentinels via pad(tensor, fill):
     q/k/v=0, g=-1e6 (decay~1 keeps state), beta=-80 (sigmoid~0, no update)."""
     return pad(q, 0.0), pad(k, 0.0), pad(v, 0.0), pad(g, -1e6), pad(beta, -80.0)
-
-
-def _intracard_prefill_padded_varlen(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    scale,
-    out,
-    A_log,
-    dt_bias,
-    lower_bound,
-    initial_state,
-    final_state,
-    cu_seqlens,
-    seq_lens,
-    state_transposed,
-    s_split,
-    allow_fallback,
-) -> None:
-    _, T, H, _ = q.shape
-    o2p, cu_pad, total_aligned = _get_or_build_cp_pad_layout(cu_seqlens, seq_lens, q.device)
-
-    def _pad(src: torch.Tensor, fill: float) -> torch.Tensor:
-        tail = src.shape[2:]
-        flat = src.reshape(T, *tail)
-        buf = src.new_zeros((total_aligned, *tail)) if fill == 0.0 else src.new_full((total_aligned, *tail), fill)
-        buf.index_copy_(0, o2p, flat)
-        return buf.reshape(1, total_aligned, *tail)
-
-    pq, pk, pv, pg, pbeta = _pad_cp_inputs(_pad, q, k, v, g, beta)
-    pout = out.new_empty((1, total_aligned, H, D))
-    _intracard_prefill_impl(
-        pq,
-        pk,
-        pv,
-        pg,
-        pbeta,
-        scale,
-        pout,
-        A_log,
-        dt_bias,
-        lower_bound,
-        initial_state=initial_state,
-        final_state=final_state,
-        cu_seqlens=cu_pad,
-        state_transposed=state_transposed,
-        s_split=s_split,
-        allow_fallback=allow_fallback,
-    )
-    out.reshape(T, H, D).copy_(pout.reshape(total_aligned, H, D).index_select(0, o2p))
 
 
 def _intracard_prefill_padded_dense(
@@ -253,9 +166,8 @@ def _intracard_prefill_impl(
     assert K == D
     device = q.device
 
-    # Partial-tile support (Approach A): pad non-CHUNK-aligned seqs to a CHUNK multiple
-    # with no-op sentinels (see _pad_cp_inputs), run the aligned pipeline, scatter back.
-    # (A native ceil+mask that skips the pad rows is a future perf optimization.)
+    # dense non-CHUNK-aligned: pad to a CHUNK multiple (cheap tail F.pad, no gather).
+    # varlen is handled natively below (ceil tiles + in-kernel partial-tile mask, no pad).
     if cu_seqlens is None:
         if T % CHUNK != 0:
             _intracard_prefill_padded_dense(
@@ -279,38 +191,29 @@ def _intracard_prefill_impl(
     else:
         assert B == 1, "varlen requires packed B=1"
         assert cu_seqlens.dtype == torch.int32, f"cu_seqlens must be int32, got {cu_seqlens.dtype}"
-        _seq_lens = _get_or_build_seq_lens(cu_seqlens)
-        if any(sl % CHUNK != 0 for sl in _seq_lens):
-            _intracard_prefill_padded_varlen(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                scale,
-                out,
-                A_log,
-                dt_bias,
-                lower_bound,
-                initial_state,
-                final_state,
-                cu_seqlens,
-                _seq_lens,
-                state_transposed,
-                s_split,
-                allow_fallback,
-            )
-            return
 
+    # Native varlen partial-tile handling (SM100-style): non-aligned seqs use ceil tile
+    # counts + tile_starts so K1/pre_scan/K2 read packed v and mask the partial last tile,
+    # instead of padding the whole input and scattering back.
+    v_is_varlen = False
+    v_tile_starts = None
+    v_tile_actual_lens = None
+    native_total_tiles = None
     if cu_seqlens is None:
         n_seqs = B
         seq_tiles = [T // CHUNK] * B
         T_total = B * T
     else:
-        seq_lens = _get_or_build_seq_lens(cu_seqlens)
+        meta = _get_or_build_varlen_metadata(cu_seqlens)
+        seq_lens = meta.seq_lens
         n_seqs = len(seq_lens)
-        seq_tiles = [sl // CHUNK for sl in seq_lens]
+        seq_tiles = [(sl + CHUNK - 1) // CHUNK for sl in seq_lens]  # ceil — last tile may be partial
         T_total = T
+        if meta.needs_padding:
+            v_is_varlen = True
+            v_tile_starts = meta.tile_starts
+            v_tile_actual_lens = meta.tile_actual_lens
+            native_total_tiles = meta.total_tiles  # ceil tile sum
 
     min_seg_tiles = None
     if s_split is None:
@@ -344,7 +247,7 @@ def _intracard_prefill_impl(
         return
 
     seg_cu_tiles = _get_plan_tensor(tuple(seg_cu), torch.int32, device)
-    total_tiles = T_total // CHUNK
+    total_tiles = native_total_tiles if v_is_varlen else T_total // CHUNK
 
     # ---- K1 once ----
     n_qk = total_tiles * H * CHUNK * D
@@ -356,7 +259,14 @@ def _intracard_prefill_impl(
     # for the CHUNK-aligned data CP handles it is byte-identical to beta_flat.
     beta_flat = torch.empty(T_total * H, dtype=beta.dtype, device=device)
     _copy_beta_flat(beta, beta_flat, H, T_total)
-    launch_k1(q, k, g, A_log, dt_bias, beta_flat, scale, lower_bound, ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta)
+    launch_k1(
+        q, k, g, A_log, dt_bias, beta_flat, scale, lower_bound,
+        ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta,
+        tile_starts=v_tile_starts,
+        tile_actual_lens=v_tile_actual_lens,
+        total_tiles=native_total_tiles,
+        is_varlen=v_is_varlen,
+    )
 
     # ---- initial_state -> bhvk fp32 ----
     init_bhvk = None
@@ -372,7 +282,12 @@ def _intracard_prefill_impl(
     m_seg = _get_scratch("m_seg", (n_seg_total, H, D, D), torch.float32, device)
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
 
-    launch_pre_scan(v_flat, ws_beta, ws_kd, ws_kr, ws_gt, ws_inv, b_seg, m_seg, seg_cu_tiles)
+    launch_pre_scan(
+        v_flat, ws_beta, ws_kd, ws_kr, ws_gt, ws_inv, b_seg, m_seg, seg_cu_tiles,
+        v_tile_starts=v_tile_starts,
+        v_tile_actual_lens=v_tile_actual_lens,
+        total_tiles=total_tiles,
+    )
 
     # ---- stage 2: merge ----
     carries = _get_scratch("carries", (n_seg_total, H, D, D), torch.float32, device)
@@ -397,6 +312,8 @@ def _intracard_prefill_impl(
         initial_state=carries,
         final_state=seg_final,
         state_transposed=False,
+        v_tile_starts=v_tile_starts,
+        v_tile_actual_lens=v_tile_actual_lens,
     )
 
     if final_state is not None:

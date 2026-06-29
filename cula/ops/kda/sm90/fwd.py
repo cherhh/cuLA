@@ -195,32 +195,16 @@ def _validate_inputs(
 
 @contextmanager
 def _cute_arch_for_device(device: torch.device):
-    """Temporarily provide the CuTeDSL arch for ``device`` (sm_90a / sm_100a) without leaking process env."""
-    if not torch.cuda.is_available() or device.type != "cuda":
-        yield
-        return
-
+    """Temporarily set CUTE_DSL_ARCH for the given device."""
     major, minor = torch.cuda.get_device_capability(device)
     arch = _CUTE_ARCH_BY_CC.get((major, minor))
     if arch is None:
-        raise RuntimeError(
-            f"FlashKDA prefill supports Hopper (sm_90a) or Blackwell (sm_100a/sm_103a); "
-            f"got compute capability sm_{major}{minor}."
-        )
-
-    old_arch = os.environ.get("CUTE_DSL_ARCH")
-    if old_arch is not None and old_arch != arch:
-        raise RuntimeError(
-            f"FlashKDA prefill requires CUTE_DSL_ARCH={arch} for this device, but the process has CUTE_DSL_ARCH={old_arch!r}."
-        )
-
-    if old_arch is None:
-        os.environ["CUTE_DSL_ARCH"] = arch
+        raise RuntimeError(f"unsupported compute capability sm_{major}{minor}")
+    os.environ["CUTE_DSL_ARCH"] = arch
     try:
         yield
     finally:
-        if old_arch is None:
-            os.environ.pop("CUTE_DSL_ARCH", None)
+        os.environ.pop("CUTE_DSL_ARCH", None)
 
 
 # ---- Cached scratch workspaces ----
