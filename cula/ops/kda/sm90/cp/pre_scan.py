@@ -419,7 +419,9 @@ def pre_scan_kernel(
                 s_dyn = cutlass.Int32(0)
                 phase_full = phase_full ^ cutlass.Int32(1)
     cute.arch.barrier()
-    # Epilogue: write both states fp32 bhvk
+    # Epilogue: write both states fp32. The index swap below (gmem[d_out, tidx] =
+    # smem[tidx, d_out]) stores the TRANSPOSE S^T / M^T on purpose — merge consumes
+    # this transposed convention (carry @ M^T), so do not "fix" the orientation here.
     state_base_f = cutlass.Int32(seg_idx) * cutlass.Int32(H * D * D) + cutlass.Int32(head_idx) * cutlass.Int32(D * D)
     if tidx < D:
         for d_out in cutlass.range_constexpr(D):
