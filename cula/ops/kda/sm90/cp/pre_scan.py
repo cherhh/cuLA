@@ -65,6 +65,9 @@ def pre_scan_kernel(
     seg_cu_tiles: cute.Tensor,
     b_state_g: cute.Tensor,  # flat fp32 [S*H*D*D] gmem, bhvk
     m_state_g: cute.Tensor,  # flat fp32 [S*H*D*D] gmem, bhvk
+    v_tile_starts: cute.Tensor,
+    v_tile_actual_lens: cute.Tensor,
+    v_is_varlen: cutlass.Constexpr[bool],
 ):
     seg_idx, head_idx, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
@@ -249,6 +252,17 @@ def pre_scan_kernel(
         # ===== LOAD WARP =====
         s_dyn_l = cutlass.Int32(0)
         phase_emp = cutlass.Int32(1)
+        if cutlass.const_expr(v_is_varlen):
+            seq_v_start = v_tile_starts[tile_base]
+            tma_tensor_v_seq = cute.domain_offset((seq_v_start, 0, 0), tma_tensor_v)
+            gSrc_v_seq = cute.local_tile(tma_tensor_v_seq, (CHUNK, D), (None, None, None))
+            tVs_seq, tVg_seq = cpasync.tma_partition(
+                tma_atom_v,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sV, 0, 2),
+                cute.group_modes(gSrc_v_seq, 0, 2),
+            )
         for t in cutlass.range(t_tiles, unroll=1):
             cute.arch.mbarrier_wait(sMbarE_ptr + s_dyn_l, phase_emp)
             tg_l = tile_base + t
@@ -256,7 +270,10 @@ def pre_scan_kernel(
             bar_l = sMbar_ptr + s_dyn_l
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(bar_l, cutlass.Int32(TMA_BYTES))
-            cute.copy(tma_atom_v, tVg[(None, tg_l, 0, head_idx)], tVs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
+            if cutlass.const_expr(v_is_varlen):
+                cute.copy(tma_atom_v, tVg_seq[(None, t, 0, head_idx)], tVs_seq[(None, s_dyn_l)], tma_bar_ptr=bar_l)
+            else:
+                cute.copy(tma_atom_v, tVg[(None, tg_l, 0, head_idx)], tVs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_kd, tKDg[(None, 0, 0, wt_l)], tKDs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_kr, tKRg[(None, 0, 0, wt_l)], tKRs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_inv, tIg[(None, 0, 0, wt_l)], tIs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
@@ -279,6 +296,16 @@ def pre_scan_kernel(
             sBeta_s = sBeta[(None, 0, s_dyn)]
 
             cute.arch.mbarrier_wait(sMbar_ptr + s_dyn, phase_full)
+
+            if cutlass.const_expr(v_is_varlen):
+                actual_len = v_tile_actual_lens[tile_base + t]
+                if actual_len < cutlass.Int32(CHUNK):
+                    if tidx < D:
+                        col_v_tail = tidx
+                        for r in cutlass.range_constexpr(CHUNK):
+                            if actual_len <= cutlass.Int32(r):
+                                sV_s[r, col_v_tail] = cutlass.BFloat16(0.0)
+                    cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
             sKr_T_s = sKr_T_view[(None, None, s_dyn)]
             sKr_T_blk_tile_s = cute.flat_divide(sKr_T_s, (CHUNK, CHUNK))
@@ -440,9 +467,12 @@ def run_pre_scan(
     seg_cu_tiles: cute.Tensor,
     b_state_g: cute.Tensor,  # flat fp32 [S*H*D*D]
     m_state_g: cute.Tensor,  # flat fp32 [S*H*D*D]
+    v_tile_starts: cute.Tensor,
+    v_tile_actual_lens: cute.Tensor,
     H: cutlass.Constexpr[int],
     total_tiles: cutlass.Constexpr[int],
     T_total: cutlass.Constexpr[int],
+    v_is_varlen: cutlass.Constexpr[bool],
     S: cutlass.Constexpr[int],
     stream: cuda_drv.CUstream,
 ):
@@ -536,6 +566,9 @@ def run_pre_scan(
         seg_cu_tiles,
         b_state_g,
         m_state_g,
+        v_tile_starts,
+        v_tile_actual_lens,
+        v_is_varlen,
     ).launch(
         grid=(S, H, 1),
         block=[THREADS_PER_CTA, 1, 1],
@@ -581,20 +614,28 @@ def launch_pre_scan(
     b_state: torch.Tensor,  # [S, H, D, D] fp32, written (bhvk)
     m_state: torch.Tensor,  # [S, H, D, D] fp32, written (bhvk)
     seg_cu_tiles: torch.Tensor,  # int32 [S+1], global tile prefix sum
+    v_tile_starts: torch.Tensor | None = None,  # per-tile packed offset (native varlen)
+    v_tile_actual_lens: torch.Tensor | None = None,  # per-tile valid rows (partial-tile mask)
+    total_tiles: int | None = None,  # ceil tile sum (varlen); None -> T_total // CHUNK
 ) -> None:
     """Launch fused pre_scan: B_seg and M_seg for all segments."""
     assert v.is_cuda and v.dtype == torch.bfloat16 and v.is_contiguous()
     B, T, H, K = v.shape
     assert K == D
     T_total = B * T
-    total_tiles = T_total // CHUNK
+    v_is_varlen = v_tile_starts is not None
+    if not v_is_varlen:
+        v_tile_starts = torch.zeros(1, dtype=torch.int32, device=v.device)
+        v_tile_actual_lens = v_tile_starts
+    if total_tiles is None:
+        total_tiles = T_total // CHUNK
     S_total = seg_cu_tiles.numel() - 1
 
     b_flat = b_state.reshape(-1)
     m_flat = m_state.reshape(-1)
     v_flat = v.view(T_total, H, D)
 
-    key = (S_total, H, total_tiles)
+    key = (S_total, H, total_tiles, v_is_varlen)
     if key not in _compiled_cache_prescan:
         stream = _get_current_custream()
         _compiled_cache_prescan[key] = cute.compile(
@@ -608,9 +649,12 @@ def launch_pre_scan(
             from_dlpack(seg_cu_tiles.detach(), assumed_align=4),
             from_dlpack(b_flat.detach(), assumed_align=16),
             from_dlpack(m_flat.detach(), assumed_align=16),
+            from_dlpack(v_tile_starts.detach(), assumed_align=4),
+            from_dlpack(v_tile_actual_lens.detach(), assumed_align=4),
             H=H,
             total_tiles=total_tiles,
             T_total=T_total,
+            v_is_varlen=v_is_varlen,
             S=S_total,
             stream=stream,
         )
@@ -626,6 +670,8 @@ def launch_pre_scan(
         seg_cu_tiles,
         b_flat,
         m_flat,
+        v_tile_starts,
+        v_tile_actual_lens,
         stream,
     )
     full_args = (
@@ -638,9 +684,12 @@ def launch_pre_scan(
         seg_cu_tiles,
         b_flat,
         m_flat,
+        v_tile_starts,
+        v_tile_actual_lens,
         H,
         total_tiles,
         T_total,
+        v_is_varlen,
         S_total,
         stream,
     )
