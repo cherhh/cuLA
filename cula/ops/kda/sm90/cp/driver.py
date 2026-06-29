@@ -1,32 +1,14 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
-
-"""
-Intracard-CP prefill driver.
-
-Three-stage pipeline (pre_scan, merge, rerun) over chunk-affine recurrence.
-Internal state buffers use bhvk layout; user-facing state_transposed handled
-at entry/exit.
-"""
+"""Intracard-CP prefill driver: K1 once → pre_scan → merge → K2 rerun."""
 
 from __future__ import annotations
 
 import torch
 
 from cula.ops.kda.sm90.cp.merge import launch_merge
-from cula.ops.kda.sm90.cp.plan import AUTO_MIN_SEG_TILES, _auto_s_split, _plan_segments
+from cula.ops.kda.sm90.cp.plan import CPPlan, plan_cp
 from cula.ops.kda.sm90.cp.pre_scan import launch_pre_scan
 from cula.ops.kda.sm90.fwd import (
     _copy_beta_flat,
@@ -58,14 +40,13 @@ def _get_plan_tensor(values: tuple, dtype, device: torch.device) -> torch.Tensor
     return cached
 
 
-def _get_scratch(key_name: str, shape: tuple, dtype, device, zero_on_alloc: bool = False) -> torch.Tensor:
+def _get_scratch(key_name: str, shape: tuple, dtype, device) -> torch.Tensor:
     key = (key_name, shape, dtype, str(device))
     cached = _SCRATCH_CACHE.get(key)
     if cached is None:
         if len(_SCRATCH_CACHE) >= _SCRATCH_CACHE_MAXSIZE:
             _SCRATCH_CACHE.pop(next(iter(_SCRATCH_CACHE)))
-        alloc = torch.zeros if zero_on_alloc else torch.empty
-        cached = alloc(shape, dtype=dtype, device=device)
+        cached = torch.empty(shape, dtype=dtype, device=device)
         _SCRATCH_CACHE[key] = cached
     return cached
 
@@ -80,12 +61,11 @@ def intracard_prefill(*args, **kwargs) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dense partial-tile (non-CHUNK-aligned) support — pad to a CHUNK multiple.
-# (Varlen is handled natively in _intracard_prefill_impl: ceil tiles + mask.)
+# Dense partial-tile support — pad to CHUNK multiple, run aligned CP, strip back.
+# (Varlen partial-tile is handled natively via ceil tiles + tile_starts mask.)
 # ---------------------------------------------------------------------------
 def _pad_cp_inputs(pad, q, k, v, g, beta):
-    """Pad the 5 KDA inputs with no-op CP sentinels via pad(tensor, fill):
-    q/k/v=0, g=-1e6 (decay~1 keeps state), beta=-80 (sigmoid~0, no update)."""
+    """No-op sentinels: q/k/v=0, g=-1e6 (decay~0), beta=-80 (sigmoid~0)."""
     return pad(q, 0.0), pad(k, 0.0), pad(v, 0.0), pad(g, -1e6), pad(beta, -80.0)
 
 
@@ -136,96 +116,72 @@ def _intracard_prefill_padded_dense(
     out.copy_(pout[:, :T])
 
 
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 def _intracard_prefill_impl(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    out: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    lower_bound: float,
-    initial_state: torch.Tensor | None = None,
-    final_state: torch.Tensor | None = None,
-    cu_seqlens: torch.Tensor | None = None,
-    state_transposed: bool = False,
-    s_split: int | None = None,
-    allow_fallback: bool = True,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    out,
+    A_log,
+    dt_bias,
+    lower_bound,
+    initial_state=None,
+    final_state=None,
+    cu_seqlens=None,
+    state_transposed=False,
+    s_split=None,
+    allow_fallback=True,
 ) -> None:
-    """Prefill with intracard sequence parallelism.
-
-    Non-CHUNK-aligned sequence lengths are padded up to CHUNK and
-    run through the aligned CP pipeline.
-
-    ``s_split`` caps subsequences per sequence (None = auto).
-    """
     assert q.is_cuda and q.dtype == torch.bfloat16
     B, T, H, K = q.shape
     assert K == D
     device = q.device
 
-    # dense non-CHUNK-aligned: pad to a CHUNK multiple (cheap tail F.pad, no gather).
-    # varlen is handled natively below (ceil tiles + in-kernel partial-tile mask, no pad).
-    if cu_seqlens is None:
-        if T % CHUNK != 0:
-            _intracard_prefill_padded_dense(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                scale,
-                out,
-                A_log,
-                dt_bias,
-                lower_bound,
-                initial_state,
-                final_state,
-                state_transposed,
-                s_split,
-                allow_fallback,
-            )
-            return
-    else:
-        assert B == 1, "varlen requires packed B=1"
-        assert cu_seqlens.dtype == torch.int32, f"cu_seqlens must be int32, got {cu_seqlens.dtype}"
+    # --- Step 1: handle non-aligned dense by padding ---
+    if cu_seqlens is None and T % CHUNK != 0:
+        _intracard_prefill_padded_dense(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            out,
+            A_log,
+            dt_bias,
+            lower_bound,
+            initial_state,
+            final_state,
+            state_transposed,
+            s_split,
+            allow_fallback,
+        )
+        return
 
-    # Native varlen partial-tile handling (SM100-style): non-aligned seqs use ceil tile
-    # counts + tile_starts so K1/pre_scan/K2 read packed v and mask the partial last tile,
-    # instead of padding the whole input and scattering back.
-    v_is_varlen = False
-    v_tile_starts = None
-    v_tile_actual_lens = None
-    native_total_tiles = None
+    # --- Step 2: compute tile counts and plan segments ---
     if cu_seqlens is None:
         n_seqs = B
         seq_tiles = [T // CHUNK] * B
         T_total = B * T
+        varlen_meta = None
     else:
-        meta = _get_or_build_varlen_metadata(cu_seqlens)
-        seq_lens = meta.seq_lens
-        n_seqs = len(seq_lens)
-        seq_tiles = [(sl + CHUNK - 1) // CHUNK for sl in seq_lens]  # ceil — last tile may be partial
+        assert B == 1
+        assert cu_seqlens.dtype == torch.int32
+        varlen_meta = _get_or_build_varlen_metadata(cu_seqlens)
+        n_seqs = len(varlen_meta.seq_lens)
+        seq_tiles = [(sl + CHUNK - 1) // CHUNK for sl in varlen_meta.seq_lens]
         T_total = T
-        if meta.needs_padding:
-            v_is_varlen = True
-            v_tile_starts = meta.tile_starts
-            v_tile_actual_lens = meta.tile_actual_lens
-            native_total_tiles = meta.total_tiles  # ceil tile sum
 
-    min_seg_tiles = None
-    if s_split is None:
-        s_split = _auto_s_split(device, seq_tiles, H)
-        min_seg_tiles = AUTO_MIN_SEG_TILES
+    plan = plan_cp(device, n_seqs, seq_tiles, T_total, H, s_split, varlen_meta)
 
-    seg_cu, per_seq = _plan_segments(seq_tiles, s_split, min_seg_tiles)
-    n_seg_total = len(seg_cu) - 1
-
-    # Bypass: <= 2 segments per sequence => CP overhead outweighs parallelism.
-    max_n_seg = max(n_seg for _, n_seg in per_seq)
-    if n_seg_total == n_seqs or max_n_seg <= 2:
+    # --- Step 3: bypass if CP isn't beneficial ---
+    max_n_seg = max(n for _, n in plan.per_seq)
+    if plan.n_seg_total == n_seqs or max_n_seg <= 2:
         if not allow_fallback:
             raise ValueError("SM90 intracard CP is not meaningfully splittable for this shape.")
         flash_kda_fwd(
@@ -246,15 +202,60 @@ def _intracard_prefill_impl(
         )
         return
 
-    seg_cu_tiles = _get_plan_tensor(tuple(seg_cu), torch.int32, device)
-    total_tiles = native_total_tiles if v_is_varlen else T_total // CHUNK
+    # --- Step 4: run CP pipeline (K1 → pre_scan → merge → K2) ---
+    _run_cp_pipeline(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        out,
+        A_log,
+        dt_bias,
+        lower_bound,
+        initial_state,
+        final_state,
+        cu_seqlens,
+        state_transposed,
+        plan,
+        device,
+        B,
+        T_total,
+        H,
+    )
 
-    # ---- K1 once ----
-    n_qk = total_tiles * H * CHUNK * D
-    n_cc = total_tiles * H * CHUNK * CHUNK
+
+def _run_cp_pipeline(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    out,
+    A_log,
+    dt_bias,
+    lower_bound,
+    initial_state,
+    final_state,
+    cu_seqlens,
+    state_transposed,
+    plan: CPPlan,
+    device,
+    B,
+    T_total,
+    H,
+) -> None:
+    n_seg = plan.n_seg_total
+    seg_cu_tiles = _get_plan_tensor(tuple(plan.seg_cu), torch.int32, device)
+
+    # ---- K1: prepare workspace tensors (run once) ----
+    n_qk = plan.total_tiles * H * CHUNK * D
+    n_cc = plan.total_tiles * H * CHUNK * CHUNK
     # ws_beta uses tile layout (total_tiles*CHUNK*H), not packed token layout (T_total*H).
     ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta = _get_or_alloc_workspaces(
-        n_qk, n_cc, total_tiles * H * D, total_tiles * CHUNK * H, device, beta.dtype
+        n_qk, n_cc, plan.total_tiles * H * D, plan.total_tiles * CHUNK * H, device, beta.dtype
     )
     beta_flat = torch.empty(T_total * H, dtype=beta.dtype, device=device)
     _copy_beta_flat(beta, beta_flat, H, T_total)
@@ -274,26 +275,16 @@ def _intracard_prefill_impl(
         ws_inv,
         ws_mqk,
         ws_beta,
-        tile_starts=v_tile_starts,
-        tile_actual_lens=v_tile_actual_lens,
-        total_tiles=native_total_tiles,
-        is_varlen=v_is_varlen,
+        tile_starts=plan.v_tile_starts,
+        tile_actual_lens=plan.v_tile_actual_lens,
+        total_tiles=plan.total_tiles if plan.v_is_varlen else None,
+        is_varlen=plan.v_is_varlen,
     )
 
-    # ---- initial_state -> bhvk fp32 ----
-    init_bhvk = None
-    if initial_state is not None:
-        assert initial_state.shape == (n_seqs, H, D, D)
-        init_bhvk = initial_state.to(torch.float32)
-        if state_transposed:
-            init_bhvk = init_bhvk.transpose(-1, -2)
-        init_bhvk = init_bhvk.contiguous()
-
-    # ---- stage 1: pre_scan ----
-    b_seg = _get_scratch("b_seg", (n_seg_total, H, D, D), torch.float32, device)
-    m_seg = _get_scratch("m_seg", (n_seg_total, H, D, D), torch.float32, device)
+    # ---- pre_scan: compute per-segment B/M states ----
+    b_seg = _get_scratch("b_seg", (n_seg, H, D, D), torch.float32, device)
+    m_seg = _get_scratch("m_seg", (n_seg, H, D, D), torch.float32, device)
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
-
     launch_pre_scan(
         v_flat,
         ws_beta,
@@ -304,20 +295,27 @@ def _intracard_prefill_impl(
         b_seg,
         m_seg,
         seg_cu_tiles,
-        v_tile_starts=v_tile_starts,
-        v_tile_actual_lens=v_tile_actual_lens,
-        total_tiles=total_tiles,
+        v_tile_starts=plan.v_tile_starts,
+        v_tile_actual_lens=plan.v_tile_actual_lens,
+        total_tiles=plan.total_tiles,
     )
 
-    # ---- stage 2: merge ----
-    carries = _get_scratch("carries", (n_seg_total, H, D, D), torch.float32, device)
-    launch_merge(carries, m_seg, b_seg, per_seq, init_bhvk)
+    # ---- merge: propagate carries across segments within each sequence ----
+    init_bhvk = None
+    if initial_state is not None:
+        assert initial_state.shape == (plan.n_seqs, H, D, D)
+        init_bhvk = initial_state.to(torch.float32)
+        if state_transposed:
+            init_bhvk = init_bhvk.transpose(-1, -2)
+        init_bhvk = init_bhvk.contiguous()
+    carries = _get_scratch("carries", (n_seg, H, D, D), torch.float32, device)
+    launch_merge(carries, m_seg, b_seg, plan.per_seq, init_bhvk)
 
-    # ---- stage 3: rerun ----
+    # ---- K2: rerun recurrence with merged carries as initial states ----
     out_flat = out.view(1, T_total, H, D) if B > 1 else out
     seg_final = None
     if final_state is not None:
-        seg_final = _get_scratch("seg_final", (n_seg_total, H, D, D), torch.float32, device)
+        seg_final = _get_scratch("seg_final", (n_seg, H, D, D), torch.float32, device)
     launch_k2(
         v_flat,
         ws_beta,
@@ -332,17 +330,18 @@ def _intracard_prefill_impl(
         initial_state=carries,
         final_state=seg_final,
         state_transposed=False,
-        v_tile_starts=v_tile_starts,
-        v_tile_actual_lens=v_tile_actual_lens,
+        v_tile_starts=plan.v_tile_starts,
+        v_tile_actual_lens=plan.v_tile_actual_lens,
     )
 
+    # ---- gather final states (one per original sequence) ----
     if final_state is not None:
-        last_idx = _get_plan_tensor(tuple(first + n_seg - 1 for first, n_seg in per_seq), torch.long, device)
+        last_idx = _get_plan_tensor(tuple(first + n - 1 for first, n in plan.per_seq), torch.long, device)
         if (
             not state_transposed
             and final_state.dtype == torch.float32
             and final_state.is_contiguous()
-            and final_state.shape == (n_seqs, H, D, D)
+            and final_state.shape == (plan.n_seqs, H, D, D)
         ):
             torch.index_select(seg_final, 0, last_idx, out=final_state)
         else:
