@@ -236,12 +236,7 @@ def _copy_beta_flat(beta: torch.Tensor, beta_flat: torch.Tensor, H: int, T_total
 
 
 def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
-    """Padded per-sequence tile boundaries for non-aligned varlen K2 recurrence.
-
-    Returns (cu_pad, cu_tiles): CHUNK-aligned cumulative token offsets and the matching
-    cumulative tile counts. K1 emits ws_beta directly, so varlen no longer needs a
-    host-side beta gather/pad — only these boundaries are required.
-    """
+    """CHUNK-aligned cumulative token offsets and tile counts for non-aligned varlen."""
     key = (seq_lens, str(device), cu_dtype)
     cached = _VARLEN_LAYOUT_CACHE.get(key)
     if cached is not None:
@@ -261,34 +256,16 @@ def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
     return cached
 
 
-def _varlen_metadata_attrs(cu_seqlens: torch.Tensor) -> tuple:
-    return (
+def _get_or_build_varlen_metadata(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None = None) -> _VarlenMetadata:
+    """Cache varlen metadata (seq_lens, tile offsets, padding flags) for cu_seqlens."""
+    cache_key = id(cu_seqlens)
+    attrs = (
         cu_seqlens.data_ptr(),
         tuple(cu_seqlens.shape),
         str(cu_seqlens.device),
         cu_seqlens.dtype,
         int(cu_seqlens._version),
     )
-
-
-def _prune_varlen_metadata_cache() -> None:
-    for key, (tensor_ref, _attrs, _meta) in list(_VARLEN_METADATA_CACHE.items()):
-        if tensor_ref() is None:
-            _VARLEN_METADATA_CACHE.pop(key, None)
-
-
-def _store_varlen_metadata(cu_seqlens: torch.Tensor, attrs: tuple, meta: _VarlenMetadata) -> None:
-    if len(_VARLEN_METADATA_CACHE) >= _VARLEN_LAYOUT_CACHE_MAXSIZE:
-        _prune_varlen_metadata_cache()
-    if len(_VARLEN_METADATA_CACHE) >= _VARLEN_LAYOUT_CACHE_MAXSIZE:
-        _VARLEN_METADATA_CACHE.pop(next(iter(_VARLEN_METADATA_CACHE)))
-    _VARLEN_METADATA_CACHE[id(cu_seqlens)] = (weakref.ref(cu_seqlens), attrs, meta)
-
-
-def _get_or_build_varlen_metadata(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None = None) -> _VarlenMetadata:
-    """Cache CPU varlen metadata (seq_lens, tile offsets, padding flags) for cu_seqlens."""
-    cache_key = id(cu_seqlens)
-    attrs = _varlen_metadata_attrs(cu_seqlens)
     cached = _VARLEN_METADATA_CACHE.get(cache_key)
     if cached is not None:
         tensor_ref, cached_attrs, meta = cached
@@ -329,20 +306,14 @@ def _get_or_build_varlen_metadata(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torc
         tile_starts=tile_starts,
         tile_actual_lens=tile_actual_lens,
     )
-    _store_varlen_metadata(cu_seqlens, attrs, meta)
+    if len(_VARLEN_METADATA_CACHE) >= _VARLEN_LAYOUT_CACHE_MAXSIZE:
+        for k, (ref, _a, _m) in list(_VARLEN_METADATA_CACHE.items()):
+            if ref() is None:
+                _VARLEN_METADATA_CACHE.pop(k, None)
+    if len(_VARLEN_METADATA_CACHE) >= _VARLEN_LAYOUT_CACHE_MAXSIZE:
+        _VARLEN_METADATA_CACHE.pop(next(iter(_VARLEN_METADATA_CACHE)))
+    _VARLEN_METADATA_CACHE[cache_key] = (weakref.ref(cu_seqlens), attrs, meta)
     return meta
-
-
-def _get_or_build_seq_lens(cu_seqlens: torch.Tensor) -> tuple[int, ...]:
-    return _get_or_build_varlen_metadata(cu_seqlens).seq_lens
-
-
-def _get_or_build_cu_tiles(cu_seqlens: torch.Tensor, chunk: int) -> torch.Tensor:
-    if chunk == CHUNK:
-        meta = _get_or_build_varlen_metadata(cu_seqlens)
-        if meta.cu_tiles is not None:
-            return meta.cu_tiles
-    return (cu_seqlens // chunk).to(torch.int32).contiguous()
 
 
 def _get_k1_symbols():
@@ -398,7 +369,7 @@ def flash_kda_fwd(
         final_state: [N, H, D, D] bf16/fp32 or None (written in-place).
         cu_seqlens: [N+1] int32/int64 for variable-length, or None.
         cu_seqlens_cpu: optional CPU copy of cu_seqlens (same values) to skip the
-            GPU->host sync when first building varlen metadata. Trusted, not verified.
+            GPU->host sync when first building varlen metadata.
         state_transposed: False -> [N,H,V,K] (default), True -> [N,H,K,V].
     """
     problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu)
@@ -543,10 +514,7 @@ def _dispatch_cute(
 
     if problem.is_varlen:
         T_total = T
-        if k2_cu_seqlens_tiles_cached is not None:
-            k2_cu_seqlens_tiles = k2_cu_seqlens_tiles_cached
-        else:
-            k2_cu_seqlens_tiles = _get_or_build_cu_tiles(cu_seqlens, K1_CHUNK)
+        k2_cu_seqlens_tiles = k2_cu_seqlens_tiles_cached
     else:
         T_total = B * T
         k2_cu_seqlens_tiles = None
