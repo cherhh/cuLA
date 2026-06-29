@@ -3,9 +3,6 @@
 
 """Shared low-level helpers for the SM90 FlashKDA kernels.
 
-Leaf module (no in-package imports): k1.py/k2.py import these without pulling in
-the fwd.py orchestrator, which would otherwise create a circular dependency
-(fwd -> k1/k2 -> fwd).
 """
 
 from __future__ import annotations
@@ -71,7 +68,9 @@ def _wrap_input(t: torch.Tensor, align: int, *, view_shape=None, cache: bool = F
     """Wrap a tensor as a CuTe tensor via from_dlpack.
 
     ``cache=True``: reuse across launches, keyed by (id, _version, align, view_shape)
-    and verified by weakref. Use ``cache=False`` for per-call buffers (workspaces, states).
+    and verified by weakref. 
+    
+    Use ``cache=False`` for per-call buffers (workspaces, states).
     """
     if not cache:
         src = t if view_shape is None else t.view(view_shape)

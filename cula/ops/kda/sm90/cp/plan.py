@@ -9,7 +9,7 @@ import os
 
 import torch
 
-CHUNK = 16  # match k2.CHUNK
+CHUNK = 16
 MIN_SEG_TILES = int(os.environ.get("CULA_KDA_CP_MIN_SEG_TILES", "4"))
 # auto-plan tile floor: lets one long seq split into ~SM/H segments
 AUTO_MIN_SEG_TILES = int(os.environ.get("CULA_KDA_CP_AUTO_MIN_SEG_TILES", "32"))
