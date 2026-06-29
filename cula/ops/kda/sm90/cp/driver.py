@@ -156,9 +156,9 @@ def _intracard_prefill_impl(
 ) -> None:
     """Prefill with intracard sequence parallelism.
 
-    Non-CHUNK-aligned sequence lengths are padded up to CHUNK and 
-    run through the aligned CP pipeline. 
-    
+    Non-CHUNK-aligned sequence lengths are padded up to CHUNK and
+    run through the aligned CP pipeline.
+
     ``s_split`` caps subsequences per sequence (None = auto).
     """
     assert q.is_cuda and q.dtype == torch.bfloat16
@@ -252,16 +252,28 @@ def _intracard_prefill_impl(
     # ---- K1 once ----
     n_qk = total_tiles * H * CHUNK * D
     n_cc = total_tiles * H * CHUNK * CHUNK
+    # ws_beta uses tile layout (total_tiles*CHUNK*H), not packed token layout (T_total*H).
     ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta = _get_or_alloc_workspaces(
-        n_qk, n_cc, total_tiles * H * D, T_total * H, device, beta.dtype
+        n_qk, n_cc, total_tiles * H * D, total_tiles * CHUNK * H, device, beta.dtype
     )
-    # K1 emits raw beta into the compact ws_beta workspace (read by pre_scan + K2);
-    # for the CHUNK-aligned data CP handles it is byte-identical to beta_flat.
     beta_flat = torch.empty(T_total * H, dtype=beta.dtype, device=device)
     _copy_beta_flat(beta, beta_flat, H, T_total)
     launch_k1(
-        q, k, g, A_log, dt_bias, beta_flat, scale, lower_bound,
-        ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta,
+        q,
+        k,
+        g,
+        A_log,
+        dt_bias,
+        beta_flat,
+        scale,
+        lower_bound,
+        ws_qd,
+        ws_kd,
+        ws_kr,
+        ws_gt,
+        ws_inv,
+        ws_mqk,
+        ws_beta,
         tile_starts=v_tile_starts,
         tile_actual_lens=v_tile_actual_lens,
         total_tiles=native_total_tiles,
@@ -283,7 +295,15 @@ def _intracard_prefill_impl(
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
 
     launch_pre_scan(
-        v_flat, ws_beta, ws_kd, ws_kr, ws_gt, ws_inv, b_seg, m_seg, seg_cu_tiles,
+        v_flat,
+        ws_beta,
+        ws_kd,
+        ws_kr,
+        ws_gt,
+        ws_inv,
+        b_seg,
+        m_seg,
+        seg_cu_tiles,
         v_tile_starts=v_tile_starts,
         v_tile_actual_lens=v_tile_actual_lens,
         total_tiles=total_tiles,
