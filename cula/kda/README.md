@@ -1,102 +1,90 @@
 # `cula.kda` — KDA (Kimi Delta Attention) operators
 
-This package is the **public API + autograd + dispatch** layer for KDA. The actual GPU
-kernels live under `cula/ops/kda/` (CuTe DSL / TVM-FFI) and `csrc/kda/sm100/` (CUDA C++,
-exposed as `cula.cudac`). Dependency direction is one-way: `cula.kda` → `cula.ops.kda`
-→ `cula.cudac`; backends never import `cula.kda`. `import cula` / `import cula.kda` are
-lazy (PEP 562) and pull no CuTeDSL/CUDA at import time.
+## API
 
-> Repo-wide tree: [`../../REPO_LAYOUT.md`](../../REPO_LAYOUT.md).
+| Symbol | Description | Arch | Direction |
+|--------|-------------|------|-----------|
+| `chunk_kda` | Chunked KDA prefill | SM100 (Blackwell) | Forward + backward |
+| `kda_prefill_hopper` | KDA prefill | SM90 (Hopper) | Forward only |
+| `kda_decode` | Single-token decode | SM100 | Forward |
+| `fused_sigmoid_gating_delta_rule_update` | Decode state update | SM100 | Forward |
 
-## Public API (`cula.kda.__init__`)
+## Quick start
 
-| Symbol | API wrapper | Backend (arch) | Notes |
-|--------|-------------|--------|-------|
-| `chunk_kda` | `chunk.py` | modular chunk (`ops/kda/sm100/`) | Full fwd **+ bwd** autograd. Default training & Blackwell prefill path. |
-| `kda_prefill_hopper` | `hopper_prefill.py` (`= cula_kda_prefill`) | two-kernel prefill (`ops/kda/sm90/`, K1+K2) | Forward-only. Hopper. Two-kernel pipeline, *not* a fused kernel. |
-| `kda_decode` | wraps `cula/ops/kda/decode/cute.py` | **decode** | Single-token decode. |
-| `fused_sigmoid_gating_delta_rule_update` | wraps `cula/ops/kda/decode/cute.py` | **decode** | Decode state update. |
+### Prefill (Hopper)
 
-**Not exported:**
-- `flash_kda_prefill` (`cula/ops/kda/experimental/sm100_fused/wrapper.py`) — `[exp]` **unwired / dead path**. No live caller; the Blackwell fused prefill is not yet wired. Backend: `…/experimental/sm100_fused/kda_fully_fused_wip.py` (~6k lines).
-- `intracard_prefill` (`cula/ops/kda/sm90/cp/driver.py`) — SM90 intracard-CP backend, reached from the SM90 wrapper when `use_cp` selects it (see §5).
+```python
+import torch
+from cula.kda import kda_prefill_hopper
 
-## The five pipelines
+B, T, H, D = 1, 1024, 4, 128
+q = torch.randn(B, T, H, D, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device="cuda")
+v = torch.randn(B, T, H, D, dtype=torch.bfloat16, device="cuda")
+g = torch.randn(B, T, H, D, dtype=torch.bfloat16, device="cuda")
+beta = torch.randn(B, T, H, dtype=torch.bfloat16, device="cuda")
+A_log = torch.randn(H, dtype=torch.float32, device="cuda")
+dt_bias = torch.randn(H * D, dtype=torch.float32, device="cuda")
 
-### 1. Modular chunked — `chunk_kda` (SM100, train + Blackwell prefill)
-```
-chunk_kda                         chunk.py            (autograd: ChunkKDAFunction)
-└ fwd  chunk_kda_fwd              chunk_fwd.py        (kernels imported lazily)
-   ├ gate     FLA kda_gate_chunk_cumsum / chunk_local_cumsum
-   ├ intra    chunk_kda_fwd_intra            chunk_intra.py
-   │            └ C++  cula.cudac.chunk_kda_fwd_intra_cuda + recompute_w_u_cuda
-   ├ [CP pre] FLA chunk_gated_delta_rule_fwd_h_pre_process     (only if cp_context)
-   ├ recur    chunk_gated_delta_rule_fwd_h   ops/kda/sm100/delta_h.py  (CuTeDSL)
-   │            └ may dispatch SM100 intracard-CP (see §5)
-   └ out      chunk_gla_fwd_o                ops/kda/sm100/fwd_o.py    (CuTeDSL)
-└ bwd  chunk_kda_bwd              chunk_bwd.py        ← 4 runtimes in one function:
-        C++ recompute_w_u_cuda · FLA chunk_gated_delta_rule_bwd_dhu ·
-        CuTeDSL bwd_wy_dqkg (ops/kda/sm100/bwd_wy_dqkg.py) ·
-        Triton dAv/wy_dqkg (in chunk_bwd.py) + Triton bwd-intra (in chunk_intra.py) ·
-        FLA gate bwd
+o, ht = kda_prefill_hopper(
+    q, k, v, g, beta,
+    A_log=A_log, dt_bias=dt_bias,
+    scale=D**-0.5, lower_bound=-5.0,
+    safe_gate=True, use_gate_in_kernel=True,
+    output_final_state=True,
+)
 ```
 
-### 2. Two-kernel (K1+K2) prefill (Hopper) — `kda_prefill_hopper` (SM90, fwd-only)
-```
-kda_prefill_hopper = cula_kda_prefill     hopper_prefill.py  (HopperChunkKDAFunction)
-└ flash_kda_fwd                           ops/kda/sm90/fwd.py
-   └ _dispatch_cute → launch_k1 (…/sm90/k1.py) + launch_k2 (…/sm90/k2.py)
-      CuTe DSL, CHUNK=16, D=128. Handles varlen padding/repack. CUDA graph disabled.
-```
-> **Note:** this is a **two-kernel pipeline** (K1 prepare → 6 workspace tensors →
-> K2 recurrence), *not* a single fused kernel. The
-> K1/K2 split is what enables SM90 CP (K1 once → K2 rerun, §5).
+### Prefill (Blackwell, with backward)
 
-### 3. Fused prefill (Blackwell) — `flash_kda_prefill` `[exp]`, not exported
-```
-flash_kda_prefill   ops/kda/experimental/sm100_fused/wrapper.py
-                      → KDAChunkwise  ops/kda/experimental/sm100_fused/kda_fully_fused_wip.py (~6k lines)
-```
-**Unwired / dead** — no live caller; the Blackwell fused prefill is not yet wired.
-The **production** Blackwell prefill is the modular `chunk_kda` (§1), not this.
+```python
+from cula.kda import chunk_kda
 
-### 4. Decode — `kda_decode` / `fused_sigmoid_gating_delta_rule_update`
-```
-ops/kda/decode/cute.py   — small / large / varlen kernel variants + a fast dense path.
-   Independent of the sm90/sm100 prefill paths. (FLA reference: ops/kda/decode/reference_fla.py.)
+o, ht = chunk_kda(
+    q, k, v, g, beta,
+    A_log=A_log, dt_bias=dt_bias,
+    use_qk_l2norm_in_kernel=True,
+    use_gate_in_kernel=True,
+    safe_gate=True, lower_bound=-5.0,
+    output_final_state=True,
+)
 ```
 
-### 5. Context Parallel (intracard) — `use_intracard_cp` / `use_cp`
-Surfaced via an explicit `use_intracard_cp: "auto" | bool` (alias `use_cp`) on both prefill
-entries; **default off**. Decision logic is centralized in `cula/ops/kda/policy.py`
-(`sm90_intracard_cp_decision`, `sm100_intracard_cp_decision`): force (`True`) raises on
-unsupported/unsplittable, `"auto"` runs only when supported + heuristically beneficial else
-falls back, `False` disables. `cp_context` (FLA *cross-rank* CP) is orthogonal: when a
-`cp_context` is passed, forcing `use_intracard_cp=True` **raises** (the two cannot be combined),
-while `"auto"`/`False`/default force intracard CP **off** and let `cp_context` proceed.
+### Variable-length (packed)
 
-| | SM90 CP | SM100 CP |
-|--|---------|----------|
-| Entry | `cula_kda_prefill(use_cp=...)` → `intracard_prefill` | `chunk_kda(use_cp=...)` → inside `chunk_gated_delta_rule_fwd_h` |
-| Pipeline | K1 once → `pre_scan` → `merge` → K2 rerun | `intracard_fwd_h`: `pre_scan` → `merge` → `fwd_h` on sub-seqs (recurses with `_no_cp=True`) |
-| Default | off (`None`→off) | off (`None`→env `CULA_INTRACARD_CP`) |
-| Backend | `ops/kda/sm90/cp/{driver,pre_scan,merge,plan}.py` | `ops/kda/sm100/cp/{chunk_delta_h,pre_scan,merge}.py` |
+```python
+cu_seqlens = torch.tensor([0, 256, 500, 1000], dtype=torch.int32, device="cuda")
+q = torch.randn(1, 1000, H, D, dtype=torch.bfloat16, device="cuda")
+# ... k, v, g, beta shaped [1, 1000, H, D] / [1, 1000, H]
 
-## Gotchas / known rough edges
+o, ht = kda_prefill_hopper(
+    q, k, v, g, beta,
+    A_log=A_log, dt_bias=dt_bias,
+    scale=D**-0.5, lower_bound=-5.0,
+    safe_gate=True, use_gate_in_kernel=True,
+    cu_seqlens=cu_seqlens,
+    output_final_state=True,
+)
+```
 
-- **`cp_context` (FLA cross-rank CP) ≠ `use_cp` (cuLA single-card intracard CP).** Both
-  live on `chunk_kda`; they are orthogonal. `cp_context` comes from `fla.ops.cp` (FLA ≥ 0.5.0).
-- **Two CP backends are asymmetric in scope:** SM90 CP parallelizes the whole K1+K2 prefill;
-  SM100 CP parallelizes only the recurrence (`fwd_h`).
-- **SM100 paths not CI-runtime-verified here:** this box is Hopper (no SM100 GPU, `cula.cudac`
-  not built). SM100 (`chunk_kda`, decode, intracard-CP) is import/compile-verified; SM90 is
-  kernel-test verified.
+### Intracard context-parallel
 
-## Runtime cheat-sheet
+```python
+# "auto": use CP only when beneficial for the given sequence lengths
+o, ht = kda_prefill_hopper(
+    q, k, v, g, beta,
+    A_log=A_log, dt_bias=dt_bias,
+    scale=D**-0.5, lower_bound=-5.0,
+    safe_gate=True, use_gate_in_kernel=True,
+    cu_seqlens=cu_seqlens,
+    use_intracard_cp="auto",
+)
+```
 
-| Runtime | Where |
-|---------|-------|
-| CUDA C++ (`cula.cudac`) | chunk intra fwd + recompute_w_u (`csrc/kda/sm100/`) |
-| CuTe DSL / TVM-FFI | SM90 prefill (k1/k2), SM100 recurrence/output/bwd-fused, decode, both CP backends |
-| Triton | bwd intra (`chunk_intra.py`), bwd dAv/wy_dqkg (`chunk_bwd.py`) |
-| FLA (`third_party/`) | gate cumsum/bwd, `chunk_gated_delta_rule_bwd_dhu`, cross-rank CP pre/post-process |
+## Requirements
+
+- **D = 128** (head dimension, currently the only supported value)
+- **bf16** for q/k/v/g/beta, **fp32** for A_log/dt_bias
+- All tensors must be CUDA and contiguous
+- `safe_gate=True` + `lower_bound` in `[-5, 0)` required for Hopper prefill
+- `use_gate_in_kernel=True` required for Hopper prefill
