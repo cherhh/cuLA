@@ -347,14 +347,36 @@ def _check_cp_vs_fla(T, *, with_state, cu, seed):
     cu_cpu = cu.cpu() if cu is not None else None
     with torch.no_grad():
         ref_o, ref_ht = fla_chunk_kda(
-            q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, initial_state=h0,
-            cu_seqlens=cu, cu_seqlens_cpu=cu_cpu, output_final_state=True,
-            use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, safe_gate=True, lower_bound=LB,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=h0,
+            cu_seqlens=cu,
+            cu_seqlens_cpu=cu_cpu,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            safe_gate=True,
+            lower_bound=LB,
         )
         h0_vk = h0.transpose(-2, -1).contiguous() if h0 is not None else None
         cp_o, cp_ht_vk = cula_kda_prefill(
-            q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, initial_state=h0_vk,
-            cu_seqlens=cu, output_final_state=True, safe_gate=True, lower_bound=LB,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=h0_vk,
+            cu_seqlens=cu,
+            output_final_state=True,
+            safe_gate=True,
+            lower_bound=LB,
             use_intracard_cp=True,
         )
     _assert_close(cp_o, ref_o, "o", rm=TOL_FLA_RMSE)
@@ -399,3 +421,25 @@ def test_cp_determinism():
         out, fin = _run_cp(q, k, v, g, beta, None, True, s_split=8)
         assert torch.equal(out, out0), f"non-deterministic out at iter {i}"
         assert torch.equal(fin, fin0), f"non-deterministic ht at iter {i}"
+
+
+@needs_cuda
+def test_cp_determinism_varlen():
+    # Regression guard for the varlen ws_beta under-allocation bug (docs/
+    # kda_sm90_cp_varlen_race.md): ws_beta must be sized total_tiles*CHUNK*H, not
+    # T_total*H — for varlen total_tiles*CHUNK > T_total, so the smaller size let
+    # K1's ws_beta stores run out of bounds into adjacent allocator memory,
+    # nondeterministically corrupting downstream ws_gt/ws_inv -> o. test_cp_determinism
+    # above only covers dense (where total_tiles*CHUNK == T_total), which is why this
+    # went unnoticed. Many short varlen segments (s_split=8 on a 64-tile head)
+    # maximize the OOB tile indices; revert the size fix and this fails fast.
+    lens = [1024, 1, 63, 65, 129]
+    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device="cuda")
+    q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, sum(lens), seed=5)
+    _run_cp.A_log, _run_cp.dt_bias = A_log, dt_bias
+    out0, fin0 = _run_cp(q, k, v, g, beta, None, True, cu=cu, s_split=8)
+    assert not (out0.isnan().any() or out0.isinf().any()), "CP varlen output has NaN/Inf"
+    for i in range(_DETERMINISM_ITERS):
+        out, fin = _run_cp(q, k, v, g, beta, None, True, cu=cu, s_split=8)
+        assert torch.equal(out, out0), f"non-deterministic varlen out at iter {i}"
+        assert torch.equal(fin, fin0), f"non-deterministic varlen ht at iter {i}"
