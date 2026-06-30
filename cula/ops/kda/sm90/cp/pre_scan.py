@@ -30,7 +30,7 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 import torch
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
 
 from cula.ops.kda.sm90._common import movm_t_b16
 from cula.ops.kda.sm90.k2 import (
@@ -60,8 +60,8 @@ def pre_scan_kernel(
     tma_atom_beta: cute.CopyAtom,
     tma_tensor_beta: cute.Tensor,
     H: cutlass.Constexpr[int],
-    total_tiles: cutlass.Constexpr[int],
-    T_total: cutlass.Constexpr[int],
+    total_tiles: cutlass.Int32,
+    T_total: cutlass.Int32,
     seg_cu_tiles: cute.Tensor,
     b_state_g: cute.Tensor,  # flat fp32 [S*H*D*D] gmem, bhvk
     m_state_g: cute.Tensor,  # flat fp32 [S*H*D*D] gmem, bhvk
@@ -470,10 +470,10 @@ def run_pre_scan(
     v_tile_starts: cute.Tensor,
     v_tile_actual_lens: cute.Tensor,
     H: cutlass.Constexpr[int],
-    total_tiles: cutlass.Constexpr[int],
-    T_total: cutlass.Constexpr[int],
+    total_tiles: cutlass.Int32,
+    T_total: cutlass.Int32,
     v_is_varlen: cutlass.Constexpr[bool],
-    S: cutlass.Constexpr[int],
+    S: cutlass.Int32,
     stream: cuda_drv.CUstream,
 ):
     cc_smem = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
@@ -577,31 +577,65 @@ def run_pre_scan(
     )
 
 
-_compiled_cache_prescan: dict = {}
-_compiled_call_style_prescan: dict = {}
+# Compile cache keyed on CONFIG ONLY — total_tiles/T_total/S are dynamic
+# cutlass.Int32, so one compiled kernel serves every batch shape (no per-shape
+# recompile storm). Plain dict + lazy compile (fwd_o style).
+_prescan_kernel_cache: dict = {}
 
 
-def _is_runtime_signature_error(exc: Exception) -> bool:
-    return "input args/kwargs length does not match runtime function signature" in repr(exc)
+def _compile_pre_scan(H, v_is_varlen):
+    sym_t = cute.sym_int()  # T_total (v token extent)
+    sym_bt = cute.sym_int()  # beta/ws_beta (total_tiles*CHUNK*H)
+    sym_qk = cute.sym_int()  # ws_kd/kr (total_tiles*H*CHUNK*D)
+    sym_gt = cute.sym_int()  # ws_gt    (total_tiles*H*D)
+    sym_cc = cute.sym_int()  # ws_inv   (total_tiles*H*CHUNK*CHUNK)
+    sym_seg = cute.sym_int()  # seg_cu_tiles (S+1)
+    sym_st = cute.sym_int()  # b_flat / m_flat (S*H*D*D)
+    sym_vs = cute.sym_int()  # v_tile_starts
+    sym_va = cute.sym_int()  # v_tile_actual_lens
+
+    v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, H, D), stride_order=(2, 1, 0), assumed_align=16)
+    beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_bt,), assumed_align=16)
+    ws_kd_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
+    ws_kr_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
+    ws_gt_fake = make_fake_compact_tensor(cutlass.Float32, (sym_gt,), assumed_align=16)
+    ws_inv_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
+    seg_fake = make_fake_compact_tensor(cutlass.Int32, (sym_seg,), assumed_align=4)
+    b_fake = make_fake_compact_tensor(cutlass.Float32, (sym_st,), assumed_align=16)
+    m_fake = make_fake_compact_tensor(cutlass.Float32, (sym_st,), assumed_align=16)
+    vts_fake = make_fake_compact_tensor(cutlass.Int32, (sym_vs,), assumed_align=4)
+    vtal_fake = make_fake_compact_tensor(cutlass.Int32, (sym_va,), assumed_align=4)
+    stream_fake = make_fake_stream()
+
+    return cute.compile(
+        run_pre_scan,
+        v_fake,
+        beta_fake,
+        ws_kd_fake,
+        ws_kr_fake,
+        ws_gt_fake,
+        ws_inv_fake,
+        seg_fake,
+        b_fake,
+        m_fake,
+        vts_fake,
+        vtal_fake,
+        H,  # Constexpr -> baked
+        cutlass.Int32(1),  # total_tiles -> runtime (placeholder)
+        cutlass.Int32(1),  # T_total -> runtime
+        v_is_varlen,  # Constexpr
+        cutlass.Int32(1),  # S -> runtime
+        stream_fake,
+    )
 
 
-def _call_compiled_prescan(key, compiled_fn, compact_args, full_args) -> None:
-    style = _compiled_call_style_prescan.get(key)
-    if style == "compact":
-        compiled_fn(*compact_args)
-        return
-    if style == "full":
-        compiled_fn(*full_args)
-        return
-
-    try:
-        compiled_fn(*compact_args)
-        _compiled_call_style_prescan[key] = "compact"
-    except Exception as exc:
-        if not _is_runtime_signature_error(exc):
-            raise
-        _compiled_call_style_prescan[key] = "full"
-        compiled_fn(*full_args)
+def _get_compiled_pre_scan(H, v_is_varlen):
+    key = (H, v_is_varlen)
+    cached = _prescan_kernel_cache.get(key)
+    if cached is None:
+        cached = _compile_pre_scan(H, v_is_varlen)
+        _prescan_kernel_cache[key] = cached
+    return cached
 
 
 def launch_pre_scan(
@@ -635,62 +669,24 @@ def launch_pre_scan(
     m_flat = m_state.reshape(-1)
     v_flat = v.view(T_total, H, D)
 
-    key = (S_total, H, total_tiles, v_is_varlen)
-    if key not in _compiled_cache_prescan:
-        stream = _get_current_custream()
-        _compiled_cache_prescan[key] = cute.compile(
-            run_pre_scan,
-            from_dlpack(v_flat.detach(), assumed_align=16),
-            from_dlpack(beta.detach(), assumed_align=16),
-            from_dlpack(ws_kd.detach(), assumed_align=16),
-            from_dlpack(ws_kr.detach(), assumed_align=16),
-            from_dlpack(ws_gt.detach(), assumed_align=16),
-            from_dlpack(ws_inv.detach(), assumed_align=16),
-            from_dlpack(seg_cu_tiles.detach(), assumed_align=4),
-            from_dlpack(b_flat.detach(), assumed_align=16),
-            from_dlpack(m_flat.detach(), assumed_align=16),
-            from_dlpack(v_tile_starts.detach(), assumed_align=4),
-            from_dlpack(v_tile_actual_lens.detach(), assumed_align=4),
-            H=H,
-            total_tiles=total_tiles,
-            T_total=T_total,
-            v_is_varlen=v_is_varlen,
-            S=S_total,
-            stream=stream,
-        )
-
+    compiled_fn = _get_compiled_pre_scan(H, v_is_varlen)
     stream = _get_current_custream()
-    compact_args = (
-        v_flat,
-        beta,
-        ws_kd,
-        ws_kr,
-        ws_gt,
-        ws_inv,
-        seg_cu_tiles,
-        b_flat,
-        m_flat,
-        v_tile_starts,
-        v_tile_actual_lens,
+    # Real tensors + dynamic Int32 dims; TMA descriptors are (re)built inside
+    # run_pre_scan from these Int32 every launch, so one compiled kernel serves all shapes.
+    compiled_fn(
+        from_dlpack(v_flat.detach(), assumed_align=16),
+        from_dlpack(beta.detach(), assumed_align=16),
+        from_dlpack(ws_kd.detach(), assumed_align=16),
+        from_dlpack(ws_kr.detach(), assumed_align=16),
+        from_dlpack(ws_gt.detach(), assumed_align=16),
+        from_dlpack(ws_inv.detach(), assumed_align=16),
+        from_dlpack(seg_cu_tiles.detach(), assumed_align=4),
+        from_dlpack(b_flat.detach(), assumed_align=16),
+        from_dlpack(m_flat.detach(), assumed_align=16),
+        from_dlpack(v_tile_starts.detach(), assumed_align=4),
+        from_dlpack(v_tile_actual_lens.detach(), assumed_align=4),
+        cutlass.Int32(total_tiles),
+        cutlass.Int32(T_total),
+        cutlass.Int32(S_total),
         stream,
     )
-    full_args = (
-        v_flat,
-        beta,
-        ws_kd,
-        ws_kr,
-        ws_gt,
-        ws_inv,
-        seg_cu_tiles,
-        b_flat,
-        m_flat,
-        v_tile_starts,
-        v_tile_actual_lens,
-        H,
-        total_tiles,
-        T_total,
-        v_is_varlen,
-        S_total,
-        stream,
-    )
-    _call_compiled_prescan(key, _compiled_cache_prescan[key], compact_args, full_args)
