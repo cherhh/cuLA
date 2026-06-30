@@ -117,7 +117,7 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 ## Intra-Card Context Parallel
 
-Long sequences can be split into sub-sequences, processed in parallel on one GPU, and merged via a prefix scan — unlocking sequence-dimension parallelism (≈3–7× on long single sequences where `batch × heads` under-utilises the SMs). **Default off; inference-only.** Two surfaces:
+Long sequences can be split into sub-sequences, processed in parallel on one GPU, and merged via a prefix scan — unlocking sequence-dimension parallelism. **Default off; inference-only.** Two surfaces:
 
 ### SM90 — via `kda_prefill_hopper(use_intracard_cp=...)`
 
@@ -132,7 +132,7 @@ Works with **any sequence length** (non-CHUNK-aligned is handled internally) and
 ```python
 o, final_state = kda_prefill_hopper(
     q=q, k=k, v=v, g=g, beta=beta, A_log=A_log, dt_bias=dt_bias,
-    cu_seqlens=cu_seqlens,              # varlen packed (int32); omit for dense
+    cu_seqlens=cu_seqlens,              # varlen packed (int32)
     output_final_state=True, use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0,
     use_intracard_cp="auto",           # "auto" | True | False  (default False)
 )
