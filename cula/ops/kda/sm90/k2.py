@@ -31,6 +31,7 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 import torch
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 CHUNK: int = 16
 D: int = 128
@@ -82,7 +83,7 @@ def k2_kernel(
     tma_atom_beta: cute.CopyAtom,
     tma_tensor_beta: cute.Tensor,
     H: cutlass.Constexpr[int],
-    total_tiles: cutlass.Constexpr[int],
+    total_tiles: cutlass.Int32,
     cu_seqlens_tiles: cute.Tensor,
     v_tile_starts: cute.Tensor,
     v_tile_actual_lens: cute.Tensor,
@@ -618,10 +619,10 @@ def run_k2(
     v_tile_starts: cute.Tensor,
     v_tile_actual_lens: cute.Tensor,
     H: cutlass.Constexpr[int],
-    total_tiles: cutlass.Constexpr[int],
-    O_T_total: cutlass.Constexpr[int],
-    V_T_total: cutlass.Constexpr[int],
-    N: cutlass.Constexpr[int],
+    total_tiles: cutlass.Int32,
+    O_T_total: cutlass.Int32,
+    V_T_total: cutlass.Int32,
+    N: cutlass.Int32,
     has_initial_state: cutlass.Constexpr[bool],
     has_final_state: cutlass.Constexpr[bool],
     state_transposed: cutlass.Constexpr[bool],
@@ -631,7 +632,7 @@ def run_k2(
     cc_smem = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
     kinter_smem = _make_out_kinter_one_stage()
 
-    def make_thd_atom(t, op, t_total: cutlass.Constexpr[int]):
+    def make_thd_atom(t, op, t_total: cutlass.Int32):
         view = cute.make_tensor(
             t.iterator,
             cute.make_layout((t_total, D, H), stride=(H * D, 1, D)),
@@ -742,44 +743,83 @@ def run_k2(
     )
 
 
-_compiled_cache_k2: dict = {}
-_compiled_call_style_k2: dict = {}
+# Compile cache keyed on CONFIG ONLY — the per-batch shape dims
+# (total_tiles, O_T_total, V_T_total, N) are dynamic cutlass.Int32, so one
+# compiled kernel serves every batch shape (no per-shape recompile storm).
+# Plain dict + lazy compile (fwd_o style): compile is always immediately
+# followed by execution.
+_k2_kernel_cache: dict = {}
 _DUMMY_FP32_CACHE: dict[str, torch.Tensor] = {}
 _DUMMY_INT32_CACHE: dict[str, torch.Tensor] = {}
 _CU_STREAM_CACHE: dict[int, object] = {}
-_COMPILED_CACHE_MAXSIZE = 32
 _CU_STREAM_CACHE_MAXSIZE = 64
 
 
-def _store_compiled_k2(key, compiled_fn) -> None:
-    if len(_compiled_cache_k2) >= _COMPILED_CACHE_MAXSIZE:
-        evict_key = next(iter(_compiled_cache_k2))
-        _compiled_cache_k2.pop(evict_key, None)
-        _compiled_call_style_k2.pop(evict_key, None)
-    _compiled_cache_k2[key] = compiled_fn
+def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_varlen):
+    # One sym_int per dynamic tensor extent; shape scalars are runtime Int32.
+    sym_vt = cute.sym_int()  # V_T_total (v token extent)
+    sym_ot = cute.sym_int()  # O_T_total (out token extent; differs from V in varlen)
+    sym_qk = cute.sym_int()  # ws_qd/kd/kr  (total_tiles*H*CHUNK*D)
+    sym_cc = cute.sym_int()  # ws_inv/mqk   (total_tiles*H*CHUNK*CHUNK)
+    sym_gt = cute.sym_int()  # ws_gt        (total_tiles*H*D)
+    sym_bt = cute.sym_int()  # beta/ws_beta (total_tiles*CHUNK*H)
+    sym_cu = cute.sym_int()  # cu_seqlens_tiles (N+1)
+    sym_st = cute.sym_int()  # init/final flat (N*H*D*D or 1)
+    sym_vs = cute.sym_int()  # v_tile_starts (total_tiles or 1)
+    sym_va = cute.sym_int()  # v_tile_actual_lens (total_tiles or 1)
+
+    v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_vt, H, D), stride_order=(2, 1, 0), assumed_align=16)
+    beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_bt,), assumed_align=16)
+    ws_qd_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
+    ws_kd_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
+    ws_kr_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
+    ws_gt_fake = make_fake_compact_tensor(cutlass.Float32, (sym_gt,), assumed_align=16)
+    ws_inv_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
+    ws_mqk_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
+    out_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_ot, H, D), stride_order=(2, 1, 0), assumed_align=16)
+    cu_fake = make_fake_compact_tensor(cutlass.Int32, (sym_cu,), assumed_align=4)
+    init_fake = make_fake_compact_tensor(cutlass.Float32, (sym_st,), assumed_align=16)
+    final_fake = make_fake_compact_tensor(cutlass.Float32, (sym_st,), assumed_align=16)
+    vts_fake = make_fake_compact_tensor(cutlass.Int32, (sym_vs,), assumed_align=4)
+    vtal_fake = make_fake_compact_tensor(cutlass.Int32, (sym_va,), assumed_align=4)
+    stream_fake = make_fake_stream()
+
+    return cute.compile(
+        run_k2,
+        v_fake,
+        beta_fake,
+        ws_qd_fake,
+        ws_kd_fake,
+        ws_kr_fake,
+        ws_gt_fake,
+        ws_inv_fake,
+        ws_mqk_fake,
+        out_fake,
+        cu_fake,
+        init_fake,
+        final_fake,
+        vts_fake,
+        vtal_fake,
+        H,  # Constexpr -> baked
+        cutlass.Int32(1),  # total_tiles -> runtime (placeholder)
+        cutlass.Int32(1),  # O_T_total
+        cutlass.Int32(1),  # V_T_total
+        cutlass.Int32(1),  # N
+        has_initial_state,  # Constexpr
+        has_final_state,  # Constexpr
+        state_transposed,  # Constexpr
+        v_is_varlen,  # Constexpr
+        stream_fake,
+    )
 
 
-def _is_runtime_signature_error(exc: Exception) -> bool:
-    return "input args/kwargs length does not match runtime function signature" in repr(exc)
-
-
-def _call_compiled_k2(key, compiled_fn, compact_args, full_args) -> None:
-    style = _compiled_call_style_k2.get(key)
-    if style == "compact":
-        compiled_fn(*compact_args)
-        return
-    if style == "full":
-        compiled_fn(*full_args)
-        return
-
-    try:
-        compiled_fn(*compact_args)
-        _compiled_call_style_k2[key] = "compact"
-    except Exception as exc:
-        if not _is_runtime_signature_error(exc):
-            raise
-        _compiled_call_style_k2[key] = "full"
-        compiled_fn(*full_args)
+def _get_compiled_k2(H, has_initial_state, has_final_state, state_transposed, v_is_varlen):
+    key = (H, has_initial_state, has_final_state, state_transposed, v_is_varlen)
+    cached = _k2_kernel_cache.get(key)
+    if cached is None:
+        cached = _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_varlen)
+        _k2_kernel_cache[key] = cached
+    return cached
 
 
 def _get_current_custream():
@@ -885,106 +925,34 @@ def launch_k2(
     else:
         final_state_fp32 = _dummy
 
-    key = (
-        N_seqs,
+    compiled_fn = _get_compiled_k2(
         H,
-        total_tiles,
-        O_T_total,
-        V_T_total,
         has_initial_state_flag,
         has_final_state_flag,
         state_transposed,
         v_is_varlen,
     )
     stream = _get_current_custream()
-    # Build CuTe wrappers once (reused for compile + call). Persistent inputs
-    # (v, out, varlen metadata) reuse cached wrappers; per-call buffers are fresh.
-    sv = _wrap_input(v, 16, view_shape=(V_T_total, H, D), cache=True)
-    sbeta = _wrap_input(beta, 16)
-    sqd = _wrap_input(ws_qd, 16)
-    skd = _wrap_input(ws_kd, 16)
-    skr = _wrap_input(ws_kr, 16)
-    sgt = _wrap_input(ws_gt, 16)
-    sinv = _wrap_input(ws_inv, 16)
-    smqk = _wrap_input(ws_mqk, 16)
-    sout = _wrap_input(out, 16, view_shape=(O_T_total, H, D), cache=True)
-    scu = _wrap_input(cu_seqlens_tiles, 4, cache=True)
-    sinit = _wrap_input(initial_state_fp32, 16)
-    sfinal = _wrap_input(final_state_fp32, 16)
-    svts = _wrap_input(v_tile_starts, 4, cache=True)
-    svtal = _wrap_input(v_tile_actual_lens, 4, cache=True)
-
-    if key not in _compiled_cache_k2:
-        compiled = cute.compile(
-            run_k2,
-            sv,
-            sbeta,
-            sqd,
-            skd,
-            skr,
-            sgt,
-            sinv,
-            smqk,
-            sout,
-            scu,
-            sinit,
-            sfinal,
-            svts,
-            svtal,
-            H=H,
-            total_tiles=total_tiles,
-            O_T_total=O_T_total,
-            V_T_total=V_T_total,
-            N=N_seqs,
-            has_initial_state=has_initial_state_flag,
-            has_final_state=has_final_state_flag,
-            state_transposed=state_transposed,
-            v_is_varlen=v_is_varlen,
-            stream=stream,
-        )
-        _store_compiled_k2(key, compiled)
-
-    compact_args = (
-        sv,
-        sbeta,
-        sqd,
-        skd,
-        skr,
-        sgt,
-        sinv,
-        smqk,
-        sout,
-        scu,
-        sinit,
-        sfinal,
-        svts,
-        svtal,
+    # Real tensors + dynamic Int32 dims. The TMA descriptors are (re)built inside
+    # run_k2 from these Int32 every launch, so one compiled kernel serves all shapes.
+    compiled_fn(
+        _wrap_input(v, 16, view_shape=(V_T_total, H, D), cache=True),
+        _wrap_input(beta, 16),
+        _wrap_input(ws_qd, 16),
+        _wrap_input(ws_kd, 16),
+        _wrap_input(ws_kr, 16),
+        _wrap_input(ws_gt, 16),
+        _wrap_input(ws_inv, 16),
+        _wrap_input(ws_mqk, 16),
+        _wrap_input(out, 16, view_shape=(O_T_total, H, D), cache=True),
+        _wrap_input(cu_seqlens_tiles, 4, cache=True),
+        _wrap_input(initial_state_fp32, 16),
+        _wrap_input(final_state_fp32, 16),
+        _wrap_input(v_tile_starts, 4, cache=True),
+        _wrap_input(v_tile_actual_lens, 4, cache=True),
+        cutlass.Int32(total_tiles),
+        cutlass.Int32(O_T_total),
+        cutlass.Int32(V_T_total),
+        cutlass.Int32(N_seqs),
         stream,
     )
-    full_args = (
-        sv,
-        sbeta,
-        sqd,
-        skd,
-        skr,
-        sgt,
-        sinv,
-        smqk,
-        sout,
-        scu,
-        sinit,
-        sfinal,
-        svts,
-        svtal,
-        H,
-        total_tiles,
-        O_T_total,
-        V_T_total,
-        N_seqs,
-        has_initial_state_flag,
-        has_final_state_flag,
-        state_transposed,
-        v_is_varlen,
-        stream,
-    )
-    _call_compiled_k2(key, _compiled_cache_k2[key], compact_args, full_args)
