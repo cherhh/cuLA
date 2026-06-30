@@ -30,6 +30,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 from cula.ops.kda.sm90._common import _wrap_input, add_f16x2_u32, movm_t_b16
 
@@ -66,8 +67,8 @@ def k1_kernel(
     tile_starts: cute.Tensor,
     tile_actual_lens: cute.Tensor,
     H: cutlass.Constexpr[int],
-    total_tiles: cutlass.Constexpr[int],
-    T_total: cutlass.Constexpr[int],
+    total_tiles: cutlass.Int32,
+    T_total: cutlass.Int32,
     scale: cutlass.Constexpr[float],
     gate_scale: cutlass.Constexpr[float],
     is_varlen: cutlass.Constexpr[bool],
@@ -583,8 +584,8 @@ def run_k1(
     tile_starts: cute.Tensor,
     tile_actual_lens: cute.Tensor,
     H: cutlass.Constexpr[int],
-    total_tiles: cutlass.Constexpr[int],
-    T_total: cutlass.Constexpr[int],
+    total_tiles: cutlass.Int32,
+    T_total: cutlass.Int32,
     scale: cutlass.Constexpr[float],
     gate_scale: cutlass.Constexpr[float],
     is_varlen: cutlass.Constexpr[bool],
@@ -689,43 +690,78 @@ def run_k1(
     )
 
 
-_compiled_cache_k1: dict = {}
-_compiled_call_style_k1: dict = {}
+# Compile cache keyed on CONFIG ONLY — total_tiles/T_total are dynamic
+# cutlass.Int32, so one compiled kernel serves every batch shape (no per-shape
+# recompile storm). Plain dict + lazy compile (fwd_o style).
+_k1_kernel_cache: dict = {}
 _CU_STREAM_CACHE: dict[int, object] = {}
 _DUMMY_INT32_CACHE: dict[str, torch.Tensor] = {}
-_COMPILED_CACHE_MAXSIZE = 32
 _CU_STREAM_CACHE_MAXSIZE = 64
 
 
-def _store_compiled_k1(key, compiled_fn) -> None:
-    if len(_compiled_cache_k1) >= _COMPILED_CACHE_MAXSIZE:
-        evict_key = next(iter(_compiled_cache_k1))
-        _compiled_cache_k1.pop(evict_key, None)
-        _compiled_call_style_k1.pop(evict_key, None)
-    _compiled_cache_k1[key] = compiled_fn
+def _compile_k1(H, scale, gate_scale, is_varlen):
+    sym_t = cute.sym_int()  # T_total (q/k/g token extent)
+    sym_al = cute.sym_int()  # a_log
+    sym_bt = cute.sym_int()  # beta (T_total*H)
+    sym_qk = cute.sym_int()  # ws_qd/kd/kr  (total_tiles*H*CHUNK*D)
+    sym_gt = cute.sym_int()  # ws_gt        (total_tiles*H*D)
+    sym_cc = cute.sym_int()  # ws_inv/mqk   (total_tiles*H*CHUNK*CHUNK)
+    sym_wb = cute.sym_int()  # ws_beta      (total_tiles*CHUNK*H)
+    sym_ts = cute.sym_int()  # tile_starts
+    sym_tal = cute.sym_int()  # tile_actual_lens
+
+    q_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, H, D), stride_order=(2, 1, 0), assumed_align=16)
+    k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, H, D), stride_order=(2, 1, 0), assumed_align=16)
+    g_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, H, D), stride_order=(2, 1, 0), assumed_align=16)
+    alog_fake = make_fake_compact_tensor(cutlass.Float32, (sym_al,), assumed_align=16)
+    dt_fake = make_fake_compact_tensor(cutlass.Float32, (H, D), stride_order=(1, 0), assumed_align=16)
+    beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_bt,), assumed_align=16)
+    ws_qd_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
+    ws_kd_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
+    ws_kr_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
+    ws_gt_fake = make_fake_compact_tensor(cutlass.Float32, (sym_gt,), assumed_align=16)
+    ws_inv_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
+    ws_mqk_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
+    ws_beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_wb,), assumed_align=16)
+    ts_fake = make_fake_compact_tensor(cutlass.Int32, (sym_ts,), assumed_align=4)
+    tal_fake = make_fake_compact_tensor(cutlass.Int32, (sym_tal,), assumed_align=4)
+    stream_fake = make_fake_stream()
+
+    return cute.compile(
+        run_k1,
+        q_fake,
+        k_fake,
+        g_fake,
+        alog_fake,
+        dt_fake,
+        beta_fake,
+        ws_qd_fake,
+        ws_kd_fake,
+        ws_kr_fake,
+        ws_gt_fake,
+        ws_inv_fake,
+        ws_mqk_fake,
+        ws_beta_fake,
+        ts_fake,
+        tal_fake,
+        H,  # Constexpr -> baked
+        cutlass.Int32(1),  # total_tiles -> runtime (placeholder)
+        cutlass.Int32(1),  # T_total -> runtime
+        scale,  # Constexpr
+        gate_scale,  # Constexpr
+        is_varlen,  # Constexpr
+        stream_fake,
+        options="--opt-level=3",
+    )
 
 
-def _is_runtime_signature_error(exc: Exception) -> bool:
-    return "input args/kwargs length does not match runtime function signature" in repr(exc)
-
-
-def _call_compiled_k1(key, compiled_fn, compact_args, full_args) -> None:
-    style = _compiled_call_style_k1.get(key)
-    if style == "compact":
-        compiled_fn(*compact_args)
-        return
-    if style == "full":
-        compiled_fn(*full_args)
-        return
-
-    try:
-        compiled_fn(*compact_args)
-        _compiled_call_style_k1[key] = "compact"
-    except Exception as exc:
-        if not _is_runtime_signature_error(exc):
-            raise
-        _compiled_call_style_k1[key] = "full"
-        compiled_fn(*full_args)
+def _get_compiled_k1(H, scale, gate_scale, is_varlen):
+    key = (H, scale, gate_scale, is_varlen)
+    cached = _k1_kernel_cache.get(key)
+    if cached is None:
+        cached = _compile_k1(H, scale, gate_scale, is_varlen)
+        _k1_kernel_cache[key] = cached
+    return cached
 
 
 def _get_current_custream():
@@ -786,96 +822,27 @@ def launch_k1(
         tile_starts = dummy
         tile_actual_lens = dummy
 
-    key = (T_total, H, total_tiles, scale, gate_scale, is_varlen)
+    compiled_fn = _get_compiled_k1(H, scale, gate_scale, is_varlen)
     stream = _get_current_custream()
-    # Build CuTe wrappers once (reused for compile + call). Persistent inputs
-    # (q, k, g, A_log, dt_bias, varlen metadata) reuse cached wrappers; per-call
-    # workspace outputs are wrapped fresh.
-    sq = _wrap_input(q, 16, view_shape=(T_total, H, D), cache=True)
-    sk = _wrap_input(k, 16, view_shape=(T_total, H, D), cache=True)
-    sg = _wrap_input(g, 16, view_shape=(T_total, H, D), cache=True)
-    salog = _wrap_input(A_log, 16, cache=True)
-    sdt = _wrap_input(dt_bias, 16, cache=True)
-    sbeta = _wrap_input(beta, 16)
-    sqd = _wrap_input(ws_qd, 16)
-    skd = _wrap_input(ws_kd, 16)
-    skr = _wrap_input(ws_kr, 16)
-    sgt = _wrap_input(ws_gt, 16)
-    sinv = _wrap_input(ws_inv, 16)
-    smqk = _wrap_input(ws_mqk, 16)
-    sws_beta = _wrap_input(ws_beta, 16)
-    sts = _wrap_input(tile_starts, 4, cache=True)
-    stal = _wrap_input(tile_actual_lens, 4, cache=True)
-
-    if key not in _compiled_cache_k1:
-        compiled = cute.compile(
-            run_k1,
-            sq,
-            sk,
-            sg,
-            salog,
-            sdt,
-            sbeta,
-            sqd,
-            skd,
-            skr,
-            sgt,
-            sinv,
-            smqk,
-            sws_beta,
-            sts,
-            stal,
-            H=H,
-            total_tiles=total_tiles,
-            T_total=T_total,
-            scale=scale,
-            gate_scale=gate_scale,
-            is_varlen=is_varlen,
-            stream=stream,
-            options="--opt-level=3",
-        )
-        _store_compiled_k1(key, compiled)
-
-    compact_args = (
-        sq,
-        sk,
-        sg,
-        salog,
-        sdt,
-        sbeta,
-        sqd,
-        skd,
-        skr,
-        sgt,
-        sinv,
-        smqk,
-        sws_beta,
-        sts,
-        stal,
+    # Real tensors + dynamic Int32 dims; TMA descriptors are (re)built inside
+    # run_k1 from these Int32 every launch, so one compiled kernel serves all shapes.
+    compiled_fn(
+        _wrap_input(q, 16, view_shape=(T_total, H, D), cache=True),
+        _wrap_input(k, 16, view_shape=(T_total, H, D), cache=True),
+        _wrap_input(g, 16, view_shape=(T_total, H, D), cache=True),
+        _wrap_input(A_log, 16, cache=True),
+        _wrap_input(dt_bias, 16, cache=True),
+        _wrap_input(beta, 16),
+        _wrap_input(ws_qd, 16),
+        _wrap_input(ws_kd, 16),
+        _wrap_input(ws_kr, 16),
+        _wrap_input(ws_gt, 16),
+        _wrap_input(ws_inv, 16),
+        _wrap_input(ws_mqk, 16),
+        _wrap_input(ws_beta, 16),
+        _wrap_input(tile_starts, 4, cache=True),
+        _wrap_input(tile_actual_lens, 4, cache=True),
+        cutlass.Int32(total_tiles),
+        cutlass.Int32(T_total),
         stream,
     )
-    full_args = (
-        sq,
-        sk,
-        sg,
-        salog,
-        sdt,
-        sbeta,
-        sqd,
-        skd,
-        skr,
-        sgt,
-        sinv,
-        smqk,
-        sws_beta,
-        sts,
-        stal,
-        H,
-        total_tiles,
-        T_total,
-        scale,
-        gate_scale,
-        is_varlen,
-        stream,
-    )
-    _call_compiled_k1(key, _compiled_cache_k1[key], compact_args, full_args)
