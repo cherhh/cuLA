@@ -3,10 +3,11 @@
 
 """SM90 KDA prefill wrapper for the two-kernel K1+K2 CuTeDSL path"""
 
+import contextlib
 from typing import Literal
 
 import torch
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from torch.amp import custom_bwd, custom_fwd
 
 from cula.ops.kda.policy import (
     IntracardCPMode,
@@ -25,37 +26,78 @@ def _beta_logits_bf16(beta: torch.Tensor) -> torch.Tensor:
     return torch.logit(beta.float(), eps=1e-6).to(torch.bfloat16)
 
 
+def _cast_beta_bf16(beta: torch.Tensor) -> torch.Tensor:
+    return beta if beta.dtype == torch.bfloat16 else beta.to(torch.bfloat16)
+
+
+def _contig(t: torch.Tensor | None) -> torch.Tensor | None:
+    """None-safe contiguous fixup (FLA input_guard semantics, per-call cheap)."""
+    if t is None or t.is_contiguous():
+        return t
+    return t.contiguous()
+
+
+def _guarded_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    output_final_state: bool = False,
+    lower_bound: float | None = None,
+    cu_seqlens: torch.IntTensor | None = None,
+    cu_seqlens_cpu: torch.IntTensor | None = None,
+    use_intracard_cp: IntracardCPMode | None = None,
+    beta_is_logits: bool = False,
+    out: torch.Tensor | None = None,
+    final_state: torch.Tensor | None = None,
+):
+    # Lightweight input guard: fix non-contiguous tensors and enter the
+    # inputs' device only when it is not already current.
+    q, k, v, g, beta = _contig(q), _contig(k), _contig(v), _contig(g), _contig(beta)
+    A_log, dt_bias = _contig(A_log), _contig(dt_bias)
+    initial_state, cu_seqlens = _contig(initial_state), _contig(cu_seqlens)
+    device_ctx = (
+        torch.cuda.device(q.device.index)
+        if q.device.index != torch.cuda.current_device()
+        else contextlib.nullcontext()
+    )
+    with device_ctx:
+        return HopperChunkKDAFunction._forward_impl(
+            q, k, v, g, beta, A_log, dt_bias, scale, initial_state, output_final_state,
+            lower_bound, cu_seqlens, cu_seqlens_cpu, use_intracard_cp,
+            beta_is_logits, out, final_state,
+        )
+
+
 class HopperChunkKDAFunction(torch.autograd.Function):
     @staticmethod
-    @input_guard
-    @autocast_custom_fwd
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        scale: float,
-        initial_state: torch.Tensor,
-        output_final_state: bool = False,
-        lower_bound: float | None = None,
-        cu_seqlens: torch.IntTensor | None = None,
-        cu_seqlens_cpu: torch.IntTensor | None = None,
-        use_intracard_cp: IntracardCPMode | None = None,
+    @custom_fwd(device_type="cuda")
+    def forward(ctx, *args):
+        return _guarded_forward(*args)
+
+    @staticmethod
+    def _forward_impl(
+        q, k, v, g, beta, A_log, dt_bias, scale, initial_state, output_final_state,
+        lower_bound, cu_seqlens, cu_seqlens_cpu, use_intracard_cp,
+        beta_is_logits, out, final_state,
     ):
         batch_size, seq_len, num_heads, head_dim = q.shape
 
-        out = torch.empty_like(v)
+        if out is None:
+            out = torch.empty_like(v)
 
         n_seqs = batch_size
         if cu_seqlens is not None:
             n_seqs = cu_seqlens.numel() - 1
 
-        final_state = None
-        if output_final_state:
+        if not output_final_state:
+            final_state = None
+        elif final_state is None:
             final_state = torch.empty(
                 n_seqs,
                 num_heads,
@@ -66,9 +108,13 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             )
 
         g = _cast_g_bf16(g)
-        # FLA convention: beta is post-sigmoid [0,1].
-        # cuLA kernel applies sigmoid internally, so convert to pre-sigmoid logits.
-        beta = _beta_logits_bf16(beta)
+        if beta_is_logits:
+            # Kernel-native convention: beta is already pre-sigmoid logits.
+            beta = _cast_beta_bf16(beta)
+        else:
+            # FLA convention: beta is post-sigmoid [0,1].
+            # cuLA kernel applies sigmoid internally, so convert to pre-sigmoid logits.
+            beta = _beta_logits_bf16(beta)
 
         cp_decision = sm90_intracard_cp_decision(q, cu_seqlens, cu_seqlens_cpu, use_intracard_cp)
         if cp_decision.enabled:
@@ -114,8 +160,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         return out.to(q.dtype), final_state
 
     @staticmethod
-    @input_guard
-    @autocast_custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, do, dht):
         raise NotImplementedError("Backward pass is not implemented yet.")
 
@@ -131,12 +176,15 @@ def cula_kda_prefill(
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
     use_gate_in_kernel: bool = True,
     safe_gate: bool = False,
     lower_bound: float | None = None,
     cu_seqlens: torch.IntTensor | None = None,
     chunk_indices: torch.IntTensor | None = None,
     use_intracard_cp: Literal["auto"] | bool | None = None,
+    out: torch.Tensor | None = None,
+    final_state: torch.Tensor | None = None,
     **kwargs,
 ):
     r"""
@@ -170,6 +218,12 @@ def cula_kda_prefill(
         use_qk_l2norm_in_kernel (bool):
             Accepted for API compatibility; CuTeDSL always applies L2-norm
             internally. Default: `False`.
+        use_beta_sigmoid_in_kernel (bool):
+            When `True`, `beta` is pre-sigmoid logits and is passed straight
+            to the kernel (which always applies sigmoid internally) — no
+            host-side logit round-trip. When `False` (FLA convention),
+            `beta` is post-sigmoid and is converted back to logits first.
+            Default: `False`.
         use_gate_in_kernel (bool):
             Must be `True`; CuTeDSL computes the gate internally. Default: `True`.
         safe_gate (bool):
@@ -190,6 +244,14 @@ def cula_kda_prefill(
             requires CP support and raises on rejection, ``"auto"`` falls back
             to the serial K1+K2 path, and ``False`` disables CP. ``use_cp`` is
             accepted as a compatibility alias.
+        out (Optional[torch.Tensor]):
+            Preallocated output buffer, bf16, same shape as ``v``, written in
+            place (also returned). ``None`` allocates per call. Default: `None`.
+        final_state (Optional[torch.Tensor]):
+            Preallocated final-state buffer, fp32, shape `[N, H, K, V]`,
+            written in place (also returned). Requires
+            ``output_final_state=True``. ``None`` allocates per call.
+            Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -258,9 +320,31 @@ def cula_kda_prefill(
             f"(num_kv_heads={num_kv_heads} != num_qk_heads={num_qk_heads}); native GVA is a follow-up change."
         )
 
+    if out is not None:
+        if out.shape != v.shape or out.dtype != torch.bfloat16 or not out.is_cuda or not out.is_contiguous():
+            raise ValueError(
+                f"out must be a contiguous CUDA bfloat16 tensor of shape {tuple(v.shape)}, "
+                f"got dtype={out.dtype}, shape={tuple(out.shape)}"
+            )
+    if final_state is not None:
+        if not output_final_state:
+            raise ValueError("final_state buffer requires output_final_state=True.")
+        n_seqs = cu_seqlens.numel() - 1 if cu_seqlens is not None else q.shape[0]
+        expected = (n_seqs, num_kv_heads, head_dim, head_dim)
+        if (
+            final_state.shape != expected
+            or final_state.dtype != torch.float32
+            or not final_state.is_cuda
+            or not final_state.is_contiguous()
+        ):
+            raise ValueError(
+                f"final_state must be a contiguous CUDA float32 tensor of shape {expected}, "
+                f"got dtype={final_state.dtype}, shape={tuple(final_state.shape)}"
+            )
+
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = HopperChunkKDAFunction.apply(
+    fwd_args = (
         q,
         k,
         v,
@@ -275,5 +359,17 @@ def cula_kda_prefill(
         cu_seqlens,
         cu_seqlens_cpu,
         use_intracard_cp,
+        use_beta_sigmoid_in_kernel,
+        out,
+        final_state,
     )
+    # Forward-only op: skip the autograd.Function machinery unless a graph
+    # could actually be recorded (backward raises NotImplementedError anyway).
+    needs_grad = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in (q, k, v, g, beta, A_log, dt_bias, initial_state)
+    )
+    if needs_grad:
+        o, final_state = HopperChunkKDAFunction.apply(*fwd_args)
+    else:
+        o, final_state = _guarded_forward(*fwd_args)
     return o, final_state
