@@ -22,7 +22,6 @@ CuteDSL port of FlashKDA K2 (Recurrence).
 Produces workspace tensors consumed by subsequent stages.
 """
 
-from __future__ import annotations
 
 import cuda.bindings.driver as cuda_drv
 import cutlass

@@ -22,7 +22,6 @@ CuteDSL port of FlashKDA K1.
 Produces 6 workspace tensors consumed by K2: ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk.
 """
 
-from __future__ import annotations
 
 import cuda.bindings.driver as cuda_drv
 import cutlass
