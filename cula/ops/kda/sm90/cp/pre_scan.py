@@ -213,6 +213,9 @@ def pre_scan_kernel(
     tCrKd = thr_mma.make_fragment_A(thr_mma.partition_A(sKd_ref))
     tCrState = thr_mma.make_fragment_B(thr_mma.partition_B(sState_ref))
     tCrU = thr_mma.make_fragment_C(tiled_mma.partition_shape_C((CHUNK, D)))
+    # Separate accumulator for the M-chain's kd@M so it can issue ahead of the
+    # S-chain's dependent stages instead of serializing behind them.
+    tCrU_m = thr_mma.make_fragment_C(tiled_mma.partition_shape_C((CHUNK, D)))
 
     tCrKd_cv = smem_thr_copy_A.retile(tCrKd)
     tCrState_cv = smem_thr_copy_B_T.retile(tCrState)
@@ -320,6 +323,17 @@ def pre_scan_kernel(
                 cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
                 cute.gemm(tiled_mma, tCrU, tCrKd, tCrState, tCrU)
 
+            # M-chain front half (kd @ M), hoisted: independent of the S-chain,
+            # so its MMAs overlap the S-chain's dependent sigmoid/movmatrix/INV
+            # stages instead of serializing behind them.
+            tCrU_m.fill(0.0)
+            for k in cutlass.range_constexpr(D // 16):
+                sKd_k = sKd_tile[None, None, 0, k]
+                sM_k = sM_tile[None, None, 0, k]
+                cute.copy(smem_tiled_copy_B_T, smem_thr_copy_B_T.partition_S(sM_k), tCrState_cv)
+                cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
+                cute.gemm(tiled_mma, tCrU_m, tCrKd, tCrState, tCrU_m)
+
             # sigmoid(beta) * (v - u_pre)
             lane_in_warp = tidx % 32
             Rrow0 = lane_in_warp // 4
@@ -381,21 +395,14 @@ def pre_scan_kernel(
                     tCsState_blk[ii] = cutlass.BFloat16(old + tCrUpd_blk[ii])
 
             # ===== M-chain (M_seg): V:=0 duality =====
-            # kd @ M
-            tCrU.fill(0.0)
-            for k in cutlass.range_constexpr(D // 16):
-                sKd_k = sKd_tile[None, None, 0, k]
-                sM_k = sM_tile[None, None, 0, k]
-                cute.copy(smem_tiled_copy_B_T, smem_thr_copy_B_T.partition_S(sM_k), tCrState_cv)
-                cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
-                cute.gemm(tiled_mma, tCrU, tCrKd, tCrState, tCrU)
+            # (kd @ M already issued above, ahead of the S-chain's dependent stages.)
 
             # sigmoid(beta) * (0 - u_pre)
-            for i in cutlass.range_constexpr(cute.size(tCrU)):
+            for i in cutlass.range_constexpr(cute.size(tCrU_m)):
                 ii: cutlass.Constexpr[int] = i
                 sub_i: cutlass.Constexpr[int] = (ii % 4) // 2
                 sig = sig0 if sub_i == 0 else sig1
-                diff = cutlass.Float32(0.0) - tCrU[ii]
+                diff = cutlass.Float32(0.0) - tCrU_m[ii]
                 tCrU_pre_bf16[ii] = cutlass.BFloat16(diff * sig)
             for i in cutlass.range_constexpr(cute.size(tCrU_pre_u32)):
                 ii: cutlass.Constexpr[int] = i
