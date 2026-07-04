@@ -214,20 +214,80 @@ _K1_SYMBOLS = None
 _K2_LAUNCHER = None
 
 
-def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, device, dtype):
-    """Allocate K1/K2 scratch tensors (ws_qd/kd/kr/gt/inv/mqk, ws_beta).
+_WS_ARENA_ALIGN = 256
+_WS_ARENA: dict = {}  # (device, stream_ptr) -> [arena uint8 tensor, {sizes_key: views}]
+_WS_ARENA_MAXSIZE = 8
+_WS_VIEWS_MAXSIZE = 32
+
+
+def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, n_beta_flat: int, device, dtype):
+    """Carve K1/K2 scratch (ws_qd/kd/kr/gt/inv/mqk, ws_beta, beta_flat) out of a
+    grow-only per-(device, stream) arena instead of allocating per call.
 
     ws_beta holds raw beta in the compact wt_l tile layout (K1 emits, K2 reads),
-    sized total_tiles*H*CHUNK == T_total*H.
+    sized total_tiles*H*CHUNK. beta_flat stages the [H, T] transposed original
+    beta consumed by K1.
+
+    Reusing the arena across calls is safe because every producer/consumer runs
+    on the keyed stream: the next call's K1 cannot overwrite a workspace before
+    this call's K2 finished reading it. Calls on different streams get
+    independent arenas.
     """
-    ws_qd = torch.empty(n_qk, dtype=torch.bfloat16, device=device)
-    ws_kd = torch.empty_like(ws_qd)
-    ws_kr = torch.empty_like(ws_qd)
-    ws_gt = torch.empty(n_gt, dtype=torch.float32, device=device)
-    ws_inv = torch.empty(n_cc, dtype=torch.bfloat16, device=device)
-    ws_mqk = torch.empty_like(ws_inv)
-    ws_beta = torch.empty(n_beta, dtype=dtype, device=device)
-    return ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta
+    stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
+    arena_key = (str(device), stream_ptr)
+    sizes_key = (n_qk, n_cc, n_gt, n_beta, n_beta_flat, dtype)
+    entry = _WS_ARENA.get(arena_key)
+    if entry is not None:
+        views = entry[1].get(sizes_key)
+        if views is not None:
+            return views
+
+    nbytes_list = (
+        n_qk * 2,  # ws_qd bf16
+        n_qk * 2,  # ws_kd
+        n_qk * 2,  # ws_kr
+        n_gt * 4,  # ws_gt fp32
+        n_cc * 2,  # ws_inv bf16
+        n_cc * 2,  # ws_mqk
+        n_beta * dtype.itemsize,  # ws_beta
+        n_beta_flat * dtype.itemsize,  # beta_flat staging
+    )
+    offsets = []
+    total = 0
+    for nbytes in nbytes_list:
+        offsets.append(total)
+        total += -(-nbytes // _WS_ARENA_ALIGN) * _WS_ARENA_ALIGN
+
+    if entry is None or entry[0].numel() < total:
+        if entry is None and len(_WS_ARENA) >= _WS_ARENA_MAXSIZE:
+            _WS_ARENA.pop(next(iter(_WS_ARENA)))
+        # Growing replaces the arena; stale views die with the old entry.
+        entry = [torch.empty(total, dtype=torch.uint8, device=device), {}]
+        _WS_ARENA[arena_key] = entry
+    arena = entry[0]
+
+    def carve(idx: int, numel: int, view_dtype: torch.dtype):
+        return arena.narrow(0, offsets[idx], numel * view_dtype.itemsize).view(view_dtype)
+
+    views = (
+        carve(0, n_qk, torch.bfloat16),
+        carve(1, n_qk, torch.bfloat16),
+        carve(2, n_qk, torch.bfloat16),
+        carve(3, n_gt, torch.float32),
+        carve(4, n_cc, torch.bfloat16),
+        carve(5, n_cc, torch.bfloat16),
+        carve(6, n_beta, dtype),
+        carve(7, n_beta_flat, dtype),
+    )
+    if len(entry[1]) >= _WS_VIEWS_MAXSIZE:
+        entry[1].pop(next(iter(entry[1])))
+    entry[1][sizes_key] = views
+    return views
+
+
+def clear_workspace_cache() -> None:
+    """Drop all cached workspace arenas (frees the GPU memory they pin)."""
+    _WS_ARENA.clear()
 
 
 def _copy_beta_flat(beta: torch.Tensor, beta_flat: torch.Tensor, H: int, T_total: int) -> None:
@@ -523,14 +583,13 @@ def _dispatch_cute(
 
     n_qk = total_tiles * H * K1_CHUNK * K1_D
     n_cc = total_tiles * H * K1_CHUNK * K1_CHUNK
-    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta = _get_or_alloc_workspaces(
-        n_qk, n_cc, total_tiles * H * K1_D, T_total * H, q.device, beta.dtype
+    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta, k1_beta_flat = _get_or_alloc_workspaces(
+        n_qk, n_cc, total_tiles * H * K1_D, T_total * H, k1_T_total * H, q.device, beta.dtype
     )
 
-    # K1 reads beta from its transposed original-packed layout and emits raw beta into
-    # the compact ws_beta workspace (tail rows = -80); K2 reads ws_beta directly, so
-    # varlen needs no host-side beta padding/gather.
-    k1_beta_flat = torch.empty(k1_T_total * H, dtype=k1_beta.dtype, device=k1_beta.device)
+    # K1 reads beta from its transposed original-packed layout (beta_flat) and emits
+    # raw beta into the compact ws_beta workspace (tail rows = -80); K2 reads ws_beta
+    # directly, so varlen needs no host-side beta padding/gather.
     _copy_beta_flat(k1_beta, k1_beta_flat, H, k1_T_total)
 
     k2_initial_state = None
