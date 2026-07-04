@@ -193,18 +193,29 @@ def _validate_inputs(
     )
 
 
+_DEVICE_ARCH_CACHE: dict[int, str] = {}
+
+
 @contextmanager
 def _cute_arch_for_device(device: torch.device):
-    """Temporarily set CUTE_DSL_ARCH for the given device."""
-    major, minor = torch.cuda.get_device_capability(device)
-    arch = _CUTE_ARCH_BY_CC.get((major, minor))
+    """Ensure CUTE_DSL_ARCH matches the device before any lazy cute.compile.
+
+    Check-and-set without popping: compiles only happen on the first call per
+    kernel config, so re-writing (and previously popping) the env var on every
+    dispatch was pure overhead. Leaving it set is safe — any other arch's
+    dispatch path performs the same check-and-set before its own compiles.
+    """
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    arch = _DEVICE_ARCH_CACHE.get(idx)
     if arch is None:
-        raise RuntimeError(f"unsupported compute capability sm_{major}{minor}")
-    os.environ["CUTE_DSL_ARCH"] = arch
-    try:
-        yield
-    finally:
-        os.environ.pop("CUTE_DSL_ARCH", None)
+        major, minor = torch.cuda.get_device_capability(device)
+        arch = _CUTE_ARCH_BY_CC.get((major, minor))
+        if arch is None:
+            raise RuntimeError(f"unsupported compute capability sm_{major}{minor}")
+        _DEVICE_ARCH_CACHE[idx] = arch
+    if os.environ.get("CUTE_DSL_ARCH") != arch:
+        os.environ["CUTE_DSL_ARCH"] = arch
+    yield
 
 
 # ---- Cached scratch workspaces ----
