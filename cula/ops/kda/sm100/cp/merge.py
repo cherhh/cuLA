@@ -14,7 +14,6 @@ Input:  hm [S_split, H, K, V+K] fp32 — packed (he, m) from pre_scan
 Output: h  [num_non_first, H, K, V] fp32
 """
 
-from __future__ import annotations
 
 import functools
 
