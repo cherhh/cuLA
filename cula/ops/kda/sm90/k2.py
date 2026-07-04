@@ -763,7 +763,10 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
     sym_gt = cute.sym_int()  # ws_gt        (total_tiles*H*D)
     sym_bt = cute.sym_int()  # beta/ws_beta (total_tiles*CHUNK*H)
     sym_cu = cute.sym_int()  # cu_seqlens_tiles (N+1)
-    sym_st = cute.sym_int()  # init/final flat (N*H*D*D or 1)
+    # init/final need SEPARATE syms: their runtime sizes differ whenever exactly
+    # one of them is the 1-element dummy, and tvm-ffi binds each sym to one value.
+    sym_sti = cute.sym_int()  # initial state flat (N*H*D*D or 1)
+    sym_stf = cute.sym_int()  # final state flat (N*H*D*D or 1)
     sym_vs = cute.sym_int()  # v_tile_starts (total_tiles or 1)
     sym_va = cute.sym_int()  # v_tile_actual_lens (total_tiles or 1)
 
@@ -777,8 +780,8 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
     ws_mqk_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
     out_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_ot, H, D), stride_order=(2, 1, 0), assumed_align=16)
     cu_fake = make_fake_compact_tensor(cutlass.Int32, (sym_cu,), assumed_align=4)
-    init_fake = make_fake_compact_tensor(cutlass.Float32, (sym_st,), assumed_align=16)
-    final_fake = make_fake_compact_tensor(cutlass.Float32, (sym_st,), assumed_align=16)
+    init_fake = make_fake_compact_tensor(cutlass.Float32, (sym_sti,), assumed_align=16)
+    final_fake = make_fake_compact_tensor(cutlass.Float32, (sym_stf,), assumed_align=16)
     vts_fake = make_fake_compact_tensor(cutlass.Int32, (sym_vs,), assumed_align=4)
     vtal_fake = make_fake_compact_tensor(cutlass.Int32, (sym_va,), assumed_align=4)
     stream_fake = make_fake_stream()
