@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 
 from cula.ops.kda.sm90.cp.merge import launch_merge
-from cula.ops.kda.sm90.cp.plan import CPPlan, plan_cp
+from cula.ops.kda.sm90.cp.plan import CP_ENGAGE_MARGIN, CPPlan, estimate_cp_speedup, plan_cp
 from cula.ops.kda.sm90.cp.pre_scan import launch_pre_scan
 from cula.ops.kda.sm90.fwd import (
     _copy_beta_flat,
@@ -180,8 +180,14 @@ def _intracard_prefill_impl(
     plan = plan_cp(device, n_seqs, seq_tiles, T_total, H, s_split, varlen_meta)
 
     # --- Step 3: bypass if CP isn't beneficial ---
+    # Structural: not splittable at all. With allow_fallback (auto semantics),
+    # additionally consult the calibrated cost model; forced callers
+    # (allow_fallback=False) run CP whenever the shape is splittable.
     max_n_seg = max(n for _, n in plan.per_seq)
-    if plan.n_seg_total == n_seqs or max_n_seg <= 2:
+    bypass = plan.n_seg_total == n_seqs or max_n_seg <= 2
+    if not bypass and allow_fallback:
+        bypass = estimate_cp_speedup(device, seq_tiles, plan.seg_cu, plan.per_seq, H) < CP_ENGAGE_MARGIN
+    if bypass:
         if not allow_fallback:
             raise ValueError("SM90 intracard CP is not meaningfully splittable for this shape.")
         flash_kda_fwd(

@@ -13,8 +13,32 @@ import torch
 CHUNK = 16
 MIN_SEG_TILES = int(os.environ.get("CULA_KDA_CP_MIN_SEG_TILES", "4"))
 AUTO_MIN_SEG_TILES = int(os.environ.get("CULA_KDA_CP_AUTO_MIN_SEG_TILES", "32"))
+# Superseded by estimate_cp_speedup for the auto engage decision; kept for
+# env-var compatibility and external callers.
 MIN_BENEFICIAL_SEG = int(os.environ.get("CULA_KDA_CP_MIN_SEG", "5"))
 ENGAGE_MIN_TILES = int(os.environ.get("CULA_KDA_CP_ENGAGE_MIN_TILES", "640"))
+
+# ---------------------------------------------------------------------------
+# Engage cost model
+# ---------------------------------------------------------------------------
+# Per-CTA chain wall time is modeled as `per_tile * tiles + fixed` (us),
+# fitted on H100 SXM (D=128, CHUNK=16, bf16) against the serial K2 chain,
+# the (interleaved) pre_scan S+M chain, and the per-segment K2 rerun. K1 and
+# driver host time are identical/hidden on both sides and cancel out of the
+# comparison. Only the serial-vs-CP ratio drives the decision, so absolute
+# miscalibration on other SM90 parts shifts the break-even point mildly
+# without changing the asymptotics; override via env for other silicon.
+CP_COST_SERIAL_PER_TILE_US = float(os.environ.get("CULA_KDA_CP_COST_SERIAL_PER_TILE_US", "1.48"))
+CP_COST_SERIAL_FIXED_US = float(os.environ.get("CULA_KDA_CP_COST_SERIAL_FIXED_US", "84"))
+CP_COST_PRESCAN_PER_TILE_US = float(os.environ.get("CULA_KDA_CP_COST_PRESCAN_PER_TILE_US", "2.39"))
+CP_COST_PRESCAN_FIXED_US = float(os.environ.get("CULA_KDA_CP_COST_PRESCAN_FIXED_US", "27"))
+CP_COST_K2SEG_PER_TILE_US = float(os.environ.get("CULA_KDA_CP_COST_K2SEG_PER_TILE_US", "1.69"))
+CP_COST_K2SEG_FIXED_US = float(os.environ.get("CULA_KDA_CP_COST_K2SEG_FIXED_US", "19"))
+CP_COST_MERGE_FIXED_US = float(os.environ.get("CULA_KDA_CP_COST_MERGE_FIXED_US", "8"))
+CP_COST_MERGE_PER_SEG_US = float(os.environ.get("CULA_KDA_CP_COST_MERGE_PER_SEG_US", "3.3"))
+# Required predicted serial/CP ratio before auto engages CP: absorbs model
+# error, the (hidden) extra driver host work, and measurement noise.
+CP_ENGAGE_MARGIN = float(os.environ.get("CULA_KDA_CP_ENGAGE_MARGIN", "1.10"))
 
 _SM_COUNT_CACHE: dict[int, int] = {}
 
@@ -68,6 +92,42 @@ def auto_plan_segments(device: torch.device, seq_tiles: list[int], H: int) -> tu
     s_split = _auto_s_split(device, seq_tiles, H)
     seg_cu, per_seq = _plan_segments(seq_tiles, s_split, AUTO_MIN_SEG_TILES)
     return s_split, seg_cu, per_seq
+
+
+def _makespan_us(chain_tiles: list[int], per_tile_us: float, fixed_us: float, H: int, sm_count: int) -> float:
+    """Lower-bound makespan of one chain-per-(chain, head) kernel: the slowest
+    chain, or the average per-SM load when chains x H oversubscribe the SMs."""
+    if not chain_tiles:
+        return 0.0
+    walls = [per_tile_us * t + fixed_us for t in chain_tiles]
+    return max(max(walls), sum(walls) * H / sm_count)
+
+
+def estimate_cp_speedup(
+    device: torch.device,
+    seq_tiles: list[int],
+    seg_cu: list[int],
+    per_seq: list[tuple[int, int]],
+    H: int,
+) -> float:
+    """Predicted serial-K2 / (pre_scan + merge + segment-K2) wall-time ratio.
+
+    > 1 means CP is predicted faster. K1 and host-side driver work are the
+    same on both sides and are excluded.
+    """
+    sm_count = _sm_count(device)
+    serial_us = _makespan_us(seq_tiles, CP_COST_SERIAL_PER_TILE_US, CP_COST_SERIAL_FIXED_US, H, sm_count)
+    seg_tiles = [seg_cu[i + 1] - seg_cu[i] for i in range(len(seg_cu) - 1)]
+    max_n_seg = max(n_seg for _first, n_seg in per_seq)
+    cp_us = (
+        _makespan_us(seg_tiles, CP_COST_PRESCAN_PER_TILE_US, CP_COST_PRESCAN_FIXED_US, H, sm_count)
+        + _makespan_us(seg_tiles, CP_COST_K2SEG_PER_TILE_US, CP_COST_K2SEG_FIXED_US, H, sm_count)
+        + CP_COST_MERGE_FIXED_US
+        + CP_COST_MERGE_PER_SEG_US * max_n_seg
+    )
+    if cp_us <= 0.0:
+        return 0.0
+    return serial_us / cp_us
 
 
 @dataclass
