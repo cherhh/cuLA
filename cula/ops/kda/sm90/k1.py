@@ -31,7 +31,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-from cula.ops.kda.sm90._common import _wrap_input, add_f16x2_u32, movm_t_b16
+from cula.ops.kda.sm90._common import add_f16x2_u32, movm_t_b16
 
 CHUNK: int = 16
 D: int = 128
@@ -750,7 +750,7 @@ def _compile_k1(H, scale, gate_scale, is_varlen):
         gate_scale,  # Constexpr
         is_varlen,  # Constexpr
         stream_fake,
-        options="--opt-level=3",
+        options="--enable-tvm-ffi --opt-level=3",
     )
 
 
@@ -823,25 +823,26 @@ def launch_k1(
 
     compiled_fn = _get_compiled_k1(H, scale, gate_scale, is_varlen)
     stream = _get_current_custream()
-    # Real tensors + dynamic Int32 dims; TMA descriptors are (re)built inside
-    # run_k1 from these Int32 every launch, so one compiled kernel serves all shapes.
+    # tvm-ffi launch: torch tensors pass straight through (no per-call CuTe
+    # tensor wrapping). TMA descriptors are (re)built inside run_k1 from the
+    # dynamic Int32 dims every launch, so one compiled kernel serves all shapes.
     compiled_fn(
-        _wrap_input(q, 16, view_shape=(T_total, H, D), cache=True),
-        _wrap_input(k, 16, view_shape=(T_total, H, D), cache=True),
-        _wrap_input(g, 16, view_shape=(T_total, H, D), cache=True),
-        _wrap_input(A_log, 16, cache=True),
-        _wrap_input(dt_bias, 16, cache=True),
-        _wrap_input(beta, 16),
-        _wrap_input(ws_qd, 16),
-        _wrap_input(ws_kd, 16),
-        _wrap_input(ws_kr, 16),
-        _wrap_input(ws_gt, 16),
-        _wrap_input(ws_inv, 16),
-        _wrap_input(ws_mqk, 16),
-        _wrap_input(ws_beta, 16),
-        _wrap_input(tile_starts, 4, cache=True),
-        _wrap_input(tile_actual_lens, 4, cache=True),
-        cutlass.Int32(total_tiles),
-        cutlass.Int32(T_total),
+        q.view(T_total, H, D),
+        k.view(T_total, H, D),
+        g.view(T_total, H, D),
+        A_log,
+        dt_bias,
+        beta,
+        ws_qd,
+        ws_kd,
+        ws_kr,
+        ws_gt,
+        ws_inv,
+        ws_mqk,
+        ws_beta,
+        tile_starts,
+        tile_actual_lens,
+        total_tiles,
+        T_total,
         stream,
     )

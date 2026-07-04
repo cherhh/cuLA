@@ -45,7 +45,7 @@ def _make_state_smem_layout():
     return cute.tile_to_shape(atom, (D, D), (0, 1))
 
 
-from cula.ops.kda.sm90._common import _wrap_input, movm_t_b16  # noqa: E402
+from cula.ops.kda.sm90._common import movm_t_b16  # noqa: E402
 
 
 def _make_out_kinter_one_stage():
@@ -812,6 +812,7 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
         state_transposed,  # Constexpr
         v_is_varlen,  # Constexpr
         stream_fake,
+        options="--enable-tvm-ffi",
     )
 
 
@@ -935,26 +936,27 @@ def launch_k2(
         v_is_varlen,
     )
     stream = _get_current_custream()
-    # Real tensors + dynamic Int32 dims. The TMA descriptors are (re)built inside
-    # run_k2 from these Int32 every launch, so one compiled kernel serves all shapes.
+    # tvm-ffi launch: torch tensors pass straight through (no per-call CuTe
+    # tensor wrapping). TMA descriptors are (re)built inside run_k2 from the
+    # dynamic Int32 dims every launch, so one compiled kernel serves all shapes.
     compiled_fn(
-        _wrap_input(v, 16, view_shape=(V_T_total, H, D), cache=True),
-        _wrap_input(beta, 16),
-        _wrap_input(ws_qd, 16),
-        _wrap_input(ws_kd, 16),
-        _wrap_input(ws_kr, 16),
-        _wrap_input(ws_gt, 16),
-        _wrap_input(ws_inv, 16),
-        _wrap_input(ws_mqk, 16),
-        _wrap_input(out, 16, view_shape=(O_T_total, H, D), cache=True),
-        _wrap_input(cu_seqlens_tiles, 4, cache=True),
-        _wrap_input(initial_state_fp32, 16),
-        _wrap_input(final_state_fp32, 16),
-        _wrap_input(v_tile_starts, 4, cache=True),
-        _wrap_input(v_tile_actual_lens, 4, cache=True),
-        cutlass.Int32(total_tiles),
-        cutlass.Int32(O_T_total),
-        cutlass.Int32(V_T_total),
-        cutlass.Int32(N_seqs),
+        v.view(V_T_total, H, D),
+        beta,
+        ws_qd,
+        ws_kd,
+        ws_kr,
+        ws_gt,
+        ws_inv,
+        ws_mqk,
+        out.view(O_T_total, H, D),
+        cu_seqlens_tiles,
+        initial_state_fp32,
+        final_state_fp32,
+        v_tile_starts,
+        v_tile_actual_lens,
+        total_tiles,
+        O_T_total,
+        V_T_total,
+        N_seqs,
         stream,
     )
