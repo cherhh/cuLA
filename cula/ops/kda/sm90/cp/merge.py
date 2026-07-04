@@ -36,9 +36,9 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
 from cutlass.cute.nvgpu import cpasync
-from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-from cula.ops.kda.sm90.k2 import D
+from cula.ops.kda.sm90.k2 import D, _get_current_custream
 from cula.ops.ptx import cvt_f32_to_tf32, mma_m16n8k8_tf32
 
 # ---------------------------------------------------------------------------
@@ -385,12 +385,42 @@ def _compile_merge(H: int, has_init: int):
         nseg_fake,
         cutlass.Int32(1),
         stream_fake,
+        options="--enable-tvm-ffi",
     )
 
 
 @functools.lru_cache(maxsize=32)
 def _get_compiled_merge(H: int, has_init: int):
     return _compile_merge(H, has_init)
+
+
+# Plan-derived launch constants, cached: building them per call costs two
+# synchronous pageable H2D copies (~0.4 ms) plus a memset for the dummy init.
+_PER_SEQ_TENSOR_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_PER_SEQ_TENSOR_CACHE_MAXSIZE = 64
+_DUMMY_INIT_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _get_per_seq_tensors(per_seq: tuple, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (per_seq, str(device))
+    cached = _PER_SEQ_TENSOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_PER_SEQ_TENSOR_CACHE) >= _PER_SEQ_TENSOR_CACHE_MAXSIZE:
+        _PER_SEQ_TENSOR_CACHE.pop(next(iter(_PER_SEQ_TENSOR_CACHE)))
+    firsts = torch.tensor([f for f, _ in per_seq], dtype=torch.int32, device=device)
+    nsegs = torch.tensor([n for _, n in per_seq], dtype=torch.int32, device=device)
+    _PER_SEQ_TENSOR_CACHE[key] = (firsts, nsegs)
+    return firsts, nsegs
+
+
+def _get_dummy_init(H: int, device: torch.device) -> torch.Tensor:
+    key = (H, str(device))
+    cached = _DUMMY_INIT_CACHE.get(key)
+    if cached is None:
+        cached = torch.zeros(1, H, D, D, dtype=torch.float32, device=device)
+        _DUMMY_INIT_CACHE[key] = cached
+    return cached
 
 
 # ---------------------------------------------------------------------------
@@ -408,26 +438,22 @@ def launch_merge(
     H = carries.shape[1]
     device = carries.device
 
-    firsts = torch.tensor([f for f, _ in per_seq], dtype=torch.int32, device=device)
-    nsegs = torch.tensor([n for _, n in per_seq], dtype=torch.int32, device=device)
+    firsts, nsegs = _get_per_seq_tensors(tuple(per_seq), device)
     has_init = 1 if init_bhvk is not None else 0
-
-    if init_bhvk is None:
-        init_arg = carries.new_zeros(1, H, D, D)
-    else:
-        init_arg = init_bhvk
+    init_arg = init_bhvk if init_bhvk is not None else _get_dummy_init(H, device)
 
     compiled_fn = _get_compiled_merge(H, has_init)
-    stream_ptr = torch.cuda.current_stream(device).cuda_stream
+    stream = _get_current_custream()
 
+    # tvm-ffi launch: torch tensors pass straight through.
     compiled_fn(
-        from_dlpack(b_seg, assumed_align=128),
-        from_dlpack(m_seg, assumed_align=128),
-        from_dlpack(carries, assumed_align=128),
-        from_dlpack(init_arg, assumed_align=128),
-        from_dlpack(firsts, assumed_align=16),
-        from_dlpack(nsegs, assumed_align=16),
-        cutlass.Int32(n_seqs),
-        cuda.CUstream(stream_ptr),
+        b_seg,
+        m_seg,
+        carries,
+        init_arg,
+        firsts,
+        nsegs,
+        n_seqs,
+        stream,
     )
     return carries

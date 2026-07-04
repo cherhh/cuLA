@@ -29,13 +29,14 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 import torch
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
-from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 from cula.ops.kda.sm90._common import movm_t_b16
 from cula.ops.kda.sm90.k2 import (
     CHUNK,
     D,
     _get_current_custream,
+    _get_dummy_int32,
     _make_out_kinter_one_stage,
     _make_state_smem_layout,
 )
@@ -625,6 +626,7 @@ def _compile_pre_scan(H, v_is_varlen):
         v_is_varlen,  # Constexpr
         cutlass.Int32(1),  # S -> runtime
         stream_fake,
+        options="--enable-tvm-ffi",
     )
 
 
@@ -658,34 +660,32 @@ def launch_pre_scan(
     T_total = B * T
     v_is_varlen = v_tile_starts is not None
     if not v_is_varlen:
-        v_tile_starts = torch.zeros(1, dtype=torch.int32, device=v.device)
-        v_tile_actual_lens = v_tile_starts
+        dummy = _get_dummy_int32(v.device)
+        v_tile_starts = dummy
+        v_tile_actual_lens = dummy
     if total_tiles is None:
         total_tiles = T_total // CHUNK
     S_total = seg_cu_tiles.numel() - 1
 
-    b_flat = b_state.reshape(-1)
-    m_flat = m_state.reshape(-1)
-    v_flat = v.view(T_total, H, D)
-
     compiled_fn = _get_compiled_pre_scan(H, v_is_varlen)
     stream = _get_current_custream()
-    # Real tensors + dynamic Int32 dims; TMA descriptors are (re)built inside
-    # run_pre_scan from these Int32 every launch, so one compiled kernel serves all shapes.
+    # tvm-ffi launch: torch tensors pass straight through (no per-call CuTe
+    # tensor wrapping). TMA descriptors are (re)built inside run_pre_scan from
+    # the dynamic Int32 dims every launch, so one compiled kernel serves all shapes.
     compiled_fn(
-        from_dlpack(v_flat.detach(), assumed_align=16),
-        from_dlpack(beta.detach(), assumed_align=16),
-        from_dlpack(ws_kd.detach(), assumed_align=16),
-        from_dlpack(ws_kr.detach(), assumed_align=16),
-        from_dlpack(ws_gt.detach(), assumed_align=16),
-        from_dlpack(ws_inv.detach(), assumed_align=16),
-        from_dlpack(seg_cu_tiles.detach(), assumed_align=4),
-        from_dlpack(b_flat.detach(), assumed_align=16),
-        from_dlpack(m_flat.detach(), assumed_align=16),
-        from_dlpack(v_tile_starts.detach(), assumed_align=4),
-        from_dlpack(v_tile_actual_lens.detach(), assumed_align=4),
-        cutlass.Int32(total_tiles),
-        cutlass.Int32(T_total),
-        cutlass.Int32(S_total),
+        v.view(T_total, H, D),
+        beta,
+        ws_kd,
+        ws_kr,
+        ws_gt,
+        ws_inv,
+        seg_cu_tiles,
+        b_state.reshape(-1),
+        m_state.reshape(-1),
+        v_tile_starts,
+        v_tile_actual_lens,
+        total_tiles,
+        T_total,
+        S_total,
         stream,
     )
