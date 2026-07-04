@@ -21,7 +21,6 @@ pass; the per-tile recurrence reuses the FlashKDA-derived K2 math it imports.
 160 threads = 4 MMA warps + 1 LOAD warp; outputs fp32 bhvk layout.
 """
 
-from __future__ import annotations
 
 import cuda.bindings.driver as cuda_drv
 import cutlass

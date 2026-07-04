@@ -27,7 +27,6 @@ Compared to SM100 merge:
  - 4 warps × 16 rows (SM100: 4 warps × 32 rows)
 """
 
-from __future__ import annotations
 
 import functools
 
