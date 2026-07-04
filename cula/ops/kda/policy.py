@@ -14,7 +14,7 @@ from typing import Literal
 import torch
 
 from cula.ops.kda.sm90.cp.plan import CHUNK as SM90_CP_CHUNK
-from cula.ops.kda.sm90.cp.plan import ENGAGE_MIN_TILES, MIN_BENEFICIAL_SEG, auto_plan_segments
+from cula.ops.kda.sm90.cp.plan import CP_ENGAGE_MARGIN, auto_plan_segments, estimate_cp_speedup
 
 IntracardCPMode = Literal["auto"] | bool
 
@@ -121,13 +121,6 @@ def sm90_intracard_cp_decision(
     if not seq_tiles:
         return _reject_or_disable(mode, "SM90 intracard CP requires at least one sequence.")
 
-    # auto-only gate: below ENGAGE_MIN_TILES the serial K1+K2 still fills the SM array,
-    # so CP's pre_scan/merge overhead would be a net loss. force (True) ignores it.
-    if mode is not True and max(seq_tiles) < ENGAGE_MIN_TILES:
-        return IntracardCPDecision(
-            False, f"intracard CP not beneficial: longest sequence {max(seq_tiles)} tiles (< {ENGAGE_MIN_TILES})"
-        )
-
     _s_split, seg_cu, per_seq = auto_plan_segments(q.device, seq_tiles, q.shape[2])
     n_seg_total = len(seg_cu) - 1
     max_n_seg = max(n_seg for _first, n_seg in per_seq)
@@ -136,10 +129,16 @@ def sm90_intracard_cp_decision(
             mode,
             "SM90 intracard CP is not meaningfully splittable for this shape.",
         )
-    # auto-only gate: too few segments/seq don't amortize CP's pre_scan/merge overhead
-    # (<=4 measured to regress); force (True) still runs since the shape IS splittable.
-    if max_n_seg < MIN_BENEFICIAL_SEG and mode is not True:
-        return IntracardCPDecision(False, f"intracard CP not beneficial: {max_n_seg} segments/seq (< {MIN_BENEFICIAL_SEG})")
+    # auto-only gate: engage only when the calibrated cost model predicts the
+    # CP pipeline (pre_scan + merge + segment-K2) beats the serial K2 chain by
+    # at least CP_ENGAGE_MARGIN. force (True) still runs: the shape IS splittable.
+    if mode is not True:
+        speedup = estimate_cp_speedup(q.device, seq_tiles, seg_cu, per_seq, q.shape[2])
+        if speedup < CP_ENGAGE_MARGIN:
+            return IntracardCPDecision(
+                False,
+                f"intracard CP not beneficial: predicted {speedup:.2f}x (< {CP_ENGAGE_MARGIN:.2f}x margin)",
+            )
     return IntracardCPDecision(True)
 
 
