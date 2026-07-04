@@ -752,6 +752,8 @@ _DUMMY_FP32_CACHE: dict[str, torch.Tensor] = {}
 _DUMMY_INT32_CACHE: dict[str, torch.Tensor] = {}
 _CU_STREAM_CACHE: dict[int, object] = {}
 _CU_STREAM_CACHE_MAXSIZE = 64
+_FIXED_CU_TILES_CACHE: dict[tuple, torch.Tensor] = {}
+_FIXED_CU_TILES_CACHE_MAXSIZE = 64
 
 
 def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_varlen):
@@ -857,6 +859,25 @@ def _get_dummy_int32(device: torch.device) -> torch.Tensor:
     return cached
 
 
+def _get_fixed_cu_seqlens_tiles(B: int, t_tiles_per_seq: int, device: torch.device) -> torch.Tensor:
+    """Cached [0, t, 2t, ..., B*t] tile offsets for the fixed-length path."""
+    key = (B, t_tiles_per_seq, str(device))
+    cached = _FIXED_CU_TILES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_FIXED_CU_TILES_CACHE) >= _FIXED_CU_TILES_CACHE_MAXSIZE:
+        _FIXED_CU_TILES_CACHE.pop(next(iter(_FIXED_CU_TILES_CACHE)))
+    cached = torch.arange(
+        0,
+        (B + 1) * t_tiles_per_seq,
+        t_tiles_per_seq,
+        dtype=torch.int32,
+        device=device,
+    )
+    _FIXED_CU_TILES_CACHE[key] = cached
+    return cached
+
+
 def launch_k2(
     v: torch.Tensor,
     beta: torch.Tensor,
@@ -896,14 +917,7 @@ def launch_k2(
         v_tile_actual_lens = dummy
 
     if cu_seqlens_tiles is None:
-        t_tiles_per_seq = T // CHUNK
-        cu_seqlens_tiles = torch.arange(
-            0,
-            (B + 1) * t_tiles_per_seq,
-            t_tiles_per_seq,
-            dtype=torch.int32,
-            device=v.device,
-        )
+        cu_seqlens_tiles = _get_fixed_cu_seqlens_tiles(B, T // CHUNK, v.device)
         N_seqs = B
     else:
         N_seqs = cu_seqlens_tiles.numel() - 1

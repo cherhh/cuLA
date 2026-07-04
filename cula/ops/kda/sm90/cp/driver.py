@@ -254,10 +254,9 @@ def _run_cp_pipeline(
     n_qk = plan.total_tiles * H * CHUNK * D
     n_cc = plan.total_tiles * H * CHUNK * CHUNK
     # ws_beta uses tile layout (total_tiles*CHUNK*H), not packed token layout (T_total*H).
-    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta = _get_or_alloc_workspaces(
-        n_qk, n_cc, plan.total_tiles * H * D, plan.total_tiles * CHUNK * H, device, beta.dtype
+    ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta, beta_flat = _get_or_alloc_workspaces(
+        n_qk, n_cc, plan.total_tiles * H * D, plan.total_tiles * CHUNK * H, T_total * H, device, beta.dtype
     )
-    beta_flat = torch.empty(T_total * H, dtype=beta.dtype, device=device)
     _copy_beta_flat(beta, beta_flat, H, T_total)
     launch_k1(
         q,
