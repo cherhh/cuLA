@@ -87,10 +87,59 @@ def _plan_segments(
     return seg_cu, per_seq
 
 
+def _plan_balanced(device: torch.device, seq_tiles: list[int], H: int) -> tuple[list[int], list[tuple[int, int]]]:
+    """Duration-weighted plan: aim for equal segment LENGTHS across the batch.
+
+    The legacy planner hands every splittable sequence the same segment COUNT
+    and budgets short sequences as if they occupied their SMs for the whole
+    kernel; with ragged batches that leaves the critical path on the longest
+    segment (or refuses to split at all). Here each sequence gets
+    ceil(tiles / target_len) segments, with target_len sized so one SM wave
+    covers the total load — short sequences drain early and the scheduler
+    backfills their SMs.
+    """
+    sm_count = _sm_count(device)
+    slots = max(1, sm_count // H)
+    total = sum(seq_tiles)
+    target_len = max(AUTO_MIN_SEG_TILES, -(-total // slots))
+    seg_cu = [0]
+    per_seq: list[tuple[int, int]] = []
+    for r in seq_tiles:
+        n_seg = max(1, min(-(-r // target_len), r // max(1, AUTO_MIN_SEG_TILES)))
+        n_seg = min(n_seg, r)
+        first = len(seg_cu) - 1
+        base, rem = divmod(r, n_seg)
+        for i in range(n_seg):
+            seg_cu.append(seg_cu[-1] + base + (1 if i < rem else 0))
+        per_seq.append((first, n_seg))
+    return seg_cu, per_seq
+
+
+def _plan_is_splittable(seq_tiles: list[int], seg_cu: list[int], per_seq: list[tuple[int, int]]) -> bool:
+    """Same structural criterion policy/driver apply before engaging CP."""
+    return len(seg_cu) - 1 > len(seq_tiles) and max(n_seg for _first, n_seg in per_seq) > 2
+
+
 def auto_plan_segments(device: torch.device, seq_tiles: list[int], H: int) -> tuple[int, list[int], list[tuple[int, int]]]:
-    """Return the automatic segment cap and planned segments."""
+    """Return the automatic segment cap and planned segments.
+
+    Builds two candidates — the legacy equal-count plan and the
+    duration-balanced plan — and keeps whichever the cost model predicts
+    faster. Ties keep the legacy plan, so uniform/dense batches plan exactly
+    as before; ragged batches (where the legacy planner under-splits or
+    refuses) switch to the balanced plan.
+    """
     s_split = _auto_s_split(device, seq_tiles, H)
     seg_cu, per_seq = _plan_segments(seq_tiles, s_split, AUTO_MIN_SEG_TILES)
+    seg_cu_b, per_seq_b = _plan_balanced(device, seq_tiles, H)
+
+    legacy_ok = _plan_is_splittable(seq_tiles, seg_cu, per_seq)
+    balanced_ok = _plan_is_splittable(seq_tiles, seg_cu_b, per_seq_b)
+    if balanced_ok and (
+        not legacy_ok or _cp_cost_us(device, seg_cu_b, per_seq_b, H) < _cp_cost_us(device, seg_cu, per_seq, H)
+    ):
+        seg_cu, per_seq = seg_cu_b, per_seq_b
+        s_split = max(n_seg for _first, n_seg in per_seq)
     return s_split, seg_cu, per_seq
 
 
@@ -101,6 +150,19 @@ def _makespan_us(chain_tiles: list[int], per_tile_us: float, fixed_us: float, H:
         return 0.0
     walls = [per_tile_us * t + fixed_us for t in chain_tiles]
     return max(max(walls), sum(walls) * H / sm_count)
+
+
+def _cp_cost_us(device: torch.device, seg_cu: list[int], per_seq: list[tuple[int, int]], H: int) -> float:
+    """Predicted CP pipeline wall time (pre_scan + merge + segment-K2), us."""
+    sm_count = _sm_count(device)
+    seg_tiles = [seg_cu[i + 1] - seg_cu[i] for i in range(len(seg_cu) - 1)]
+    max_n_seg = max(n_seg for _first, n_seg in per_seq)
+    return (
+        _makespan_us(seg_tiles, CP_COST_PRESCAN_PER_TILE_US, CP_COST_PRESCAN_FIXED_US, H, sm_count)
+        + _makespan_us(seg_tiles, CP_COST_K2SEG_PER_TILE_US, CP_COST_K2SEG_FIXED_US, H, sm_count)
+        + CP_COST_MERGE_FIXED_US
+        + CP_COST_MERGE_PER_SEG_US * max_n_seg
+    )
 
 
 def estimate_cp_speedup(
@@ -117,14 +179,7 @@ def estimate_cp_speedup(
     """
     sm_count = _sm_count(device)
     serial_us = _makespan_us(seq_tiles, CP_COST_SERIAL_PER_TILE_US, CP_COST_SERIAL_FIXED_US, H, sm_count)
-    seg_tiles = [seg_cu[i + 1] - seg_cu[i] for i in range(len(seg_cu) - 1)]
-    max_n_seg = max(n_seg for _first, n_seg in per_seq)
-    cp_us = (
-        _makespan_us(seg_tiles, CP_COST_PRESCAN_PER_TILE_US, CP_COST_PRESCAN_FIXED_US, H, sm_count)
-        + _makespan_us(seg_tiles, CP_COST_K2SEG_PER_TILE_US, CP_COST_K2SEG_FIXED_US, H, sm_count)
-        + CP_COST_MERGE_FIXED_US
-        + CP_COST_MERGE_PER_SEG_US * max_n_seg
-    )
+    cp_us = _cp_cost_us(device, seg_cu, per_seq, H)
     if cp_us <= 0.0:
         return 0.0
     return serial_us / cp_us
@@ -176,12 +231,10 @@ def plan_cp(
         v_tile_actual_lens = varlen_meta.tile_actual_lens
 
     if s_split is None:
-        s_split = _auto_s_split(device, seq_tiles, H)
-        min_seg_tiles = AUTO_MIN_SEG_TILES
+        # Must match the plan the policy layer scored (same entry point).
+        s_split, seg_cu, per_seq = auto_plan_segments(device, seq_tiles, H)
     else:
-        min_seg_tiles = MIN_SEG_TILES
-
-    seg_cu, per_seq = _plan_segments(seq_tiles, s_split, min_seg_tiles)
+        seg_cu, per_seq = _plan_segments(seq_tiles, s_split, MIN_SEG_TILES)
 
     return CPPlan(
         n_seqs=n_seqs,
