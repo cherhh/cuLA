@@ -288,6 +288,13 @@ def _run_cp_pipeline(
     b_seg = _get_scratch("b_seg", (n_seg, H, D, D), torch.float32, device)
     m_seg = _get_scratch("m_seg", (n_seg, H, D, D), torch.float32, device)
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
+    # Longest-first launch order: with more segment CTAs than SMs, linear block
+    # order interleaves long and short chains and long ones can start late,
+    # inflating the makespan. Stable sort -> identity for uniform splits.
+    seg_lens = [plan.seg_cu[i + 1] - plan.seg_cu[i] for i in range(n_seg)]
+    seg_order = _get_plan_tensor(
+        tuple(sorted(range(n_seg), key=lambda i: -seg_lens[i])), torch.int32, device
+    )
     launch_pre_scan(
         v_flat,
         ws_beta,
@@ -301,6 +308,7 @@ def _run_cp_pipeline(
         v_tile_starts=plan.v_tile_starts,
         v_tile_actual_lens=plan.v_tile_actual_lens,
         total_tiles=plan.total_tiles,
+        seg_order=seg_order,
     )
 
     # ---- merge: propagate carries across segments within each sequence ----
@@ -335,6 +343,7 @@ def _run_cp_pipeline(
         state_transposed=False,
         v_tile_starts=plan.v_tile_starts,
         v_tile_actual_lens=plan.v_tile_actual_lens,
+        seq_order=seg_order,
     )
 
     # ---- gather final states (one per original sequence) ----

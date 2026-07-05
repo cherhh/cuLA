@@ -37,6 +37,7 @@ from cula.ops.kda.sm90.k2 import (
     D,
     _get_current_custream,
     _get_dummy_int32,
+    _get_identity_order,
     _make_out_kinter_one_stage,
     _make_state_smem_layout,
 )
@@ -63,13 +64,16 @@ def pre_scan_kernel(
     total_tiles: cutlass.Int32,
     T_total: cutlass.Int32,
     seg_cu_tiles: cute.Tensor,
+    seg_order: cute.Tensor,  # int32 [S]: launch-slot -> segment index
     b_state_g: cute.Tensor,  # flat fp32 [S*H*D*D] gmem, bhvk
     m_state_g: cute.Tensor,  # flat fp32 [S*H*D*D] gmem, bhvk
     v_tile_starts: cute.Tensor,
     v_tile_actual_lens: cute.Tensor,
     v_is_varlen: cutlass.Constexpr[bool],
 ):
-    seg_idx, head_idx, _ = cute.arch.block_idx()
+    # Longest-first launch order (identity for uniform splits); pure reordering.
+    seg_slot, head_idx, _ = cute.arch.block_idx()
+    seg_idx = cutlass.Int32(seg_order[seg_slot])
     tidx, _, _ = cute.arch.thread_idx()
 
     smem = cutlass.utils.SmemAllocator()
@@ -472,6 +476,7 @@ def run_pre_scan(
     ws_gt: cute.Tensor,
     ws_inv: cute.Tensor,
     seg_cu_tiles: cute.Tensor,
+    seg_order: cute.Tensor,
     b_state_g: cute.Tensor,  # flat fp32 [S*H*D*D]
     m_state_g: cute.Tensor,  # flat fp32 [S*H*D*D]
     v_tile_starts: cute.Tensor,
@@ -571,6 +576,7 @@ def run_pre_scan(
         total_tiles,
         T_total,
         seg_cu_tiles,
+        seg_order,
         b_state_g,
         m_state_g,
         v_tile_starts,
@@ -597,6 +603,7 @@ def _compile_pre_scan(H, v_is_varlen):
     sym_gt = cute.sym_int()  # ws_gt    (total_tiles*H*D)
     sym_cc = cute.sym_int()  # ws_inv   (total_tiles*H*CHUNK*CHUNK)
     sym_seg = cute.sym_int()  # seg_cu_tiles (S+1)
+    sym_so = cute.sym_int()  # seg_order (S) — own sym: length differs from seg_cu_tiles
     sym_st = cute.sym_int()  # b_flat / m_flat (S*H*D*D)
     sym_vs = cute.sym_int()  # v_tile_starts
     sym_va = cute.sym_int()  # v_tile_actual_lens
@@ -608,6 +615,7 @@ def _compile_pre_scan(H, v_is_varlen):
     ws_gt_fake = make_fake_compact_tensor(cutlass.Float32, (sym_gt,), assumed_align=16)
     ws_inv_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
     seg_fake = make_fake_compact_tensor(cutlass.Int32, (sym_seg,), assumed_align=4)
+    so_fake = make_fake_compact_tensor(cutlass.Int32, (sym_so,), assumed_align=4)
     b_fake = make_fake_compact_tensor(cutlass.Float32, (sym_st,), assumed_align=16)
     m_fake = make_fake_compact_tensor(cutlass.Float32, (sym_st,), assumed_align=16)
     vts_fake = make_fake_compact_tensor(cutlass.Int32, (sym_vs,), assumed_align=4)
@@ -623,6 +631,7 @@ def _compile_pre_scan(H, v_is_varlen):
         ws_gt_fake,
         ws_inv_fake,
         seg_fake,
+        so_fake,
         b_fake,
         m_fake,
         vts_fake,
@@ -659,6 +668,7 @@ def launch_pre_scan(
     v_tile_starts: torch.Tensor | None = None,  # per-tile packed offset (native varlen)
     v_tile_actual_lens: torch.Tensor | None = None,  # per-tile valid rows (partial-tile mask)
     total_tiles: int | None = None,  # ceil tile sum (varlen); None -> T_total // CHUNK
+    seg_order: torch.Tensor | None = None,  # int32 [S] launch order; None = identity
 ) -> None:
     """Launch fused pre_scan: B_seg and M_seg for all segments."""
     assert v.is_cuda and v.dtype == torch.bfloat16 and v.is_contiguous()
@@ -673,6 +683,8 @@ def launch_pre_scan(
     if total_tiles is None:
         total_tiles = T_total // CHUNK
     S_total = seg_cu_tiles.numel() - 1
+    if seg_order is None:
+        seg_order = _get_identity_order(S_total, v.device)
 
     compiled_fn = _get_compiled_pre_scan(H, v_is_varlen)
     stream = _get_current_custream()
@@ -687,6 +699,7 @@ def launch_pre_scan(
         ws_gt,
         ws_inv,
         seg_cu_tiles,
+        seg_order,
         b_state.reshape(-1),
         m_state.reshape(-1),
         v_tile_starts,

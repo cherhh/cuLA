@@ -84,6 +84,7 @@ def k2_kernel(
     H: cutlass.Constexpr[int],
     total_tiles: cutlass.Int32,
     cu_seqlens_tiles: cute.Tensor,
+    seq_order: cute.Tensor,  # int32 [N]: launch-slot -> sequence/segment index
     v_tile_starts: cute.Tensor,
     v_tile_actual_lens: cute.Tensor,
     initial_state_g: cute.Tensor,  # flat fp32 [N*H*D*D] gmem (layout per state_transposed)
@@ -93,7 +94,11 @@ def k2_kernel(
     state_transposed: cutlass.Constexpr[bool],
     v_is_varlen: cutlass.Constexpr[bool],
 ):
-    seq_idx, head_idx, _ = cute.arch.block_idx()
+    # Longest-first launch order: blocks are dispatched in linear index order,
+    # so the planner permutes launch slots to start the longest chains first
+    # (identity for uniform/serial batches). Pure reordering — no math changes.
+    seq_slot, head_idx, _ = cute.arch.block_idx()
+    seq_idx = cutlass.Int32(seq_order[seq_slot])
     tidx, _, _ = cute.arch.thread_idx()
 
     smem = cutlass.utils.SmemAllocator()
@@ -613,6 +618,7 @@ def run_k2(
     ws_mqk: cute.Tensor,
     out: cute.Tensor,
     cu_seqlens_tiles: cute.Tensor,
+    seq_order: cute.Tensor,
     initial_state_g: cute.Tensor,  # flat fp32 [N*H*D*D] or dummy [1]
     final_state_g: cute.Tensor,  # flat fp32 [N*H*D*D] or dummy [1]
     v_tile_starts: cute.Tensor,
@@ -726,6 +732,7 @@ def run_k2(
         H,
         total_tiles,
         cu_seqlens_tiles,
+        seq_order,
         v_tile_starts,
         v_tile_actual_lens,
         initial_state_g,
@@ -754,6 +761,8 @@ _CU_STREAM_CACHE: dict[int, object] = {}
 _CU_STREAM_CACHE_MAXSIZE = 64
 _FIXED_CU_TILES_CACHE: dict[tuple, torch.Tensor] = {}
 _FIXED_CU_TILES_CACHE_MAXSIZE = 64
+_IDENTITY_ORDER_CACHE: dict[tuple, torch.Tensor] = {}
+_IDENTITY_ORDER_CACHE_MAXSIZE = 64
 
 
 def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_varlen):
@@ -765,6 +774,7 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
     sym_gt = cute.sym_int()  # ws_gt        (total_tiles*H*D)
     sym_bt = cute.sym_int()  # beta/ws_beta (total_tiles*CHUNK*H)
     sym_cu = cute.sym_int()  # cu_seqlens_tiles (N+1)
+    sym_so = cute.sym_int()  # seq_order (N) — own sym: length differs from cu_seqlens_tiles
     # init/final need SEPARATE syms: their runtime sizes differ whenever exactly
     # one of them is the 1-element dummy, and tvm-ffi binds each sym to one value.
     sym_sti = cute.sym_int()  # initial state flat (N*H*D*D or 1)
@@ -782,6 +792,7 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
     ws_mqk_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
     out_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_ot, H, D), stride_order=(2, 1, 0), assumed_align=16)
     cu_fake = make_fake_compact_tensor(cutlass.Int32, (sym_cu,), assumed_align=4)
+    so_fake = make_fake_compact_tensor(cutlass.Int32, (sym_so,), assumed_align=4)
     init_fake = make_fake_compact_tensor(cutlass.Float32, (sym_sti,), assumed_align=16)
     final_fake = make_fake_compact_tensor(cutlass.Float32, (sym_stf,), assumed_align=16)
     vts_fake = make_fake_compact_tensor(cutlass.Int32, (sym_vs,), assumed_align=4)
@@ -800,6 +811,7 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
         ws_mqk_fake,
         out_fake,
         cu_fake,
+        so_fake,
         init_fake,
         final_fake,
         vts_fake,
@@ -859,6 +871,19 @@ def _get_dummy_int32(device: torch.device) -> torch.Tensor:
     return cached
 
 
+def _get_identity_order(n: int, device: torch.device) -> torch.Tensor:
+    """Cached identity launch order [0..n) for serial/uniform batches."""
+    key = (n, str(device))
+    cached = _IDENTITY_ORDER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_IDENTITY_ORDER_CACHE) >= _IDENTITY_ORDER_CACHE_MAXSIZE:
+        _IDENTITY_ORDER_CACHE.pop(next(iter(_IDENTITY_ORDER_CACHE)))
+    cached = torch.arange(n, dtype=torch.int32, device=device)
+    _IDENTITY_ORDER_CACHE[key] = cached
+    return cached
+
+
 def _get_fixed_cu_seqlens_tiles(B: int, t_tiles_per_seq: int, device: torch.device) -> torch.Tensor:
     """Cached [0, t, 2t, ..., B*t] tile offsets for the fixed-length path."""
     key = (B, t_tiles_per_seq, str(device))
@@ -894,10 +919,13 @@ def launch_k2(
     state_transposed: bool = False,
     v_tile_starts: torch.Tensor | None = None,
     v_tile_actual_lens: torch.Tensor | None = None,
+    seq_order: torch.Tensor | None = None,
 ) -> None:
     """Run K2 recurrence. Supports fixed-len and varlen inputs.
 
     state_transposed: False=[N,H,V,K] (default), True=[N,H,K,V].
+    seq_order: optional int32 [N] launch-slot -> sequence index permutation
+        (longest-first for ragged CP batches); None = identity.
     """
     assert v.is_cuda and v.dtype == torch.bfloat16 and v.is_contiguous()
     assert out.is_cuda and out.dtype == torch.bfloat16 and out.is_contiguous()
@@ -942,6 +970,9 @@ def launch_k2(
     else:
         final_state_fp32 = _dummy
 
+    if seq_order is None:
+        seq_order = _get_identity_order(N_seqs, v.device)
+
     compiled_fn = _get_compiled_k2(
         H,
         has_initial_state_flag,
@@ -964,6 +995,7 @@ def launch_k2(
         ws_mqk,
         out.view(O_T_total, H, D),
         cu_seqlens_tiles,
+        seq_order,
         initial_state_fp32,
         final_state_fp32,
         v_tile_starts,
