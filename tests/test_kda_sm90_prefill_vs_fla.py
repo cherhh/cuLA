@@ -157,3 +157,40 @@ def test_prefill_varlen_matches_fla(cu_seqlens, H, with_state):
 
     assert_close("o", ref_o, tri_o, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+def test_prefill_workspace_reuse_across_shapes():
+    """Back-to-back calls with different shapes share the grow-only workspace
+    arena; earlier shapes must keep matching FLA after the arena has been
+    re-carved for larger and smaller shapes (including a tail-chunk one)."""
+    shapes = [(1, 512, 2), (1, 1024, 2), (2, 512, 2), (1, 500, 2), (1, 512, 2)]
+    for B, T, H in shapes:
+        q, k, v, g, beta, A_log, dt_bias, _ = _make_inputs(B, T, H, with_state=False)
+        with torch.no_grad():
+            ref_o, _ = fla_chunk_kda(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                safe_gate=True,
+                lower_bound=-5.0,
+            )
+            tri_o, _ = cula_kda_prefill(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                output_final_state=True,
+                safe_gate=True,
+                lower_bound=-5.0,
+            )
+        assert_close("o", ref_o, tri_o, 0.005)
