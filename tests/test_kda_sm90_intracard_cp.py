@@ -292,3 +292,37 @@ def test_cp_determinism_varlen():
         out, fin = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, cu=cu, s_split=8)
         assert torch.equal(out, out0), f"non-deterministic varlen out at iter {i}"
         assert torch.equal(fin, fin0), f"non-deterministic varlen ht at iter {i}"
+
+
+# ---------------------------------------------------------------------------
+# Ragged batches through the auto planner (duration-balanced splitting)
+# ---------------------------------------------------------------------------
+@needs_cuda
+@pytest.mark.parametrize(
+    "lens",
+    [
+        pytest.param([14336] + [128] * 16, id="skewed-1long-16short"),
+        pytest.param([8192, 2048], id="mixed-lengths"),
+    ],
+)
+def test_cp_matches_serial_ragged_auto_plan(lens):
+    """Ragged varlen batches planned by the duration-balanced auto planner
+    (s_split=None). Splitting must not change any accumulation order, so CP
+    output is required to be BIT-IDENTICAL to the serial path."""
+    from cula.ops.kda.sm90.cp.plan import auto_plan_segments
+
+    seq_tiles = [(sl + 15) // 16 for sl in lens]
+    _s, seg_cu, _per_seq = auto_plan_segments(torch.device("cuda"), seq_tiles, H)
+    assert len(seg_cu) - 1 > len(lens), "precondition: auto planner must split this batch"
+
+    total = sum(lens)
+    q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, total, seed=7)
+    cu = [0]
+    for sl in lens:
+        cu.append(cu[-1] + sl)
+    cu = torch.tensor(cu, dtype=torch.int32, device=q.device)
+
+    ref_o, ref_f = _run_serial(q, k, v, g, beta, A_log, dt_bias, cu=cu)
+    out, fin = _run_cp(q, k, v, g, beta, A_log, dt_bias, cu=cu, s_split=None)
+    assert torch.equal(out, ref_o)
+    assert torch.equal(fin, ref_f)
