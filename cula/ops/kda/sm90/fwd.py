@@ -200,10 +200,10 @@ _DEVICE_ARCH_CACHE: dict[int, str] = {}
 def _cute_arch_for_device(device: torch.device):
     """Ensure CUTE_DSL_ARCH matches the device before any lazy cute.compile.
 
-    Check-and-set without popping: compiles only happen on the first call per
-    kernel config, so re-writing (and previously popping) the env var on every
-    dispatch was pure overhead. Leaving it set is safe — any other arch's
-    dispatch path performs the same check-and-set before its own compiles.
+    Cached + check-and-set (no pop): compiles only happen on the first call
+    per kernel config, so re-writing the env var on every dispatch was pure
+    overhead. Leaving it set is safe — other arches' dispatch paths perform
+    the same check-and-set before their own compiles.
     """
     idx = device.index if device.index is not None else torch.cuda.current_device()
     arch = _DEVICE_ARCH_CACHE.get(idx)
@@ -235,13 +235,9 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
     """Carve K1/K2 scratch (ws_qd/kd/kr/gt/inv/mqk, ws_beta) out of a grow-only
     per-(device, stream) arena instead of allocating per call.
 
-    ws_beta holds raw beta in the compact wt_l tile layout (K1 emits, K2 reads),
-    sized total_tiles*H*CHUNK.
-
-    Reusing the arena across calls is safe because every producer/consumer runs
-    on the keyed stream: the next call's K1 cannot overwrite a workspace before
-    this call's K2 finished reading it. Calls on different streams get
-    independent arenas.
+    Reusing the arena is safe because every producer/consumer runs on the
+    keyed stream: the next call's K1 cannot overwrite a workspace before this
+    call's K2 finished reading it.
     """
     stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
     arena_key = (str(device), stream_ptr)
@@ -598,9 +594,9 @@ def _dispatch_cute(
     if problem.has_state_out:
         k2_final_state = final_state
 
-    # K1 reads beta straight from its original packed [T, H] layout and emits raw
-    # beta into the compact ws_beta workspace (tail rows = -80); K2 reads ws_beta
-    # directly, so no host-side transpose/padding/gather of beta is needed.
+    # K1 reads beta from its original packed [T, H] layout and emits raw beta
+    # into ws_beta (tail rows = -80); K2 reads ws_beta directly, so no
+    # host-side transpose/padding/gather of beta is needed.
     launch_k1(
         k1_q,
         k1_k,

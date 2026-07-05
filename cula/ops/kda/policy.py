@@ -129,9 +129,8 @@ def sm90_intracard_cp_decision(
             mode,
             "SM90 intracard CP is not meaningfully splittable for this shape.",
         )
-    # auto-only gate: engage only when the calibrated cost model predicts the
-    # CP pipeline (pre_scan + merge + segment-K2) beats the serial K2 chain by
-    # at least CP_ENGAGE_MARGIN. force (True) still runs: the shape IS splittable.
+    # auto-only gate: engage only when the cost model predicts CP faster by
+    # at least CP_ENGAGE_MARGIN; force (True) still runs.
     if mode is not True:
         speedup = estimate_cp_speedup(q.device, seq_tiles, seg_cu, per_seq, q.shape[2])
         if speedup < CP_ENGAGE_MARGIN:

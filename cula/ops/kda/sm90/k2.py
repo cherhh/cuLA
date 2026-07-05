@@ -94,9 +94,7 @@ def k2_kernel(
     state_transposed: cutlass.Constexpr[bool],
     v_is_varlen: cutlass.Constexpr[bool],
 ):
-    # Longest-first launch order: blocks are dispatched in linear index order,
-    # so the planner permutes launch slots to start the longest chains first
-    # (identity for uniform/serial batches). Pure reordering — no math changes.
+    # Longest-first launch order: pure reordering — no math changes.
     seq_slot, head_idx, _ = cute.arch.block_idx()
     seq_idx = cutlass.Int32(seq_order[seq_slot])
     tidx, _, _ = cute.arch.thread_idx()
@@ -751,9 +749,7 @@ def run_k2(
 
 # Compile cache keyed on CONFIG ONLY — the per-batch shape dims
 # (total_tiles, O_T_total, V_T_total, N) are dynamic cutlass.Int32, so one
-# compiled kernel serves every batch shape (no per-shape recompile storm).
-# Plain dict + lazy compile (fwd_o style): compile is always immediately
-# followed by execution.
+# compiled kernel serves every batch shape.
 _k2_kernel_cache: dict = {}
 _DUMMY_FP32_CACHE: dict[str, torch.Tensor] = {}
 _DUMMY_INT32_CACHE: dict[str, torch.Tensor] = {}
@@ -775,8 +771,8 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
     sym_bt = cute.sym_int()  # beta/ws_beta (total_tiles*CHUNK*H)
     sym_cu = cute.sym_int()  # cu_seqlens_tiles (N+1)
     sym_so = cute.sym_int()  # seq_order (N) — own sym: length differs from cu_seqlens_tiles
-    # init/final need SEPARATE syms: their runtime sizes differ whenever exactly
-    # one of them is the 1-element dummy, and tvm-ffi binds each sym to one value.
+    # init/final need separate syms: their runtime sizes differ when one is
+    # the 1-element dummy, and tvm-ffi binds each sym to one value.
     sym_sti = cute.sym_int()  # initial state flat (N*H*D*D or 1)
     sym_stf = cute.sym_int()  # final state flat (N*H*D*D or 1)
     sym_vs = cute.sym_int()  # v_tile_starts (total_tiles or 1)
@@ -981,9 +977,10 @@ def launch_k2(
         v_is_varlen,
     )
     stream = _get_current_custream()
-    # tvm-ffi launch: torch tensors pass straight through (no per-call CuTe
-    # tensor wrapping). TMA descriptors are (re)built inside run_k2 from the
-    # dynamic Int32 dims every launch, so one compiled kernel serves all shapes.
+    # tvm-ffi launch: torch tensors pass straight through with NO shape/dtype
+    # validation of the positional args. TMA descriptors are (re)built inside
+    # run_k2 from the dynamic Int32 dims every launch, so one compiled kernel
+    # serves all shapes.
     compiled_fn(
         v.view(V_T_total, H, D),
         beta,
