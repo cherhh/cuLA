@@ -394,8 +394,8 @@ def _get_compiled_merge(H: int, has_init: int):
     return _compile_merge(H, has_init)
 
 
-# Plan-derived launch constants, cached: building them per call costs two
-# synchronous pageable H2D copies (~0.4 ms) plus a memset for the dummy init.
+# Cached per_seq-derived tensors and dummy init: building them per call
+# costs two synchronous pageable H2D copies plus a memset.
 _PER_SEQ_TENSOR_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _PER_SEQ_TENSOR_CACHE_MAXSIZE = 64
 _DUMMY_INIT_CACHE: dict[tuple, torch.Tensor] = {}
@@ -445,7 +445,7 @@ def launch_merge(
     compiled_fn = _get_compiled_merge(H, has_init)
     stream = _get_current_custream()
 
-    # tvm-ffi launch: torch tensors pass straight through.
+    # tvm-ffi launch: torch tensors pass straight through, positional args unvalidated.
     compiled_fn(
         b_seg,
         m_seg,

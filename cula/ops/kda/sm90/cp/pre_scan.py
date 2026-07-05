@@ -71,7 +71,7 @@ def pre_scan_kernel(
     v_tile_actual_lens: cute.Tensor,
     v_is_varlen: cutlass.Constexpr[bool],
 ):
-    # Longest-first launch order (identity for uniform splits); pure reordering.
+    # Longest-first launch order; pure reordering.
     seg_slot, head_idx, _ = cute.arch.block_idx()
     seg_idx = cutlass.Int32(seg_order[seg_slot])
     tidx, _, _ = cute.arch.thread_idx()
@@ -217,7 +217,7 @@ def pre_scan_kernel(
     tCrKd = thr_mma.make_fragment_A(thr_mma.partition_A(sKd_ref))
     tCrState = thr_mma.make_fragment_B(thr_mma.partition_B(sState_ref))
     tCrU = thr_mma.make_fragment_C(tiled_mma.partition_shape_C((CHUNK, D)))
-    # Separate accumulator for the M-chain's kd@M so it can issue ahead of the
+    # Separate accumulator for the M-chain's kd@M, hoisted ahead of the
     # S-chain's dependent stages instead of serializing behind them.
     tCrU_m = thr_mma.make_fragment_C(tiled_mma.partition_shape_C((CHUNK, D)))
 
@@ -327,9 +327,8 @@ def pre_scan_kernel(
                 cute.copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(sKd_k), tCrKd_cv)
                 cute.gemm(tiled_mma, tCrU, tCrKd, tCrState, tCrU)
 
-            # M-chain front half (kd @ M), hoisted: independent of the S-chain,
-            # so its MMAs overlap the S-chain's dependent sigmoid/movmatrix/INV
-            # stages instead of serializing behind them.
+            # M-chain front half (kd @ M), hoisted to overlap the S-chain's
+            # dependent sigmoid/movmatrix/INV stages.
             tCrU_m.fill(0.0)
             for k in cutlass.range_constexpr(D // 16):
                 sKd_k = sKd_tile[None, None, 0, k]
@@ -399,7 +398,7 @@ def pre_scan_kernel(
                     tCsState_blk[ii] = cutlass.BFloat16(old + tCrUpd_blk[ii])
 
             # ===== M-chain (M_seg): V:=0 duality =====
-            # (kd @ M already issued above, ahead of the S-chain's dependent stages.)
+            # (kd @ M already issued above.)
 
             # sigmoid(beta) * (0 - u_pre)
             for i in cutlass.range_constexpr(cute.size(tCrU_m)):
@@ -591,8 +590,7 @@ def run_pre_scan(
 
 
 # Compile cache keyed on CONFIG ONLY — total_tiles/T_total/S are dynamic
-# cutlass.Int32, so one compiled kernel serves every batch shape (no per-shape
-# recompile storm). Plain dict + lazy compile (fwd_o style).
+# cutlass.Int32, so one compiled kernel serves every batch shape.
 _prescan_kernel_cache: dict = {}
 
 
@@ -688,9 +686,8 @@ def launch_pre_scan(
 
     compiled_fn = _get_compiled_pre_scan(H, v_is_varlen)
     stream = _get_current_custream()
-    # tvm-ffi launch: torch tensors pass straight through (no per-call CuTe
-    # tensor wrapping). TMA descriptors are (re)built inside run_pre_scan from
-    # the dynamic Int32 dims every launch, so one compiled kernel serves all shapes.
+    # TMA descriptors are (re)built inside run_pre_scan from the dynamic Int32
+    # dims every launch, so one compiled kernel serves all shapes.
     compiled_fn(
         v.view(T_total, H, D),
         beta,

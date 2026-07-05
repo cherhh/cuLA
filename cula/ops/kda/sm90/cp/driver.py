@@ -179,9 +179,6 @@ def _intracard_prefill_impl(
     plan = plan_cp(device, n_seqs, seq_tiles, T_total, H, s_split, varlen_meta)
 
     # --- Step 3: bypass if CP isn't beneficial ---
-    # Structural: not splittable at all. With allow_fallback (auto semantics),
-    # additionally consult the calibrated cost model; forced callers
-    # (allow_fallback=False) run CP whenever the shape is splittable.
     max_n_seg = max(n for _, n in plan.per_seq)
     bypass = plan.n_seg_total == n_seqs or max_n_seg <= 2
     if not bypass and allow_fallback:
@@ -288,9 +285,7 @@ def _run_cp_pipeline(
     b_seg = _get_scratch("b_seg", (n_seg, H, D, D), torch.float32, device)
     m_seg = _get_scratch("m_seg", (n_seg, H, D, D), torch.float32, device)
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
-    # Longest-first launch order: with more segment CTAs than SMs, linear block
-    # order interleaves long and short chains and long ones can start late,
-    # inflating the makespan. Stable sort -> identity for uniform splits.
+    # Longest-first launch order: stable sort -> identity for uniform splits.
     seg_lens = [plan.seg_cu[i + 1] - plan.seg_cu[i] for i in range(n_seg)]
     seg_order = _get_plan_tensor(
         tuple(sorted(range(n_seg), key=lambda i: -seg_lens[i])), torch.int32, device

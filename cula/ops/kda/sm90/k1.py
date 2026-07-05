@@ -260,16 +260,14 @@ def k1_kernel(
         s_g_total[col_c] = cute.exp(s, fastmath=True)
     cute.arch.barrier()
 
-    # Pre-compute per-row sigmoid(beta). beta is the ORIGINAL packed [T_total, H]
-    # layout — 16 tiny strided loads per CTA make the host-side [H, T] transpose
-    # (which FlashKDA needs for its 1D-TMA beta path) unnecessary here.
+    # Pre-compute per-row sigmoid(beta). beta is the original packed [T, H]
+    # layout, so no host-side transpose is needed.
     if tidx < CHUNK:
         bv = cutlass.Float32(-80.0)
         if actual_len > tidx:
             bv = cutlass.Float32(beta[(token_start + tidx) * H + head_idx])
         sBetaSig[tidx] = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
-        # Emit raw beta into the compact wt_l workspace (tail rows = -80 -> sigmoid~0),
-        # so K2 reads it like the other K1 outputs instead of a host-padded buffer.
+        # Emit raw beta into the compact wt_l workspace (tail rows = -80 -> sigmoid~0).
         ws_beta[(head_idx * total_tiles + tile_idx) * CHUNK + tidx] = cutlass.BFloat16(bv)
 
     # decay_apply
@@ -692,8 +690,7 @@ def run_k1(
 
 
 # Compile cache keyed on CONFIG ONLY — total_tiles/T_total are dynamic
-# cutlass.Int32, so one compiled kernel serves every batch shape (no per-shape
-# recompile storm). Plain dict + lazy compile (fwd_o style).
+# cutlass.Int32, so one compiled kernel serves every batch shape.
 _k1_kernel_cache: dict = {}
 _CU_STREAM_CACHE: dict[int, object] = {}
 _DUMMY_INT32_CACHE: dict[str, torch.Tensor] = {}
@@ -825,9 +822,8 @@ def launch_k1(
 
     compiled_fn = _get_compiled_k1(H, scale, gate_scale, is_varlen)
     stream = _get_current_custream()
-    # tvm-ffi launch: torch tensors pass straight through (no per-call CuTe
-    # tensor wrapping). TMA descriptors are (re)built inside run_k1 from the
-    # dynamic Int32 dims every launch, so one compiled kernel serves all shapes.
+    # TMA descriptors are (re)built inside run_k1 from the dynamic Int32 dims
+    # every launch, so one compiled kernel serves all shapes.
     compiled_fn(
         q.view(T_total, H, D),
         k.view(T_total, H, D),

@@ -31,7 +31,6 @@ def _cast_beta_bf16(beta: torch.Tensor) -> torch.Tensor:
 
 
 def _contig(t: torch.Tensor | None) -> torch.Tensor | None:
-    """None-safe contiguous fixup (FLA input_guard semantics, per-call cheap)."""
     if t is None or t.is_contiguous():
         return t
     return t.contiguous()
@@ -56,8 +55,6 @@ def _guarded_forward(
     out: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
 ):
-    # Lightweight input guard: fix non-contiguous tensors and enter the
-    # inputs' device only when it is not already current.
     q, k, v, g, beta = _contig(q), _contig(k), _contig(v), _contig(g), _contig(beta)
     A_log, dt_bias = _contig(A_log), _contig(dt_bias)
     initial_state, cu_seqlens = _contig(initial_state), _contig(cu_seqlens)
@@ -109,11 +106,8 @@ class HopperChunkKDAFunction(torch.autograd.Function):
 
         g = _cast_g_bf16(g)
         if beta_is_logits:
-            # Kernel-native convention: beta is already pre-sigmoid logits.
             beta = _cast_beta_bf16(beta)
         else:
-            # FLA convention: beta is post-sigmoid [0,1].
-            # cuLA kernel applies sigmoid internally, so convert to pre-sigmoid logits.
             beta = _beta_logits_bf16(beta)
 
         cp_decision = sm90_intracard_cp_decision(q, cu_seqlens, cu_seqlens_cpu, use_intracard_cp)
@@ -363,8 +357,7 @@ def cula_kda_prefill(
         out,
         final_state,
     )
-    # Forward-only op: skip the autograd.Function machinery unless a graph
-    # could actually be recorded (backward raises NotImplementedError anyway).
+    # Forward-only op: skip autograd.Function unless a graph could be recorded.
     needs_grad = torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in (q, k, v, g, beta, A_log, dt_bias, initial_state)
     )
