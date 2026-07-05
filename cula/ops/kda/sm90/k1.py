@@ -260,11 +260,13 @@ def k1_kernel(
         s_g_total[col_c] = cute.exp(s, fastmath=True)
     cute.arch.barrier()
 
-    # Pre-compute per-row sigmoid(beta)
+    # Pre-compute per-row sigmoid(beta). beta is the ORIGINAL packed [T_total, H]
+    # layout — 16 tiny strided loads per CTA make the host-side [H, T] transpose
+    # (which FlashKDA needs for its 1D-TMA beta path) unnecessary here.
     if tidx < CHUNK:
         bv = cutlass.Float32(-80.0)
         if actual_len > tidx:
-            bv = cutlass.Float32(beta[head_idx * T_total + token_start + tidx])
+            bv = cutlass.Float32(beta[(token_start + tidx) * H + head_idx])
         sBetaSig[tidx] = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
         # Emit raw beta into the compact wt_l workspace (tail rows = -80 -> sigmoid~0),
         # so K2 reads it like the other K1 outputs instead of a host-padded buffer.
@@ -701,7 +703,7 @@ _CU_STREAM_CACHE_MAXSIZE = 64
 def _compile_k1(H, scale, gate_scale, is_varlen):
     sym_t = cute.sym_int()  # T_total (q/k/g token extent)
     sym_al = cute.sym_int()  # a_log
-    sym_bt = cute.sym_int()  # beta (T_total*H)
+    sym_bt = cute.sym_int()  # beta, original packed [T_total, H] flattened (T_total*H)
     sym_qk = cute.sym_int()  # ws_qd/kd/kr  (total_tiles*H*CHUNK*D)
     sym_gt = cute.sym_int()  # ws_gt        (total_tiles*H*D)
     sym_cc = cute.sym_int()  # ws_inv/mqk   (total_tiles*H*CHUNK*CHUNK)
