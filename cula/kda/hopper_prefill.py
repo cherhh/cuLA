@@ -56,15 +56,27 @@ def _guarded_forward(
     A_log, dt_bias = _contig(A_log), _contig(dt_bias)
     initial_state, cu_seqlens = _contig(initial_state), _contig(cu_seqlens)
     device_ctx = (
-        torch.cuda.device(q.device.index)
-        if q.device.index != torch.cuda.current_device()
-        else contextlib.nullcontext()
+        torch.cuda.device(q.device.index) if q.device.index != torch.cuda.current_device() else contextlib.nullcontext()
     )
     with device_ctx:
         return HopperChunkKDAFunction._forward_impl(
-            q, k, v, g, beta, A_log, dt_bias, scale, initial_state, output_final_state,
-            lower_bound, cu_seqlens, cu_seqlens_cpu, use_intracard_cp,
-            beta_is_logits, out, final_state,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            initial_state,
+            output_final_state,
+            lower_bound,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            use_intracard_cp,
+            beta_is_logits,
+            out,
+            final_state,
         )
 
 
@@ -76,9 +88,23 @@ class HopperChunkKDAFunction(torch.autograd.Function):
 
     @staticmethod
     def _forward_impl(
-        q, k, v, g, beta, A_log, dt_bias, scale, initial_state, output_final_state,
-        lower_bound, cu_seqlens, cu_seqlens_cpu, use_intracard_cp,
-        beta_is_logits, out, final_state,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        scale,
+        initial_state,
+        output_final_state,
+        lower_bound,
+        cu_seqlens,
+        cu_seqlens_cpu,
+        use_intracard_cp,
+        beta_is_logits,
+        out,
+        final_state,
     ):
         batch_size, seq_len, num_heads, head_dim = q.shape
 

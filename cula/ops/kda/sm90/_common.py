@@ -1,10 +1,7 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared low-level helpers for the SM90 FlashKDA kernels.
-
-"""
-
+"""Shared low-level helpers for the SM90 FlashKDA kernels."""
 
 import weakref
 
@@ -67,8 +64,8 @@ def _wrap_input(t: torch.Tensor, align: int, *, view_shape=None, cache: bool = F
     """Wrap a tensor as a CuTe tensor via from_dlpack.
 
     ``cache=True``: reuse across launches, keyed by (id, _version, align, view_shape)
-    and verified by weakref. 
-    
+    and verified by weakref.
+
     Use ``cache=False`` for per-call buffers (workspaces, states).
     """
     if not cache:
