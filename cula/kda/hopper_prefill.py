@@ -107,8 +107,6 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         else:
             beta = _beta_logits_bf16(beta)
 
-        # A trivial plan means "take the serial path"; a real plan is executed
-        # verbatim by run_cp (planning and execution cannot diverge).
         plan = plan_prefill(q, cu_seqlens, cu_seqlens_cpu, use_intracard_cp)
         if not plan.trivial:
             from cula.ops.kda.sm90.cp.driver import run_cp

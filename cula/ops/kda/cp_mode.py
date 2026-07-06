@@ -9,20 +9,13 @@ from enum import Enum
 
 
 class NotSplittableError(ValueError):
-    """Raised when intracard CP cannot split the given shape.
-
-    Subclasses ValueError so existing ``except ValueError`` callers keep working,
-    while new code can catch it narrowly and fall back to the serial path.
-    """
+    """Intracard CP cannot split the given shape. Subclasses ValueError so
+    existing ``except ValueError`` callers keep working."""
 
 
 class CPMode(Enum):
-    """User intent for intracard CP.
-
-    OFF runs the serial path, AUTO engages CP only when the planner judges it
-    profitable, FORCE engages whenever the shape is splittable and raises
-    NotSplittableError otherwise.
-    """
+    """OFF = serial path; AUTO = engage when profitable; FORCE = engage
+    whenever splittable, else NotSplittableError."""
 
     OFF = "off"
     AUTO = "auto"
@@ -30,9 +23,8 @@ class CPMode(Enum):
 
     @classmethod
     def parse(cls, use_intracard_cp, use_cp=None) -> "CPMode | None":
-        """Map the public ``use_intracard_cp`` argument ("auto"/True/False, with
-        ``use_cp`` as a deprecated alias) to a mode. None stays None so each
-        backend applies its own default."""
+        """Public use_intracard_cp value ("auto"/True/False; use_cp is a
+        deprecated alias) -> mode. None stays None (backend default)."""
         if use_intracard_cp is not None and use_cp is not None:
             raise TypeError("Pass only one of use_intracard_cp or use_cp.")
         value = use_intracard_cp if use_intracard_cp is not None else use_cp
