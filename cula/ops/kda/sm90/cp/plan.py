@@ -16,7 +16,6 @@ so no per-SKU recalibration.
 from __future__ import annotations
 
 import os
-import warnings
 import weakref
 from dataclasses import dataclass
 
@@ -30,33 +29,13 @@ CHUNK = 16
 # Manual-plan floor (s_split given): keeps hand-crafted splits non-degenerate.
 MIN_SEG_TILES = 4
 
-# Floor on auto segment length, tuned on H100: below this a segment's cold
-# start (TMA warmup, state init, launch gaps) dominates its chain work.
+# Floor on auto segment length, tuned on H100.
 AUTO_MIN_SEG_TILES = int(os.environ.get("CULA_KDA_CP_AUTO_MIN_SEG_TILES", "32"))
 
 # Per-tile cost of the CP re-run (pre_scan + segment-K2) relative to the
 # serial K2 chain, tuned on H100: splitting engages only when the critical
 # path shrinks by more than this.
 RERUN_RATIO = float(os.environ.get("CULA_KDA_CP_RERUN_RATIO", "3"))
-
-_REMOVED_KNOBS = sorted(
-    k
-    for k in os.environ
-    if k.startswith("CULA_KDA_CP_COST_")
-    or k
-    in (
-        "CULA_KDA_CP_ENGAGE_MARGIN",
-        "CULA_KDA_CP_MIN_SEG",
-        "CULA_KDA_CP_ENGAGE_MIN_TILES",
-        "CULA_KDA_CP_MIN_SEG_TILES",
-    )
-)
-if _REMOVED_KNOBS:
-    warnings.warn(
-        f"{_REMOVED_KNOBS} no longer have any effect: the calibrated CP cost model "
-        "was replaced by the dimensionless engage rule (see CULA_KDA_CP_RERUN_RATIO).",
-        stacklevel=2,
-    )
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -107,10 +86,10 @@ def _materialize(seq_tiles: list[int], n_segs: list[int]) -> CPPlan:
     """Split each sequence into its requested number of near-equal segments."""
     seg_cu = [0]
     per_seq = []
-    for r, n in zip(seq_tiles, n_segs):
-        n = min(n, r)  # zero-tile sequences get zero segments
+    for tiles, n in zip(seq_tiles, n_segs):
+        n = min(n, tiles)  # zero-tile sequences get zero segments
         first = len(seg_cu) - 1
-        base, rem = divmod(r, max(n, 1))
+        base, rem = divmod(tiles, max(n, 1))
         for i in range(n):
             seg_cu.append(seg_cu[-1] + base + (1 if i < rem else 0))
         per_seq.append((first, n))
@@ -122,25 +101,37 @@ def split_balanced(seq_tiles: list[int], H: int, sm_count: int) -> CPPlan:
     chain slots (sm_count // H); each sequence gets ceil(tiles/target)
     segments. Equal lengths (not counts) minimize the critical path; a full
     machine pushes the target past every sequence, so nothing splits."""
-    slots = max(1, sm_count // H)
-    target = max(AUTO_MIN_SEG_TILES, _ceil_div(sum(seq_tiles), slots))
-    n_segs = [max(1, min(_ceil_div(r, target), r // AUTO_MIN_SEG_TILES)) for r in seq_tiles]
+    parallel_segs = max(1, sm_count // H)  # segments the card can run at once
+    target_seg_tiles = max(AUTO_MIN_SEG_TILES, _ceil_div(sum(seq_tiles), parallel_segs))
+    n_segs = [max(1, min(_ceil_div(tiles, target_seg_tiles), tiles // AUTO_MIN_SEG_TILES)) for tiles in seq_tiles]
     return _materialize(seq_tiles, n_segs)
 
 
 def plan_auto(seq_tiles: list[int], H: int, sm_count: int) -> CPPlan:
     """split_balanced + profitability: wall = max(critical chain, per-slot
     load) on both sides, with CP tiles costing RERUN_RATIO more; engage only
-    when the serial wall exceeds the CP wall."""
+    when the serial wall exceeds the CP wall.
+
+    Example: seq_tiles = [896] + [8] * 16, H=16, 132 SMs:
+      parallel_segs    = 132 // 16 = 8 segments running at once
+      target_seg_tiles = max(32, ceil(1024 / 8)) = 128
+      split  = 896 -> 7 segments of 128; the 8-tile sequences stay whole
+      engage = serial wall max(896, 128) >= CP wall 3 * max(128, 128) -> CP
+
+    Counter-example: seq_tiles = [64], H=16 -> 2 segments of 32, but
+    serial wall 64 < CP wall 3 * 32 = 96 -> trivial plan (serial path).
+    """
     if not seq_tiles:
         return CPPlan.serial(seq_tiles, "empty input")
     plan = split_balanced(seq_tiles, H, sm_count)
     if plan.trivial:
         return CPPlan.serial(seq_tiles, "machine already full or sequences too short to split")
-    slots = max(1, sm_count // H)
-    load = _ceil_div(sum(seq_tiles), slots)
-    serial_wall = max(max(seq_tiles), load)
-    cp_wall = RERUN_RATIO * max(plan.max_seg_tiles, load)
+    parallel_segs = max(1, sm_count // H)
+    # No schedule finishes before the total work spread over the parallel
+    # slots, nor before its longest chain: wall = max of the two bounds.
+    load_bound = _ceil_div(sum(seq_tiles), parallel_segs)
+    serial_wall = max(max(seq_tiles), load_bound)
+    cp_wall = RERUN_RATIO * max(plan.max_seg_tiles, load_bound)
     if serial_wall < cp_wall:
         return CPPlan.serial(
             seq_tiles,
@@ -153,7 +144,7 @@ def plan_auto(seq_tiles: list[int], H: int, sm_count: int) -> CPPlan:
 def plan_manual(seq_tiles: list[int], s_split: int) -> CPPlan:
     """Up to s_split near-equal segments per sequence; no profitability
     judgment (tests, experiments)."""
-    n_segs = [max(1, min(s_split, r // max(1, MIN_SEG_TILES))) for r in seq_tiles]
+    n_segs = [max(1, min(s_split, tiles // max(1, MIN_SEG_TILES))) for tiles in seq_tiles]
     return _materialize(seq_tiles, n_segs)
 
 
