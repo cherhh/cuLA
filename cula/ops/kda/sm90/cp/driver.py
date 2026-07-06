@@ -3,9 +3,9 @@
 
 """Intracard-CP prefill executor: K1 once → pre_scan → merge → segment-K2.
 
-This module only *runs* a given CPPlan; deciding whether and how to split
-lives in cp.plan. The production wrapper plans via ``plan_prefill`` and calls
-``run_cp``; ``intracard_prefill`` is the plan-and-run entry for direct callers.
+Only *runs* a given CPPlan; planning lives in cp.plan. The wrapper calls
+run_cp with a plan from plan_prefill; intracard_prefill is the plan-and-run
+entry for direct callers.
 """
 
 from __future__ import annotations
@@ -121,13 +121,9 @@ def intracard_prefill(
     s_split=None,
     allow_fallback=True,
 ) -> None:
-    """Plan-and-run entry for direct callers (tests, experiments).
-
-    ``s_split`` forces a manual split; otherwise the auto planner decides
-    (structurally only when ``allow_fallback=False``, i.e. forced CP). A
-    trivial plan falls back to the serial kernel, or raises when
-    ``allow_fallback=False``.
-    """
+    """Plan-and-run for direct callers. s_split forces a manual split;
+    allow_fallback=False means forced CP (structural split only, raise on a
+    trivial plan); otherwise a trivial plan falls back to the serial kernel."""
     seq_tiles = _seq_tiles_of(q, cu_seqlens)
     H = q.shape[2]
     if s_split is not None:
@@ -206,7 +202,6 @@ def _run_pipeline(
     assert K == D
     device = q.device
 
-    # Varlen partial-tile metadata is an execution detail, not a plan property.
     if cu_seqlens is None:
         T_total = B * T
         tile_starts = tile_actual_lens = None

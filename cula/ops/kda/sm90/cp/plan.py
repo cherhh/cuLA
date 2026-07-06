@@ -3,15 +3,14 @@
 
 """Segment planning for SM90 KDA intracard context-parallel (CP) prefill.
 
-CP shortens the K2 critical path by splitting sequences into segments that
-recur in parallel, at the price of re-running the recurrence (pre_scan +
-segment-K2 instead of one serial K2). The planner answers "how to split" and
-"whether to" in one step: it returns the plan the executor runs verbatim, and
-a *trivial* plan (nothing split) means "take the serial path".
+CP re-runs the recurrence (pre_scan + segment-K2) to cut the serial-K2
+critical path, so a split must shrink the longest chain by more than the
+re-run cost. plan_* return the plan the executor runs verbatim; a trivial
+plan (nothing split) means "serial path".
 
-All decisions are dimensionless -- whole tiles, plus the GPU's SM count. The
-engage rule needs no calibrated time constants because it only compares
-same-species MMA chains against each other, so it holds across Hopper SKUs.
+Decisions use whole tiles + SM count. The two constants below are chain-cost
+ratios fitted on H100; ratios of same-species chains cancel absolute speed,
+so no per-SKU recalibration.
 """
 
 from __future__ import annotations
@@ -28,35 +27,16 @@ from cula.utils import get_device_sm_count
 
 CHUNK = 16
 
-# Lenient floor for *manual* plans (s_split given): just enough to keep
-# hand-crafted test splits non-degenerate. Not a tunable.
+# Manual-plan floor (s_split given): keeps hand-crafted splits non-degenerate.
 MIN_SEG_TILES = 4
 
-# ---------------------------------------------------------------------------
-# Decision constants. Exactly two dimensionless numbers enter the engage
-# decision (plus the runtime SM count). Both are RATIOS of the same species
-# of dependent-MMA chain, so absolute chain speed cancels and they hold
-# across Hopper SKUs. Derivations use the H100 SXM e2e-pipeline chain fits
-# (CUDA-event timing, 2026-07; "fixed" is the EFFECTIVE per-launch cost --
-# it includes the merge step and inter-kernel gaps, not just the isolated
-# kernel intercept):
-#   serial K2   1.48 us/tile + 84 us fixed
-#   pre_scan    2.39 us/tile + 27 us fixed
-#   segment-K2  1.69 us/tile + 19 us fixed
-# ---------------------------------------------------------------------------
-
-# Floor on auto segment length. Each segment restarts its chain cold (TMA
-# warmup, state init, fp32 state epilogue, plus its share of merge and
-# launch gaps): (27/2.39 + 19/1.69) ~= 22 tiles of effective chain work
-# across the two CP passes; 32 rounds up with headroom so segments always
-# amortize their cold start. Validated behaviorally by the local engage-
-# boundary probes rather than by intercept fits.
+# Floor on auto segment length, tuned on H100: below this a segment's cold
+# start (TMA warmup, state init, launch gaps) dominates its chain work.
 AUTO_MIN_SEG_TILES = int(os.environ.get("CULA_KDA_CP_AUTO_MIN_SEG_TILES", "32"))
 
-# CP re-runs the recurrence: pre_scan + segment-K2 cost (2.39 + 1.69) / 1.48
-# = 2.76x the serial K2 chain per tile; 3 rounds up to absorb the merge step
-# and fit error. Splitting pays off only when the critical path shrinks by
-# more than this.
+# Per-tile cost of the CP re-run (pre_scan + segment-K2) relative to the
+# serial K2 chain, tuned on H100: splitting engages only when the critical
+# path shrinks by more than this.
 RERUN_RATIO = float(os.environ.get("CULA_KDA_CP_RERUN_RATIO", "3"))
 
 _REMOVED_KNOBS = sorted(
@@ -85,13 +65,9 @@ def _ceil_div(a: int, b: int) -> int:
 
 @dataclass(frozen=True)
 class CPPlan:
-    """How sequences split into segments, in whole tiles.
-
-    Segments are numbered globally in packed order; segment ``i`` covers the
-    tile range ``[seg_cu[i], seg_cu[i+1])``. ``per_seq[s]`` is
-    ``(first_segment, n_segments)`` for sequence ``s``. A trivial plan means
-    "run the serial path"; ``reason`` says why.
-    """
+    """Segmentation in whole tiles: segment i covers packed tile range
+    [seg_cu[i], seg_cu[i+1]); per_seq[s] = (first_segment, n_segments).
+    Trivial (nothing split) means "serial path"; reason says why."""
 
     seq_tiles: tuple[int, ...]
     seg_cu: tuple[int, ...]
@@ -142,14 +118,10 @@ def _materialize(seq_tiles: list[int], n_segs: list[int]) -> CPPlan:
 
 
 def split_balanced(seq_tiles: list[int], H: int, sm_count: int) -> CPPlan:
-    """Split so equal-length segment chains fill one SM wave.
-
-    ``target`` is the global segment length that spreads the total load over
-    the machine's chain slots (SM count // H); every sequence gets
-    ``ceil(tiles / target)`` segments, floored so segments amortize their cold
-    start. Balancing segment lengths (not counts) minimizes the critical path,
-    and a full machine pushes ``target`` past every sequence so nothing splits.
-    """
+    """One-wave split: target segment length spreads the total load over the
+    chain slots (sm_count // H); each sequence gets ceil(tiles/target)
+    segments. Equal lengths (not counts) minimize the critical path; a full
+    machine pushes the target past every sequence, so nothing splits."""
     slots = max(1, sm_count // H)
     target = max(AUTO_MIN_SEG_TILES, _ceil_div(sum(seq_tiles), slots))
     n_segs = [max(1, min(_ceil_div(r, target), r // AUTO_MIN_SEG_TILES)) for r in seq_tiles]
@@ -157,12 +129,9 @@ def split_balanced(seq_tiles: list[int], H: int, sm_count: int) -> CPPlan:
 
 
 def plan_auto(seq_tiles: list[int], H: int, sm_count: int) -> CPPlan:
-    """split_balanced plus the profitability judgment.
-
-    Both paths are chain-bound, so each wall is max(critical chain, per-slot
-    load) in tiles -- with CP's chains costing RERUN_RATIO more per tile.
-    Engage only when the serial wall exceeds the CP wall.
-    """
+    """split_balanced + profitability: wall = max(critical chain, per-slot
+    load) on both sides, with CP tiles costing RERUN_RATIO more; engage only
+    when the serial wall exceeds the CP wall."""
     if not seq_tiles:
         return CPPlan.serial(seq_tiles, "empty input")
     plan = split_balanced(seq_tiles, H, sm_count)
@@ -182,8 +151,8 @@ def plan_auto(seq_tiles: list[int], H: int, sm_count: int) -> CPPlan:
 
 
 def plan_manual(seq_tiles: list[int], s_split: int) -> CPPlan:
-    """Split every sequence into up to ``s_split`` near-equal segments, no
-    profitability judgment -- the caller has decided (tests, experiments)."""
+    """Up to s_split near-equal segments per sequence; no profitability
+    judgment (tests, experiments)."""
     n_segs = [max(1, min(s_split, r // max(1, MIN_SEG_TILES))) for r in seq_tiles]
     return _materialize(seq_tiles, n_segs)
 
@@ -221,13 +190,9 @@ def plan_prefill(
     cu_seqlens_cpu: torch.Tensor | None = None,
     mode: CPMode | None = None,
 ) -> CPPlan:
-    """Mode-aware planning entry for the SM90 prefill wrapper.
-
-    Returns the plan the executor runs verbatim; a trivial plan means "take
-    the serial path". AUTO declines unprofitable splits; FORCE skips the
-    profitability judgment and raises NotSplittableError when the shape
-    cannot split at all.
-    """
+    """Planning entry for the prefill wrapper. Trivial plan -> serial path.
+    AUTO declines unprofitable splits; FORCE splits whenever possible and
+    raises NotSplittableError otherwise."""
     if mode is None or mode is CPMode.OFF:
         return CPPlan.serial((), "disabled")
     B, T, H, _K = q.shape
