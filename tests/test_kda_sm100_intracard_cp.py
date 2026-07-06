@@ -134,7 +134,7 @@ def run_intracard_direct(k, w, u, gk, h0, cu, *, output_final_state=True, save_n
     post-split occupancy guard rejects; mirror the production caller's graceful
     fallback to the serial path so configs that don't engage CP still return.
     """
-    from cula.ops.kda.policy import NotSplittableError
+    from cula.ops.kda.cp_mode import NotSplittableError
 
     try:
         return intracard_fwd_h(
@@ -257,7 +257,7 @@ def assert_cp_splits(cu, H, total_T):
 
 def test_forced_cp_not_splittable_raises():
     """use_intracard_cp=True on an unsplittable shape must raise NotSplittableError."""
-    from cula.ops.kda.policy import NotSplittableError
+    from cula.ops.kda.cp_mode import NotSplittableError
 
     # A single one-chunk sequence cannot be meaningfully split.
     cu = torch.tensor([0, BT], dtype=torch.int32, device=DEVICE)

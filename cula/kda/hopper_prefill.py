@@ -9,11 +9,8 @@ from typing import Literal
 import torch
 from torch.amp import custom_bwd, custom_fwd
 
-from cula.ops.kda.policy import (
-    IntracardCPMode,
-    resolve_intracard_cp_mode,
-    sm90_intracard_cp_decision,
-)
+from cula.ops.kda.cp_mode import CPMode
+from cula.ops.kda.sm90.cp.plan import plan_prefill
 from cula.ops.kda.sm90.fwd import flash_kda_fwd
 from cula.utils import assert_hopper
 
@@ -50,7 +47,7 @@ def _guarded_forward(
     lower_bound: float | None = None,
     cu_seqlens: torch.IntTensor | None = None,
     cu_seqlens_cpu: torch.IntTensor | None = None,
-    use_intracard_cp: IntracardCPMode | None = None,
+    use_intracard_cp: CPMode | None = None,
     beta_is_logits: bool = False,
     out: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
@@ -110,11 +107,14 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         else:
             beta = _beta_logits_bf16(beta)
 
-        cp_decision = sm90_intracard_cp_decision(q, cu_seqlens, cu_seqlens_cpu, use_intracard_cp)
-        if cp_decision.enabled:
-            from cula.ops.kda.sm90.cp.driver import intracard_prefill
+        # A trivial plan means "take the serial path"; a real plan is executed
+        # verbatim by run_cp (planning and execution cannot diverge).
+        plan = plan_prefill(q, cu_seqlens, cu_seqlens_cpu, use_intracard_cp)
+        if not plan.trivial:
+            from cula.ops.kda.sm90.cp.driver import run_cp
 
-            intracard_prefill(
+            run_cp(
+                plan,
                 q,
                 k,
                 v,
@@ -129,7 +129,6 @@ class HopperChunkKDAFunction(torch.autograd.Function):
                 final_state=final_state,
                 cu_seqlens=cu_seqlens,
                 state_transposed=False,
-                allow_fallback=False,
             )
         else:
             flash_kda_fwd(
@@ -286,7 +285,7 @@ def cula_kda_prefill(
     dt_bias = kwargs.pop("dt_bias", None)
     cu_seqlens_cpu = kwargs.pop("cu_seqlens_cpu", None)
     use_cp_alias = kwargs.pop("use_cp", None)
-    use_intracard_cp = resolve_intracard_cp_mode(use_intracard_cp, use_cp_alias)
+    use_intracard_cp = CPMode.parse(use_intracard_cp, use_cp_alias)
     if kwargs:
         raise TypeError(f"cula_kda_prefill got unexpected keyword arguments: {set(kwargs)}")
     if A_log is None:
