@@ -516,7 +516,6 @@ def _dispatch_cute(
         )
 
     k1_q, k1_k, k1_g, k1_beta = q, k, g, beta
-    k1_T_total = problem.B * problem.T
     k1_total_tiles = problem.total_tiles
     k1_tile_starts = None
     k1_tile_actual_lens = None
@@ -537,7 +536,6 @@ def _dispatch_cute(
             k1_k = k.contiguous()
             k1_g = g.contiguous()
             k1_beta = beta.contiguous()
-            k1_T_total = problem.T
             k1_total_tiles = varlen_meta.total_tiles
             k1_tile_starts = varlen_meta.tile_starts
             k1_tile_actual_lens = varlen_meta.tile_actual_lens

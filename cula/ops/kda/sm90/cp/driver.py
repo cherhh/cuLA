@@ -93,13 +93,38 @@ def run_cp(
     with _cute_arch_for_device(q.device):
         if cu_seqlens is None and q.shape[1] % CHUNK != 0:
             _run_padded_dense(
-                plan, q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
-                initial_state, final_state, state_transposed,
+                plan,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                out,
+                A_log,
+                dt_bias,
+                lower_bound,
+                initial_state,
+                final_state,
+                state_transposed,
             )
         else:
             _run_pipeline(
-                plan, q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
-                initial_state, final_state, cu_seqlens, state_transposed,
+                plan,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                out,
+                A_log,
+                dt_bias,
+                lower_bound,
+                initial_state,
+                final_state,
+                cu_seqlens,
+                state_transposed,
             )
 
 
@@ -136,15 +161,38 @@ def intracard_prefill(
         if not allow_fallback:
             raise NotSplittableError("SM90 intracard CP cannot split this shape.")
         flash_kda_fwd(
-            q, k, v, g, beta, scale=scale, out=out, A_log=A_log, dt_bias=dt_bias,
-            lower_bound=lower_bound, initial_state=initial_state, final_state=final_state,
-            cu_seqlens=cu_seqlens, state_transposed=state_transposed,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            out=out,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            initial_state=initial_state,
+            final_state=final_state,
+            cu_seqlens=cu_seqlens,
+            state_transposed=state_transposed,
         )
         return
     run_cp(
-        plan, q, k, v, g, beta, scale=scale, out=out, A_log=A_log, dt_bias=dt_bias,
-        lower_bound=lower_bound, initial_state=initial_state, final_state=final_state,
-        cu_seqlens=cu_seqlens, state_transposed=state_transposed,
+        plan,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=scale,
+        out=out,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        initial_state=initial_state,
+        final_state=final_state,
+        cu_seqlens=cu_seqlens,
+        state_transposed=state_transposed,
     )
 
 
@@ -159,8 +207,20 @@ def _pad_cp_inputs(pad, q, k, v, g, beta):
 
 
 def _run_padded_dense(
-    plan, q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
-    initial_state, final_state, state_transposed,
+    plan,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    out,
+    A_log,
+    dt_bias,
+    lower_bound,
+    initial_state,
+    final_state,
+    state_transposed,
 ) -> None:
     B, T, H, _ = q.shape
     pad_t = ((T + CHUNK - 1) // CHUNK) * CHUNK - T
@@ -172,8 +232,21 @@ def _run_padded_dense(
     pq, pk, pv, pg, pbeta = _pad_cp_inputs(_pad, q, k, v, g, beta)
     pout = out.new_empty((B, T + pad_t, H, D))
     _run_pipeline(
-        plan, pq, pk, pv, pg, pbeta, scale, pout, A_log, dt_bias, lower_bound,
-        initial_state, final_state, None, state_transposed,
+        plan,
+        pq,
+        pk,
+        pv,
+        pg,
+        pbeta,
+        scale,
+        pout,
+        A_log,
+        dt_bias,
+        lower_bound,
+        initial_state,
+        final_state,
+        None,
+        state_transposed,
     )
     out.copy_(pout[:, :T])
 
@@ -252,9 +325,7 @@ def _run_pipeline(
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
     # Longest-first launch order: stable sort -> identity for uniform splits.
     seg_tiles = plan.seg_tiles
-    seg_order = _get_plan_tensor(
-        tuple(sorted(range(n_seg), key=lambda i: -seg_tiles[i])), torch.int32, device
-    )
+    seg_order = _get_plan_tensor(tuple(sorted(range(n_seg), key=lambda i: -seg_tiles[i])), torch.int32, device)
     launch_pre_scan(
         v_flat,
         ws_beta,

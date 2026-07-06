@@ -22,7 +22,7 @@ class CPMode(Enum):
     FORCE = "force"
 
     @classmethod
-    def parse(cls, use_intracard_cp, use_cp=None) -> "CPMode | None":
+    def parse(cls, use_intracard_cp, use_cp=None) -> CPMode | None:
         """Public use_intracard_cp value ("auto"/True/False; use_cp is a
         deprecated alias) -> mode. None stays None (backend default)."""
         if use_intracard_cp is not None and use_cp is not None:
