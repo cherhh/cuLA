@@ -309,11 +309,12 @@ def test_cp_matches_serial_ragged_auto_plan(lens):
     """Ragged varlen batches planned by the duration-balanced auto planner
     (s_split=None). Splitting must not change any accumulation order, so CP
     output is required to be BIT-IDENTICAL to the serial path."""
-    from cula.ops.kda.sm90.cp.plan import auto_plan_segments
+    from cula.ops.kda.sm90.cp.plan import plan_auto
+    from cula.utils import get_device_sm_count
 
     seq_tiles = [(sl + 15) // 16 for sl in lens]
-    _s, seg_cu, _per_seq = auto_plan_segments(torch.device("cuda"), seq_tiles, H)
-    assert len(seg_cu) - 1 > len(lens), "precondition: auto planner must split this batch"
+    plan = plan_auto(seq_tiles, H, get_device_sm_count(torch.device("cuda")))
+    assert not plan.trivial, "precondition: auto planner must split this batch"
 
     total = sum(lens)
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, total, seed=7)
