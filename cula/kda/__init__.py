@@ -19,6 +19,8 @@ __all__ = [
     "kda_decode",
     "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",
+    "kda_prefill_hopper_opt",
+    "kda_prefill_hopper_auto",
 ]
 
 _LAZY = {
