@@ -19,6 +19,9 @@ class CPDecision:
     enabled: bool
     reason: str = ""
     force: bool = False
+    # cu_seqlens materialized on host by the auto heuristic, returned so the
+    # caller reuses it instead of paying a second D2H sync.
+    cu_seqlens_cpu: torch.Tensor | None = None
 
 
 def _env_default() -> CPMode:
@@ -62,5 +65,5 @@ def sm100_intracard_cp_decision(
 
     cpu = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.cpu()
     if should_use_intracard_cp(cpu, sm_count_provider(), num_qk_heads, chunk_size):
-        return CPDecision(True)
-    return CPDecision(False, "SM100 intracard CP heuristic declined for this shape.")
+        return CPDecision(True, cu_seqlens_cpu=cpu)
+    return CPDecision(False, "SM100 intracard CP heuristic declined for this shape.", cu_seqlens_cpu=cpu)
