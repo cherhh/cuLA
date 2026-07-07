@@ -2060,6 +2060,8 @@ def chunk_gated_delta_rule_fwd_h(
         is_inference=torch.is_inference_mode_enabled(),
         sm_count_provider=lambda: get_device_sm_count(k.device),
     )
+    if cp_decision.cu_seqlens_cpu is not None:
+        cu_seqlens_cpu = cp_decision.cu_seqlens_cpu
     if cp_decision.enabled:
         from cula.ops.kda.cp_mode import NotSplittableError
         from cula.ops.kda.sm100.cp.chunk_delta_h import intracard_fwd_h
