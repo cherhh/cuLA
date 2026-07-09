@@ -17,6 +17,9 @@
 __all__ = [
     "chunk_kda",
     "kda_decode",
+    "kda_decode_mtp",
+    "kda_decode_mtp_recurrent",
+    "kda_decode_mtp_recurrent_ws",
     "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",
     "kda_prefill_hopper_opt",
@@ -27,6 +30,12 @@ _LAZY = {
     "chunk_kda": ("cula.kda.chunk", "chunk_kda"),
     "kda_prefill_hopper": ("cula.kda.hopper_fused_fwd", "cula_kda_prefill"),
     "kda_decode": ("cula.ops.kda.decode.cute", "kda_decode"),
+    "kda_decode_mtp": ("cula.ops.kda.decode.mtp", "kda_decode_mtp"),
+    "kda_decode_mtp_recurrent": ("cula.ops.kda.decode.mtp", "kda_decode_mtp_recurrent"),
+    "kda_decode_mtp_recurrent_ws": (
+        "cula.ops.kda.decode.mtp",
+        "kda_decode_mtp_recurrent_ws",
+    ),
     "fused_sigmoid_gating_delta_rule_update": (
         "cula.ops.kda.decode.cute",
         "fused_sigmoid_gating_delta_rule_update",

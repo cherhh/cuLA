@@ -34,8 +34,10 @@ cuLA/
 │       │   │   ├── fwd_o.py      #   output (chunk_gla_fwd_o)
 │       │   │   ├── bwd_wy_dqkg.py#   backward wy/dqkg fused (used by chunk_bwd)
 │       │   │   └── cp/           #   SM100 intracard-CP: chunk_delta_h, pre_scan, merge
-│       │   ├── decode/           #   single-token decode
+│       │   ├── decode/           #   single-token + MTP decode
 │       │   │   ├── cute.py       #     kda_decode / fused_sigmoid_gating_delta_rule_update (CuTe DSL)
+│       │   │   ├── mtp.py        #     kda_decode_mtp recurrent / recurrent_ws MTP verify (CuTe DSL)
+│       │   │   ├── mtp_kvbuffer.py #   KVBuffer chunkwise MTP verify (shuffle / tensor_core) + flush
 │       │   │   └── reference_fla.py
 │       │   └── experimental/sm100_fused/   # [exp] unwired fully-fused
 │       │       ├── kda_fully_fused_wip.py   #   KDAChunkwise (~6k lines)
