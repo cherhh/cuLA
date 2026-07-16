@@ -24,7 +24,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import torch
 
 from benchmarks.utils import SEED, exclusive_cumsum, prepare_safe_gate_inputs, set_seed
-from cula.kda import kda_prefill_hopper as cula_kda_prefill
+from cula.kda import kda_prefill_hopper_cutedsl as cula_kda_prefill
 from cula.utils import assert_hopper, get_device_sm_count
 
 D = 128

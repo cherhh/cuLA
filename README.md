@@ -57,11 +57,10 @@ pip install -e third_party/flash-linear-attention
 pip install -e . --no-build-isolation
 ```
 
-**Build fat wheel (default builds all archs):**
+**Build fat wheel (SM90 + SM100 + SM103):**
 
 ```bash
-python -m build --wheel --no-isolation
-# Opt out per-arch: CULA_DISABLE_SM100=1 / CULA_DISABLE_SM103=1
+CULA_BUILD_ALL_ARCHS=1 python -m build --wheel --no-isolation
 ```
 
 ## Quick Start
@@ -153,6 +152,10 @@ python benchmarks/generate_benchmark_hopper_md.py
 python -m pytest tests/test_kda_sm100_chunk_vs_fla.py -v
 # Tests for modular KDA forward against naive KDA reference
 python -m pytest tests/test_kda_sm100_chunk_vs_naive.py -v
+# Tests for the KDA fused forward (SM90 CUDA C++)
+python -m pytest tests/test_kda_fused_fwd.py -v
+# Tests for the SM90 CuTeDSL two-kernel prefill + intracard CP (vs FLA)
+python -m pytest tests/test_kda_sm90_prefill_vs_fla.py tests/test_kda_sm90_intracard_cp.py -v
 # Tests for Lightning Attention prefill
 python tests/test_lightning_sm100_prefill.py
 # Tests for Lightning Attention decode

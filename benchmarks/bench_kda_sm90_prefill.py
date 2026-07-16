@@ -16,7 +16,7 @@
 """
 bench_kda_sm90_prefill.py — Benchmark: SM90 CuTeDSL KDA prefill vs FLA Triton baseline
 
-Hopper-only. Calls cula.kda.kda_prefill_hopper (cula_kda_prefill, the K1+K2
+Hopper-only. Calls cula.kda.kda_prefill_hopper_cutedsl (cula_kda_prefill, the K1+K2
 two-kernel prefill) directly -- no get_kda_fused_fwd dispatcher.
 
 Compares:
@@ -57,7 +57,7 @@ from benchmarks.utils import (
     relative_rms_error_rel_max_mean_abs,
     set_seed,
 )
-from cula.kda import kda_prefill_hopper as cula_kda_prefill
+from cula.kda import kda_prefill_hopper_cutedsl as cula_kda_prefill
 from cula.utils import assert_hopper, get_device_sm_version
 
 # ============================================================
