@@ -11,7 +11,8 @@ cuLA provides two KDA kernel implementations targeting different GPU architectur
 | Kernel | GPU | Import |
 |---|---|---|
 | Modular Forward | Blackwell (SM100) | `from cula.kda import chunk_kda` |
-| Two-Kernel Prefill | Hopper (SM90) | `from cula.kda import kda_prefill_hopper` |
+| Fused Forward | Hopper (SM90) | `from cula.kda import kda_prefill_hopper` |
+| Two-Kernel Prefill | Hopper (SM90) | `from cula.kda import kda_prefill_hopper_cutedsl` |
 
 Both are drop-in replacements for [FLA](https://github.com/fla-org/flash-linear-attention)'s `chunk_kda` — just change the import.
 
@@ -70,9 +71,9 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 ---
 
-### Two-Kernel Prefill (SM90 — Hopper)
+### Fused Forward (SM90 — Hopper)
 
-The SM90 prefill is a **two-kernel pipeline** — K1 (Prepare) → K2 (Recurrence) — *not* a single fused kernel. Intra-chunk attention, inter-chunk state propagation, and output are computed across the two kernels. **Forward-only; backward is not yet implemented.**
+The fused forward kernel fuses intra-chunk attention, inter-chunk state propagation, and output computation into a single kernel for maximum throughput. **Forward-only; backward is not yet implemented.**
 
 #### Example
 
@@ -109,6 +110,51 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 **Notes**
 
+- Mainly **suitable for large-batch inference**; performance is limited when both batch size and head count are small, because we do not parallelize over the sequence-length dimension.
+- **Matrix inversion uses fp16 precision**, which is faster and occupies less shared memory but introduces minor numerical differences compared to tf32 inversion.
+- **Intra-subchunk attention uses g-first as anchor**, which causes some numerical differences compared with the FLA Triton implementation (FLA uses g-half as anchor in the diagonal).
+
+---
+
+### Two-Kernel Prefill (SM90 — Hopper)
+
+The SM90 prefill is a **two-kernel pipeline** — K1 (Prepare) → K2 (Recurrence) — *not* a single fused kernel. Intra-chunk attention, inter-chunk state propagation, and output are computed across the two kernels. **Forward-only; backward is not yet implemented.**
+
+#### Example
+
+```python
+import torch
+from cula.kda import kda_prefill_hopper_cutedsl
+
+B, T, H, K, V = 2, 2048, 32, 128, 128
+device = 'cuda'
+
+q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
+k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
+v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
+g = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1
+beta = torch.randn(B, T, H, device=device, dtype=torch.bfloat16).sigmoid()
+A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
+dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
+init_state = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
+
+o, final_state = kda_prefill_hopper_cutedsl(
+    q=q, k=k, v=v, g=g, beta=beta,
+    A_log=A_log, dt_bias=dt_bias,
+    initial_state=init_state,
+    output_final_state=True,
+    use_qk_l2norm_in_kernel=True,
+    use_gate_in_kernel=True,
+    safe_gate=True,
+    lower_bound=-5.0,
+)
+
+print(f'Output shape: {o.shape}')             # [2, 2048, 32, 128]
+print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
+```
+
+**Notes**
+
 - Mainly **suitable for large-batch inference**. When both batch size and head count are small, throughput on long sequences is recovered by enabling **intra-card CP** (`use_intracard_cp`), which parallelizes the sequence-length dimension on a single GPU — see [Intra-Card Context Parallel](#intra-card-context-parallel).
 - **Matrix inversion uses fp16 precision**, which is faster and occupies less shared memory but introduces minor numerical differences compared to tf32 inversion.
 - **Intra-subchunk attention uses g-first as anchor**, which causes some numerical differences compared with the FLA Triton implementation (FLA uses g-half as anchor in the diagonal).
@@ -119,7 +165,7 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 Long sequences can be split into sub-sequences, processed in parallel on one GPU, and merged via a prefix scan — unlocking sequence-dimension parallelism. **Default off; inference-only.** Two surfaces:
 
-### SM90 — via `kda_prefill_hopper(use_intracard_cp=...)`
+### SM90 — via `kda_prefill_hopper_cutedsl(use_intracard_cp=...)`
 
 Pass `use_intracard_cp` (alias `use_cp`) to the Hopper prefill:
 
@@ -127,10 +173,10 @@ Pass `use_intracard_cp` (alias `use_cp`) to the Hopper prefill:
 - **`True`** — force CP; raises if the shape cannot be meaningfully split.
 - **`False`** (default) — CP off.
 
-Works with **any sequence length** (non-CHUNK-aligned is handled internally) and **dense or varlen** input. Tunable via `CULA_KDA_CP_MIN_SEG` (the auto-router skips CP below this many segments per sequence).
+Works with **any sequence length** (non-CHUNK-aligned is handled internally) and **dense or varlen** input. The auto decision uses the device SM count plus two tunables in `cula/ops/kda/sm90/cp/plan.py` (`CULA_KDA_CP_RERUN_RATIO`, `CULA_KDA_CP_AUTO_MIN_SEG_TILES`).
 
 ```python
-o, final_state = kda_prefill_hopper(
+o, final_state = kda_prefill_hopper_cutedsl(
     q=q, k=k, v=v, g=g, beta=beta, A_log=A_log, dt_bias=dt_bias,
     cu_seqlens=cu_seqlens,              # varlen packed (int32)
     output_final_state=True, use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0,

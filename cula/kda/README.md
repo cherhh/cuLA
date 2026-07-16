@@ -5,7 +5,8 @@
 | Symbol | Description | Arch | Direction |
 |--------|-------------|------|-----------|
 | `chunk_kda` | Chunked KDA prefill | SM100 (Blackwell) | Forward + backward |
-| `kda_prefill_hopper` | KDA prefill | SM90 (Hopper) | Forward only |
+| `kda_prefill_hopper` / `_opt` / `_auto` | KDA prefill (CUDA C++ fused) | SM90 (Hopper) | Forward only |
+| `kda_prefill_hopper_cutedsl` | KDA prefill (CuTeDSL K1+K2, intracard-CP capable) | SM90 (Hopper) | Forward only |
 | `kda_decode` | Single-token decode | SM100 | Forward |
 | `fused_sigmoid_gating_delta_rule_update` | Decode state update | SM100 | Forward |
 
@@ -15,7 +16,7 @@
 
 ```python
 import torch
-from cula.kda import kda_prefill_hopper
+from cula.kda import kda_prefill_hopper_cutedsl
 
 B, T, H, D = 1, 1024, 4, 128
 q = torch.randn(B, T, H, D, dtype=torch.bfloat16, device="cuda")
@@ -26,7 +27,7 @@ beta = torch.randn(B, T, H, dtype=torch.bfloat16, device="cuda")
 A_log = torch.randn(H, dtype=torch.float32, device="cuda")
 dt_bias = torch.randn(H * D, dtype=torch.float32, device="cuda")
 
-o, ht = kda_prefill_hopper(
+o, ht = kda_prefill_hopper_cutedsl(
     q, k, v, g, beta,
     A_log=A_log, dt_bias=dt_bias,
     scale=D**-0.5, lower_bound=-5.0,
@@ -57,7 +58,7 @@ cu_seqlens = torch.tensor([0, 256, 500, 1000], dtype=torch.int32, device="cuda")
 q = torch.randn(1, 1000, H, D, dtype=torch.bfloat16, device="cuda")
 # ... k, v, g, beta shaped [1, 1000, H, D] / [1, 1000, H]
 
-o, ht = kda_prefill_hopper(
+o, ht = kda_prefill_hopper_cutedsl(
     q, k, v, g, beta,
     A_log=A_log, dt_bias=dt_bias,
     scale=D**-0.5, lower_bound=-5.0,
@@ -71,7 +72,7 @@ o, ht = kda_prefill_hopper(
 
 ```python
 # "auto": use CP only when beneficial for the given sequence lengths
-o, ht = kda_prefill_hopper(
+o, ht = kda_prefill_hopper_cutedsl(
     q, k, v, g, beta,
     A_log=A_log, dt_bias=dt_bias,
     scale=D**-0.5, lower_bound=-5.0,
