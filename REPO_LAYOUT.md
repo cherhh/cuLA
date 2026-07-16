@@ -15,7 +15,7 @@ cuLA/
 │   │   ├── chunk_fwd.py          # chunk_kda_fwd — fwd orchestration (lazy-imports kernels)
 │   │   ├── chunk_intra.py        # fwd intra (C++ ext) + bwd intra (Triton)
 │   │   ├── chunk_bwd.py          # chunk_kda_bwd — Triton + FLA + CuTeDSL + C++ mix
-│   │   └── hopper_prefill.py   # cula_kda_prefill (=kda_prefill_hopper_cutedsl) — SM90 two-kernel K1+K2 prefill, fwd-only
+│   │   └── flashkda.py   # cula_kda_prefill (=flashkda_prefill) — SM90 two-kernel K1+K2 prefill, fwd-only
 │   │
 │   ├── lightning/                # [non-KDA] Lightning Attention operator (LinearAttentionChunkwiseDecay, lightning_attn_fwd, linear_attention_decode)
 │   │   └── __init__.py
@@ -68,7 +68,7 @@ cuLA/
 
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| `cula/kda/` | Python | KDA **public API only** — autograd + dispatch, no kernels. Two prefill entries: modular chunk `chunk_kda` (SM100) and two-kernel K1+K2 `kda_prefill_hopper_cutedsl` (SM90; the CUDA C++ fused path stays on `kda_prefill_hopper`). See [`cula/kda/README.md`](cula/kda/README.md). |
+| `cula/kda/` | Python | KDA **public API only** — autograd + dispatch, no kernels. Two prefill entries: modular chunk `chunk_kda` (SM100) and two-kernel K1+K2 `flashkda_prefill` (SM90; the CUDA C++ fused path stays on `kda_prefill_hopper`). See [`cula/kda/README.md`](cula/kda/README.md). |
 | `cula/ops/kda/` | Python (CuTe DSL) | **All KDA backends**, by arch: `sm100/` (+cp), `sm90/` (+cp), `decode/`, `experimental/`, plus `policy.py` (CP dispatch). Both prefill backends are chunked forward; arch is the discriminator (1 impl each). |
 | `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTe DSL) | `[non-KDA]` Lightning/linear attention kernels. |
 | `cula/ops/{inv,ptx}.py`, `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers (kept in place; not KDA-specific). |
