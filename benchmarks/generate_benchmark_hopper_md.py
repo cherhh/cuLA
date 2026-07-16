@@ -3,7 +3,7 @@
 generate_benchmark_hopper_md.py — Run Hopper (SM90) benchmarks and generate BENCHMARK_hopper.md
 
 Currently supported Hopper benchmarks:
-  - KDA prefill (cula.kda.hopper_prefill — SM90 K1+K2 two-kernel)
+  - KDA prefill (cula.kda.flashkda — SM90 K1+K2 two-kernel)
 
 Reuses bench_kda_sm90_prefill.py (calls cula_kda_prefill directly).
 

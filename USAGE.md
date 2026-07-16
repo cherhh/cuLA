@@ -12,7 +12,7 @@ cuLA provides two KDA kernel implementations targeting different GPU architectur
 |---|---|---|
 | Modular Forward | Blackwell (SM100) | `from cula.kda import chunk_kda` |
 | Fused Forward | Hopper (SM90) | `from cula.kda import kda_prefill_hopper` |
-| Two-Kernel Prefill | Hopper (SM90) | `from cula.kda import kda_prefill_hopper_cutedsl` |
+| Two-Kernel Prefill | Hopper (SM90) | `from cula.kda import flashkda_prefill` |
 
 Both are drop-in replacements for [FLA](https://github.com/fla-org/flash-linear-attention)'s `chunk_kda` — just change the import.
 
@@ -124,7 +124,7 @@ The SM90 prefill is a **two-kernel pipeline** — K1 (Prepare) → K2 (Recurrenc
 
 ```python
 import torch
-from cula.kda import kda_prefill_hopper_cutedsl
+from cula.kda import flashkda_prefill
 
 B, T, H, K, V = 2, 2048, 32, 128, 128
 device = 'cuda'
@@ -138,7 +138,7 @@ A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
 dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
 init_state = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
 
-o, final_state = kda_prefill_hopper_cutedsl(
+o, final_state = flashkda_prefill(
     q=q, k=k, v=v, g=g, beta=beta,
     A_log=A_log, dt_bias=dt_bias,
     initial_state=init_state,
@@ -165,7 +165,7 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 Long sequences can be split into sub-sequences, processed in parallel on one GPU, and merged via a prefix scan — unlocking sequence-dimension parallelism. **Default off; inference-only.** Two surfaces:
 
-### SM90 — via `kda_prefill_hopper_cutedsl(use_intracard_cp=...)`
+### SM90 — via `flashkda_prefill(use_intracard_cp=...)`
 
 Pass `use_intracard_cp` (alias `use_cp`) to the Hopper prefill:
 
@@ -176,7 +176,7 @@ Pass `use_intracard_cp` (alias `use_cp`) to the Hopper prefill:
 Works with **any sequence length** (non-CHUNK-aligned is handled internally) and **dense or varlen** input. The auto decision uses the device SM count plus two tunables in `cula/ops/kda/sm90/cp/plan.py` (`CULA_KDA_CP_RERUN_RATIO`, `CULA_KDA_CP_AUTO_MIN_SEG_TILES`).
 
 ```python
-o, final_state = kda_prefill_hopper_cutedsl(
+o, final_state = flashkda_prefill(
     q=q, k=k, v=v, g=g, beta=beta, A_log=A_log, dt_bias=dt_bias,
     cu_seqlens=cu_seqlens,              # varlen packed (int32)
     output_final_state=True, use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0,

@@ -29,7 +29,7 @@ import torch
 from fla.ops.kda.chunk import chunk_kda as fla_chunk_kda
 from fla.utils import assert_close, device
 
-from cula.kda import kda_prefill_hopper_cutedsl as cula_kda_prefill
+from cula.kda import flashkda_prefill as cula_kda_prefill
 
 pytestmark = [
     pytest.mark.sm90_only,
