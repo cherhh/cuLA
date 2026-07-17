@@ -60,17 +60,11 @@ from benchmarks.utils import (
 from cula.kda import flashkda_prefill as cula_kda_prefill
 from cula.utils import assert_hopper, get_device_sm_version
 
-# ============================================================
-# SM90-only resolution
-# ============================================================
 _device = torch.device("cuda")
 assert_hopper(_device)
 _major, _minor = get_device_sm_version(_device)
 _SM_TAG = f"sm{_major}{_minor}"
 
-# ============================================================
-# Constants
-# ============================================================
 H, D = 64, 128
 WARMUP = 25
 N_ITERS = 100
@@ -79,9 +73,6 @@ SANITIZER_MODE = False
 HAS_INIT_STATE = False
 
 
-# ============================================================
-# Helpers
-# ============================================================
 def run_fla(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lower_bound):
     return fla_chunk_kda(
         q=q,
@@ -167,9 +158,6 @@ def _make_common(B, T, cu_seqlens, device):
     )
 
 
-# ============================================================
-# Fixed-length / varlen benchmarks
-# ============================================================
 def bench_fixed(configs):
     print("\n" + "=" * 100)
     print(f" Fixed-Length Benchmark: SM90 cula_kda_prefill ({_SM_TAG}) vs FLA Triton")
@@ -230,9 +218,6 @@ def bench_varlen(configs):
     return results
 
 
-# ============================================================
-# Report
-# ============================================================
 def print_report(fixed_results, varlen_results):
     sep = "=" * 110
     print(f"\n\n{sep}")
@@ -280,9 +265,6 @@ def print_report(fixed_results, varlen_results):
     print(f"\n{sep}\n")
 
 
-# ============================================================
-# Main
-# ============================================================
 def main():
     parser = argparse.ArgumentParser(description="bench_kda_sm90_prefill: SM90 cula_kda_prefill vs FLA Triton")
     parser.add_argument(

@@ -80,8 +80,6 @@ def k1_kernel(
     kinter_qk_layout = cute.tile_to_shape(kinter_atom_qk, (CHUNK, D), order=(0, 1))
     cc_layout = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
 
-    # ---- SMEM allocations (union aliasing) ----
-    # Input tiles (plain layout, TMA load targets)
     sQ = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sK = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
     sG_raw = smem.allocate_tensor(cutlass.BFloat16, qk_layout, 128)
@@ -92,7 +90,6 @@ def k1_kernel(
     s_q_decayed = cute.make_tensor(sQ.iterator, kinter_qk_layout)
     s_k_decayed = cute.make_tensor(sK.iterator, kinter_qk_layout)
     s_k_restored = cute.make_tensor(sG_raw.iterator, kinter_qk_layout)
-    # L/Mqk MMA outputs
     sL_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     sMqk_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     sBetaSig = smem.allocate_tensor(cutlass.Float32, cute.make_layout((CHUNK,)), 128)
@@ -151,7 +148,6 @@ def k1_kernel(
         cute.group_modes(gSrc_g, 0, 2),
     )
 
-    # ---- TMA store partitioning for ws_qd / ws_kd / ws_kr ----
     gDst_qd = cute.local_tile(tma_tensor_ws_qd, (CHUNK, D), (None, None, None))
     tQDws_s, tQDws_g = cpasync.tma_partition(
         tma_atom_ws_qd,
@@ -212,7 +208,6 @@ def k1_kernel(
                 sG_raw[r, col_tail] = cutlass.BFloat16(0.0)
     cute.arch.barrier()
 
-    # L2 normalize
     row = tidx // 16
     sQ_tile = cute.flat_divide(sQ, (1, 8))  # ((1,8), CHUNK, D//8)
     sK_tile = cute.flat_divide(sK, (1, 8))
@@ -243,7 +238,6 @@ def k1_kernel(
         r_k_bf[0, j] = cutlass.BFloat16(k_vals[j] * k_inv)
     cute.autovec_copy(r_q_bf, sQ_my)
     cute.autovec_copy(r_k_bf, sK_my)
-    # Gate cumsum
     a_log_exp = cute.exp(cutlass.Float32(a_log[head_idx]), fastmath=True)
     if tidx < 128:
         col_c = tidx
@@ -269,7 +263,6 @@ def k1_kernel(
         # Emit raw beta into the compact wt_l workspace (tail rows = -80 -> sigmoid~0).
         ws_beta[(head_idx * total_tiles + tile_idx) * CHUNK + tidx] = cutlass.BFloat16(bv)
 
-    # decay_apply
     lane = tidx % 32
     warp_id = tidx // 32
     group = lane // 4
@@ -278,7 +271,6 @@ def k1_kernel(
     N_N: cutlass.Constexpr[int] = D // 64  # = 2
     N_TILES: cutlass.Constexpr[int] = N_M * N_N  # = 4
 
-    # Phase A: load g/q/k/g_total into regs
     reg_g = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.Float32)
     reg_q = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
     reg_k = cute.make_rmem_tensor(cute.make_layout((N_TILES, 2)), cutlass.BFloat16)
@@ -299,7 +291,6 @@ def k1_kernel(
 
     cute.arch.barrier()
 
-    # Phase B: compute decay and store to swizzled SMEM
     r_qd_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
     r_kd_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
     r_ki_pack = cute.make_rmem_tensor(cute.make_layout((1, 2)), cutlass.BFloat16)
@@ -335,10 +326,8 @@ def k1_kernel(
         ws_gt[gt_base + tidx] = s_g_total[tidx]
     cute.arch.barrier()
 
-    # ---- TMA bulk stores for ws_qd / ws_kd / ws_kr ----
     # All 5 TMA stores must come from one thread (cp.async.bulk groups are per-thread).
 
-    # ---- L/Mqk: two parallel single-warp 16x16x16 MMAs ----
     mma_atom_mask_mma = warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))
     tiled_mma_mask_mma = cute.make_tiled_mma(
         mma_atom_mask_mma,
@@ -368,7 +357,6 @@ def k1_kernel(
     sB_ref = sB_tile[None, None, 0, 0]
 
     if warp_idx == 0:
-        # ---- Warp 0: L = s_k_decayed @ s_k_inv^T ----
         sA_tile_l = cute.flat_divide(s_k_decayed, (CHUNK, 16))
         sA_ref_l = sA_tile_l[None, None, 0, 0]
         tCrA_l = thr_mma_mask_mma.make_fragment_A(thr_mma_mask_mma.partition_A(sA_ref_l))
@@ -404,7 +392,6 @@ def k1_kernel(
             smem_thr_store_mask_mma.partition_D(sL_bf16),
         )
     elif warp_idx == 1:
-        # ---- Warp 1: Mqk = s_q_decayed @ s_k_inv^T ----
         sA_tile_m = cute.flat_divide(s_q_decayed, (CHUNK, 16))
         sA_ref_m = sA_tile_m[None, None, 0, 0]
         tCrA_m = thr_mma_mask_mma.make_fragment_A(thr_mma_mask_mma.partition_A(sA_ref_m))
@@ -441,7 +428,6 @@ def k1_kernel(
         )
     cute.arch.barrier()
 
-    # Neumann inverse
     i = tidx // CHUNK
     col = tidx % CHUNK
     l_bf = cutlass.Float32(sL_bf16[i, col])
@@ -488,13 +474,11 @@ def k1_kernel(
 
         N_REGS_U32: cutlass.Constexpr[int] = 4  # 8 fp16 / thread = 4 u32
 
-        # ---- L² = L · L^T ----
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrLpowB_u32[ii] = movm_t_b16(cutlass.Int32(tCrL_u32[ii]))
         tCrLpow.fill(0.0)
         cute.gemm(tiled_mma_neumann, tCrLpow, tCrL, tCrLpowB, tCrLpow)
 
-        # ---- INV += INV · L²^T ----
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrLpowB_u32[ii] = movm_t_b16(cutlass.Int32(tCrLpow_u32[ii]))
         tCrDelta.fill(0.0)
@@ -502,13 +486,11 @@ def k1_kernel(
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrInv_u32[ii] = add_f16x2_u32(cutlass.Int32(tCrInv_u32[ii]), cutlass.Int32(tCrDelta_u32[ii]))
 
-        # ---- L⁴ = L² · L²^T (B reused: still MOVM_T(L²)) ----
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrLpowA_u32[ii] = tCrLpow_u32[ii]
         tCrLpow.fill(0.0)
         cute.gemm(tiled_mma_neumann, tCrLpow, tCrLpowA, tCrLpowB, tCrLpow)
 
-        # ---- INV += INV · L⁴^T ----
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrLpowB_u32[ii] = movm_t_b16(cutlass.Int32(tCrLpow_u32[ii]))
         tCrDelta.fill(0.0)
@@ -516,13 +498,11 @@ def k1_kernel(
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrInv_u32[ii] = add_f16x2_u32(cutlass.Int32(tCrInv_u32[ii]), cutlass.Int32(tCrDelta_u32[ii]))
 
-        # ---- L⁸ = L⁴ · L⁴^T (B reused: still MOVM_T(L⁴)) ----
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrLpowA_u32[ii] = tCrLpow_u32[ii]
         tCrLpow.fill(0.0)
         cute.gemm(tiled_mma_neumann, tCrLpow, tCrLpowA, tCrLpowB, tCrLpow)
 
-        # ---- INV += INV · L⁸^T ----
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrLpowB_u32[ii] = movm_t_b16(cutlass.Int32(tCrLpow_u32[ii]))
         tCrDelta.fill(0.0)
@@ -530,7 +510,6 @@ def k1_kernel(
         for ii in cutlass.range_constexpr(N_REGS_U32):
             tCrInv_u32[ii] = add_f16x2_u32(cutlass.Int32(tCrInv_u32[ii]), cutlass.Int32(tCrDelta_u32[ii]))
 
-        # Cast fp16 -> bf16, STSM to sINV_bf16
         tCrInvC = thr_mma_neumann.make_fragment_C(tiled_mma_neumann.partition_shape_C((CHUNK, CHUNK)))
         tCrInvC_u32 = cute.recast_tensor(tCrInvC, dtype=cutlass.Int32)
         for ii in cutlass.range_constexpr(N_REGS_U32):

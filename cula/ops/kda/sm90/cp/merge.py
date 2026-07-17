@@ -40,9 +40,6 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cula.ops.kda.sm90.k2 import D, _get_current_custream
 from cula.ops.ptx import cvt_f32_to_tf32, mma_m16n8k8_tf32
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 _BR = 64
 _BN = 64
 _M_THR = 8
@@ -52,9 +49,6 @@ _VEC = 4
 _PAD = 8
 
 
-# ---------------------------------------------------------------------------
-# Kernel class
-# ---------------------------------------------------------------------------
 class Merge:
     """SMEM-resident carry merge.
 
@@ -168,7 +162,6 @@ class Merge:
         t_m = tidx // _N_THR
         t_n = tidx % _N_THR
 
-        # ---- Initialize sH from init or zeros ----
         if cutlass.const_expr(self.has_init):
             g_init = init[i_seq, i_h, None, None]
             for j in cutlass.range_constexpr(self.num_col_tiles):
@@ -193,7 +186,6 @@ class Merge:
                         sH[r, g * _col_stride + t_n * _VEC + c] = cutlass.Float32(0.0)
             cute.arch.barrier()
 
-        # ---- Store initial carry → carries[first] ----
         g_c0 = carries[first, i_h, None, None]
         for j in cutlass.range_constexpr(self.num_col_tiles):
             gC = cute.local_tile(g_c0, tiler=(_BR, _BN), coord=(i_r, j))
@@ -204,15 +196,12 @@ class Merge:
                 thr_store.partition_D(gC),
             )
 
-        # ---- Pre-declare scalars for type stability ----
         seg_idx = cutlass.Int32(0)
         idx = cutlass.Int32(0)
 
-        # ---- Main merge loop ----
         for idx in cutlass.range(0, n_seg - 1, unroll=0):
             seg_idx = first + idx
 
-            # -- Load b_seg[seg_idx, i_h] → sB (BR rows for this tile) --
             g_b = b_seg[seg_idx, i_h, None, None]
             for j in cutlass.range_constexpr(self.num_col_tiles):
                 gB = cute.local_tile(g_b, tiler=(_BR, _BN), coord=(i_r, j))
@@ -223,7 +212,6 @@ class Merge:
                     thr_copy.partition_D(sBj),
                 )
 
-            # -- Load m_seg[seg_idx, i_h] → sM (full D×D, BN-wide tiles) --
             g_m = m_seg[seg_idx, i_h, None, None]
             for j in cutlass.range_constexpr(self.num_col_tiles):
                 gM = cute.local_tile(g_m, tiler=(D, _BN), coord=(0, j))
@@ -238,7 +226,6 @@ class Merge:
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
 
-            # -- TF32 MMA: new_carry = carry @ M + B --
             # A = sH (carry rows), B = sM (transition cols)
             warp_id = tidx // 32
             lane = tidx % 32
@@ -254,7 +241,6 @@ class Merge:
                 cutlass.Float32,
             )
 
-            # Init acc from sB (offset)
             for mi in cutlass.range_constexpr(M_TILES):
                 row_a = warp_id * 16 + mi * 16 + q
                 row_b = row_a + 8
@@ -276,7 +262,6 @@ class Merge:
 
             for ki in cutlass.range_constexpr(K_TILES):
                 k_base = ki * 8
-                # A fragments from sH (carry)
                 for mi in cutlass.range_constexpr(M_TILES):
                     row_a = warp_id * 16 + mi * 16 + q
                     row_b = row_a + 8
@@ -284,12 +269,10 @@ class Merge:
                     a_frag[mi, 1] = cvt_f32_to_tf32(sH[row_b, k_base + rp])
                     a_frag[mi, 2] = cvt_f32_to_tf32(sH[row_a, k_base + rp + 4])
                     a_frag[mi, 3] = cvt_f32_to_tf32(sH[row_b, k_base + rp + 4])
-                # B fragments from sM (transition)
                 for nj in cutlass.range_constexpr(N_TILES):
                     col_b = nj * 8 + q
                     b_frag[nj, 0] = cvt_f32_to_tf32(sM[k_base + rp, col_b])
                     b_frag[nj, 1] = cvt_f32_to_tf32(sM[k_base + rp + 4, col_b])
-                # MMA
                 for mi in cutlass.range_constexpr(M_TILES):
                     for nj in cutlass.range_constexpr(N_TILES):
                         d0, d1, d2, d3 = mma_m16n8k8_tf32(
@@ -309,7 +292,6 @@ class Merge:
                         acc[mi, nj, 2] = d2
                         acc[mi, nj, 3] = d3
 
-            # Write acc → sH (carry updated for next iteration)
             cute.arch.barrier()
             for mi in cutlass.range_constexpr(M_TILES):
                 row_a = warp_id * 16 + mi * 16 + q
@@ -321,7 +303,6 @@ class Merge:
                     sH[row_b, col_a] = acc[mi, nj, 2]
                     sH[row_b, col_a + 1] = acc[mi, nj, 3]
 
-            # Store sH → carries[seg_idx + 1]
             cute.arch.barrier()
             g_c_out = carries[seg_idx + 1, i_h, None, None]
             for j in cutlass.range_constexpr(self.num_col_tiles):
@@ -336,9 +317,6 @@ class Merge:
             cute.arch.barrier()
 
 
-# ---------------------------------------------------------------------------
-# Compile cache
-# ---------------------------------------------------------------------------
 def _compile_merge(H: int, has_init: int):
     kernel_obj = Merge(H=H, has_init=has_init)
 
@@ -422,9 +400,6 @@ def _get_dummy_init(H: int, device: torch.device) -> torch.Tensor:
     return cached
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 def launch_merge(
     carries: torch.Tensor,
     m_seg: torch.Tensor,

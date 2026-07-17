@@ -60,7 +60,6 @@ def sm100_intracard_cp_decision(
     if mode is CPMode.FORCE:
         return CPDecision(True, force=True)
 
-    # auto: consult the CPU-only perf heuristic.
     from cula.ops.kda.sm100.cp.chunk_delta_h import should_use_intracard_cp
 
     cpu = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.cpu()

@@ -13,9 +13,6 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T as _T
 
 
-# ============================================================================
-# NVVM / inline-PTX helpers
-# ============================================================================
 @cutlass.dsl_user_op
 def movm_t_b16(src_u32: Int32, *, loc=None, ip=None) -> Int32:
     """``movmatrix.sync.aligned.m8n8.trans.b16`` -- register-file 8x8 b16 transpose."""
@@ -53,9 +50,6 @@ def add_f16x2_u32(a_u32: Int32, b_u32: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(result)
 
 
-# ============================================================================
-# Input wrapping
-# ============================================================================
 _WRAP_CACHE: dict = {}
 _WRAP_CACHE_MAXSIZE = 512
 

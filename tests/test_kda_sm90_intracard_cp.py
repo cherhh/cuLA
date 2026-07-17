@@ -116,9 +116,6 @@ def _run_cp(q, k, v, g, beta, A_log, dt_bias, init=None, want_final=True, cu=Non
     return out, fin
 
 
-# ---------------------------------------------------------------------------
-# CP vs serial (same K1/K2, isolates CP-specific logic)
-# ---------------------------------------------------------------------------
 @needs_cuda
 @pytest.mark.parametrize("s_split", [1, 2, 4, 7])
 def test_cp_matches_serial_fixed(s_split):
@@ -170,9 +167,6 @@ def test_cp_no_final_state():
     _assert_cp_matches(out_cp, out_ref, "o")
 
 
-# ---------------------------------------------------------------------------
-# Non-CHUNK-aligned inputs
-# ---------------------------------------------------------------------------
 @needs_cuda
 @pytest.mark.parametrize(
     "lens",
@@ -203,9 +197,6 @@ def test_cp_matches_serial_dense_nonaligned(T):
     _assert_cp_matches(fin_cp, fin_ref, "ht")
 
 
-# ---------------------------------------------------------------------------
-# CP vs FLA (ground truth) — forced CP via public API
-# ---------------------------------------------------------------------------
 def _check_cp_vs_fla(T, *, with_state, cu, seed):
     n_state = (cu.numel() - 1) if cu is not None else 1
     q, k, v, g, beta, A_log, dt_bias, h0 = _make_fla_inputs(T, with_state=with_state, n_state=n_state, seed=seed)
@@ -266,9 +257,6 @@ def test_cp_vs_fla_varlen_with_state():
     _check_cp_vs_fla(sum(lens), with_state=True, cu=cu, seed=7)
 
 
-# ---------------------------------------------------------------------------
-# Determinism
-# ---------------------------------------------------------------------------
 _DETERMINISM_ITERS = 10000
 
 
@@ -294,9 +282,6 @@ def test_cp_determinism_varlen():
         assert torch.equal(fin, fin0), f"non-deterministic varlen ht at iter {i}"
 
 
-# ---------------------------------------------------------------------------
-# Ragged batches through the auto planner (duration-balanced splitting)
-# ---------------------------------------------------------------------------
 @needs_cuda
 @pytest.mark.parametrize(
     "lens",

@@ -126,7 +126,6 @@ def k2_kernel(
     sState = smem.allocate_tensor(cutlass.BFloat16, state_layout, 128)
     sGt = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D, 1, STAGES), stride=(1, D, D)), 128)
     sBeta = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((CHUNK, 1, STAGES), stride=(1, 64, 64)), 128)
-    # ---- mbarriers ----
     sMbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((STAGES,)), 16)
     sMbar_ptr = sMbar.iterator
     sMbarE = smem.allocate_tensor(cutlass.Int64, cute.make_layout((STAGES,)), 16)
@@ -149,7 +148,6 @@ def k2_kernel(
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
 
-    # --- TMA partitioning ---
     gSrc_v = cute.local_tile(tma_tensor_v, (CHUNK, D), (None, None, None))
     tVs, tVg = cpasync.tma_partition(
         tma_atom_v,
@@ -223,7 +221,6 @@ def k2_kernel(
         cute.group_modes(gSrc_beta, 0, 2),
     )
 
-    # Init state to zero.
     if tidx < D:
         for e in cutlass.range_constexpr(D):
             sState[tidx, e] = cutlass.BFloat16(0.0)
@@ -243,7 +240,6 @@ def k2_kernel(
                     )
     cute.arch.barrier()
 
-    # --- MMA setup ---
     mma_atom = warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))
     tiled_mma = cute.make_tiled_mma(
         mma_atom,
@@ -281,7 +277,6 @@ def k2_kernel(
     smem_tiled_copy_A_state = cute.make_tiled_copy_A(copy_atom_B_T, tiled_mma_state)
     smem_thr_copy_A_state = smem_tiled_copy_A_state.get_slice(tidx)
 
-    # Reference sub-tiles (stage 0) for fragment construction.
     sKd_s0 = sKd[(None, None, 0)]
     sQd_s0 = sQd[(None, None, 0)]
     sKd_tile0 = cute.flat_divide(sKd_s0, (CHUNK, 16))
@@ -315,7 +310,6 @@ def k2_kernel(
     sKr_T_view_s0 = sKr_T_view[(None, None, 0)]
     sKr_T_ref = cute.flat_divide(sKr_T_view_s0, (D, CHUNK))[None, None, 0, 0]
 
-    # State update blocked (D, D) GEMM.
     sKr_T_blk_for_frag = cute.flat_divide(sKr_T_view_s0, (CHUNK, CHUNK))[None, None, 0, 0]
     tCrKrA_state_blk = thr_mma_state.make_fragment_A(thr_mma_state.partition_A(sKr_T_blk_for_frag))
     tCrKrA_state_blk_cv = smem_thr_copy_A_state.retile(tCrKrA_state_blk)
@@ -341,7 +335,6 @@ def k2_kernel(
     TMA_BYTES: cutlass.Constexpr[int] = 4 * CHUNK * D * 2 + 2 * CHUNK * CHUNK * 2 + D * 4 + CHUNK * 2
 
     if warp_idx == LOAD_WARP_IDX:
-        # ===== LOAD WARP =====
         s_dyn_l = cutlass.Int32(0)
         phase_emp = cutlass.Int32(1)
         if cutlass.const_expr(v_is_varlen):
@@ -378,7 +371,6 @@ def k2_kernel(
                 s_dyn_l = cutlass.Int32(0)
                 phase_emp = phase_emp ^ cutlass.Int32(1)
     elif warp_idx == STORE_WARP_IDX:
-        # ===== STORE WARP =====
         if cutlass.const_expr(v_is_varlen):
             universal_copy_bits: cutlass.Constexpr[int] = 128
             async_copy_elems: cutlass.Constexpr[int] = universal_copy_bits // cutlass.BFloat16.width
@@ -457,7 +449,6 @@ def k2_kernel(
                 s_out_s = cutlass.Int32(0)
                 phase_sf = phase_sf ^ cutlass.Int32(1)
     else:
-        # ===== COMPUTE WARPS (warps 0..3) =====
         phase_full = cutlass.Int32(0)
         s_dyn = cutlass.Int32(0)
         s_out = cutlass.Int32(0)

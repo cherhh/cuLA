@@ -37,13 +37,11 @@ SANITIZER_MODE = False
 # (tag, seq_lens) — each entry is tested at every H in H_VALUES.
 # SM90 CHUNK=16, so sequences need to be long enough (>= ~8K tiles) for CP to pay off.
 CONFIGS = [
-    # --- single seq (ascending length) ---
     ("T=4K", [4096]),
     ("T=8K", [8192]),
     ("T=16K", [16384]),
     ("T=32K", [32768]),
     ("T=64K", [65536]),
-    # --- multi-seq ---
     ("2x16K", [16384, 16384]),
     ("32K+4K", [32768, 4096]),
     ("32K+1K", [32768, 1024]),
