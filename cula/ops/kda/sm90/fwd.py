@@ -31,46 +31,17 @@ from dataclasses import dataclass
 
 import torch
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 CHUNK: int = 16
 D: int = 128  # only 128 supported
-
-# Per-tile workspace byte sizes.
-_BYTES_KD = CHUNK * D * 2
-_BYTES_QD = CHUNK * D * 2
-_BYTES_KR = CHUNK * D * 2
-_BYTES_GT = D * 4
-_BYTES_INV = CHUNK * CHUNK * 2
-_BYTES_MQK = CHUNK * CHUNK * 2
-WORKSPACE_BYTES_PER_TILE: int = _BYTES_KD + _BYTES_QD + _BYTES_KR + _BYTES_GT + _BYTES_INV + _BYTES_MQK
 
 _CUTE_ARCH_BY_CC = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a"}
 _VARLEN_LAYOUT_CACHE_MAXSIZE = 64
 
 
-# ============================================================================
-# Workspace helpers
-# ============================================================================
 def _compute_total_tiles(seq_lens: list[int] | tuple[int, ...]) -> int:
     return sum((sl + CHUNK - 1) // CHUNK for sl in seq_lens)
 
 
-def allocate_workspace(
-    total_tiles: int,
-    H: int,
-    *,
-    device: torch.device | str | int = "cuda",
-) -> torch.Tensor:
-    """Allocate inter-kernel workspace for K1/K2."""
-    n_bytes = total_tiles * H * WORKSPACE_BYTES_PER_TILE
-    return torch.empty(n_bytes, dtype=torch.uint8, device=device)
-
-
-# ============================================================================
-# Public API
-# ============================================================================
 @dataclass
 class _VarlenMetadata:
     cu_values: tuple[int, ...]
@@ -218,7 +189,6 @@ def _cute_arch_for_device(device: torch.device):
     yield
 
 
-# ---- Cached scratch workspaces ----
 _VARLEN_LAYOUT_CACHE: dict = {}
 _VARLEN_METADATA_CACHE: dict[int, tuple[weakref.ReferenceType[torch.Tensor], tuple, _VarlenMetadata]] = {}
 _K1_SYMBOLS = None
@@ -287,11 +257,6 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
         entry[1].pop(next(iter(entry[1])))
     entry[1][sizes_key] = views
     return views
-
-
-def clear_workspace_cache() -> None:
-    """Drop all cached workspace arenas (frees the GPU memory they pin)."""
-    _WS_ARENA.clear()
 
 
 def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
@@ -466,9 +431,6 @@ def flash_kda_fwd(
         )
 
 
-# ============================================================================
-# CuteDSL kernel dispatch
-# ============================================================================
 def _dispatch_cute(
     q,
     k,
@@ -490,7 +452,6 @@ def _dispatch_cute(
     """Launch K1 + K2."""
     K1_CHUNK, K1_D, launch_k1 = _get_k1_symbols()
 
-    # Non-varlen: pad T to chunk boundary if needed.
     T_orig = problem.T
     need_t_pad = (not problem.is_varlen) and (T_orig % K1_CHUNK != 0)
     if need_t_pad:

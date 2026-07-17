@@ -26,9 +26,6 @@ from cula.ops.kda.sm90.k1 import launch_k1
 from cula.ops.kda.sm90.k2 import CHUNK, D, launch_k2
 from cula.utils import get_device_sm_count
 
-# ---------------------------------------------------------------------------
-# Cached helpers
-# ---------------------------------------------------------------------------
 _SCRATCH_CACHE: dict = {}
 _PLAN_TENSOR_CACHE: dict = {}
 _SCRATCH_CACHE_MAXSIZE = 8
@@ -66,9 +63,6 @@ def _seq_tiles_of(q: torch.Tensor, cu_seqlens: torch.Tensor | None) -> list[int]
     return [(sl + CHUNK - 1) // CHUNK for sl in meta.seq_lens]
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 def run_cp(
     plan: CPPlan,
     q,
@@ -196,11 +190,9 @@ def intracard_prefill(
     )
 
 
-# ---------------------------------------------------------------------------
 # Dense partial-tile support — pad to CHUNK multiple, run aligned CP, strip back.
 # (Varlen partial-tile is handled natively via ceil tiles + tile_starts mask.)
 # The plan is built on ceil tile counts, so it is valid for the padded tensors.
-# ---------------------------------------------------------------------------
 def _pad_cp_inputs(pad, q, k, v, g, beta):
     """No-op sentinels: q/k/v=0, g=-1e6 (decay~0), beta=-80 (sigmoid~0)."""
     return pad(q, 0.0), pad(k, 0.0), pad(v, 0.0), pad(g, -1e6), pad(beta, -80.0)
@@ -251,9 +243,6 @@ def _run_padded_dense(
     out.copy_(pout[:, :T])
 
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
 def _run_pipeline(
     plan: CPPlan,
     q,
@@ -272,7 +261,6 @@ def _run_pipeline(
     state_transposed,
 ) -> None:
     B, T, H, K = q.shape
-    assert K == D
     device = q.device
 
     if cu_seqlens is None:
@@ -290,7 +278,6 @@ def _run_pipeline(
     n_seg = plan.n_seg_total
     seg_cu_tiles = _get_plan_tensor(plan.seg_cu, torch.int32, device)
 
-    # ---- K1: prepare workspace tensors (run once) ----
     n_qk = plan.total_tiles * H * CHUNK * D
     n_cc = plan.total_tiles * H * CHUNK * CHUNK
     # ws_beta uses tile layout (total_tiles*CHUNK*H), not packed token layout (T_total*H).
@@ -319,7 +306,6 @@ def _run_pipeline(
         is_varlen=is_varlen_padded,
     )
 
-    # ---- pre_scan: compute per-segment B/M states ----
     b_seg = _get_scratch("b_seg", (n_seg, H, D, D), torch.float32, device)
     m_seg = _get_scratch("m_seg", (n_seg, H, D, D), torch.float32, device)
     v_flat = v.view(1, T_total, H, D) if B > 1 else v
@@ -342,7 +328,6 @@ def _run_pipeline(
         seg_order=seg_order,
     )
 
-    # ---- merge: propagate carries across segments within each sequence ----
     init_bhvk = None
     if initial_state is not None:
         assert initial_state.shape == (plan.n_seqs, H, D, D)
@@ -353,7 +338,6 @@ def _run_pipeline(
     carries = _get_scratch("carries", (n_seg, H, D, D), torch.float32, device)
     launch_merge(carries, m_seg, b_seg, plan.per_seq, init_bhvk)
 
-    # ---- K2: rerun recurrence with merged carries as initial states ----
     out_flat = out.view(1, T_total, H, D) if B > 1 else out
     seg_final = None
     if final_state is not None:
@@ -377,7 +361,6 @@ def _run_pipeline(
         seq_order=seg_order,
     )
 
-    # ---- gather final states (one per original sequence) ----
     if final_state is not None:
         last_idx = _get_plan_tensor(tuple(first + n - 1 for first, n in plan.per_seq), torch.long, device)
         if (

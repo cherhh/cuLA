@@ -148,9 +148,6 @@ def plan_manual(seq_tiles: list[int], s_split: int) -> CPPlan:
     return _materialize(seq_tiles, n_segs)
 
 
-# ---------------------------------------------------------------------------
-# Tensor-level entry for the prefill wrapper
-# ---------------------------------------------------------------------------
 _SEQ_LENS_CACHE: dict = {}
 
 
