@@ -34,7 +34,7 @@ def kda_prefill(
     chunk_indices: torch.IntTensor | None = None,
     **kwargs,
 ):
-    """[cherhh] Select the first SM90 prefill backend that accepts the call.
+    """Select the first SM90 prefill backend that accepts the call.
 
     This forward-only API requires grad-disabled execution. FlashKDA has
     priority over the fully-fused CUDA path; disabling either backend with its

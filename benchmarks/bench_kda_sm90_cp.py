@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-bench_kda_sm90_cp.py — Benchmark: SM90 intracard CP speedup (CP-on vs CP-off)
+bench_kda_sm90_cp.py — Benchmark: SM90 FlashKDA CP-auto vs CP-off
 
-Measures the speedup of the SM90 intracard context-parallel path against
-the serial K1+K2 baseline across varlen configurations.
+Compares flashkda_prefill(use_intracard_cp="auto") against
+flashkda_prefill(use_intracard_cp=False) on varlen configs. Reports whether
+the auto planner actually engages CP for each shape (auto may stay serial).
 
 Usage:
   python bench_kda_sm90_cp.py [--ncu] [--sanitizer]
@@ -25,6 +26,7 @@ import torch
 
 from benchmarks.utils import SEED, exclusive_cumsum, prepare_safe_gate_inputs, set_seed
 from cula.kda import flashkda_prefill as cula_kda_prefill
+from cula.ops.kda.sm90.cp.plan import CHUNK, plan_auto
 from cula.utils import assert_hopper, get_device_sm_count
 
 D = 128
@@ -35,7 +37,6 @@ NCU_MODE = False
 SANITIZER_MODE = False
 
 # (tag, seq_lens) — each entry is tested at every H in H_VALUES.
-# SM90 CHUNK=16, so sequences need to be long enough (>= ~8K tiles) for CP to pay off.
 CONFIGS = [
     ("T=4K", [4096]),
     ("T=8K", [8192]),
@@ -69,7 +70,7 @@ def time_kernel(fn, warmup=None, n_iters=None):
     return start_evt.elapsed_time(end_evt) / n_iters
 
 
-def run_kernel(q, k, v, g, beta, scale, A_log, dt_bias, cu_seqlens, lower_bound, *, use_cp):
+def run_kernel(q, k, v, g, beta, scale, A_log, dt_bias, cu_seqlens, lower_bound, *, use_auto_cp):
     cula_kda_prefill(
         q,
         k,
@@ -83,13 +84,18 @@ def run_kernel(q, k, v, g, beta, scale, A_log, dt_bias, cu_seqlens, lower_bound,
         output_final_state=False,
         safe_gate=True,
         lower_bound=lower_bound,
-        use_intracard_cp="auto" if use_cp else False,
+        use_intracard_cp="auto" if use_auto_cp else False,
     )
+
+
+def _auto_engages(seq_lens, H, sm_count) -> bool:
+    seq_tiles = [(sl + CHUNK - 1) // CHUNK for sl in seq_lens]
+    return not plan_auto(seq_tiles, H, sm_count).trivial
 
 
 def bench_cp(h_values, configs):
     print("\n" + "=" * 100)
-    print(" SM90 Intracard CP Benchmark: CP-on vs CP-off")
+    print(" SM90 FlashKDA Benchmark: CP-auto vs CP-off")
     print("=" * 100)
 
     device = torch.device("cuda")
@@ -104,6 +110,7 @@ def bench_cp(h_values, configs):
             torch.cuda.empty_cache()
 
             total_T = sum(seq_lens)
+            engaged = _auto_engages(seq_lens, H, num_sms)
             cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
             inputs = prepare_safe_gate_inputs(1, total_T, H, D, device, cu_seqlens=cu_seqlens, seed=SEED)
             q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
@@ -123,11 +130,19 @@ def bench_cp(h_values, configs):
                 lower_bound=lower_bound,
             )
 
-            ms_off = time_kernel(lambda: run_kernel(**common, use_cp=False))
-            ms_on = time_kernel(lambda: run_kernel(**common, use_cp=True))
+            ms_off = time_kernel(lambda: run_kernel(**common, use_auto_cp=False))
+            ms_auto = time_kernel(lambda: run_kernel(**common, use_auto_cp=True))
 
-            speedup = ms_off / ms_on if ms_on > 0 else float("inf")
-            r = dict(tag=tag, H=H, total_T=total_T, ms_off=ms_off, ms_on=ms_on, speedup=speedup)
+            speedup = ms_off / ms_auto if ms_auto > 0 else float("inf")
+            r = dict(
+                tag=tag,
+                H=H,
+                total_T=total_T,
+                ms_off=ms_off,
+                ms_auto=ms_auto,
+                speedup=speedup,
+                engaged=engaged,
+            )
             results.append(r)
 
             del q, k, v, g, beta, A_log, dt_bias, inputs
@@ -137,10 +152,10 @@ def bench_cp(h_values, configs):
 
 
 def print_report(results, h_values):
-    sep = "=" * 95
+    sep = "=" * 105
     print(f"\n\n{sep}")
-    print("               BENCHMARK REPORT: SM90 Intracard CP")
-    print("               CP-on vs CP-off (intracard_prefill vs flash_kda_fwd)")
+    print("               BENCHMARK REPORT: SM90 FlashKDA")
+    print('               CP-auto (use_intracard_cp="auto") vs CP-off (False)')
     print(f"               D={D}  dtype=bf16  safe_gate=True")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
@@ -153,26 +168,36 @@ def print_report(results, h_values):
         if not h_results:
             continue
         print(f"\n  [H={H_val}]")
-        print(f"  {'─' * 80}")
-        print(f"  {'config':<20s} {'T':>7s}  │  {'CP_off(ms)':>10s}  {'CP_on(ms)':>10s}  {'Speedup':>8s}")
-        print(f"  {'─' * 80}")
+        print(f"  {'─' * 90}")
+        print(f"  {'config':<20s} {'T':>7s}  {'engage':>7s}  │  {'CP_off(ms)':>10s}  {'CP_auto(ms)':>11s}  {'Speedup':>8s}")
+        print(f"  {'─' * 90}")
         for r in h_results:
-            print(f"  {r['tag']:<20s} {r['total_T']:>7d}  │  {r['ms_off']:>10.4f}  {r['ms_on']:>10.4f}  {r['speedup']:>7.2f}x")
-        print(f"  {'─' * 80}")
+            eng = "yes" if r["engaged"] else "no"
+            print(
+                f"  {r['tag']:<20s} {r['total_T']:>7d}  {eng:>7s}  │  "
+                f"{r['ms_off']:>10.4f}  {r['ms_auto']:>11.4f}  {r['speedup']:>7.2f}x"
+            )
+        print(f"  {'─' * 90}")
 
-    speedups = [r["speedup"] for r in results]
+    engaged = [r for r in results if r["engaged"]]
+    speedups = [r["speedup"] for r in engaged]
     if speedups:
         geo = 1.0
         for s in speedups:
             geo *= s
         geo = geo ** (1 / len(speedups))
-        print(f"\n  All configs: geo-mean={geo:.2f}x  best={max(speedups):.2f}x  worst={min(speedups):.2f}x")
+        print(
+            f"\n  Engaged configs only ({len(engaged)}/{len(results)}): "
+            f"geo-mean={geo:.2f}x  best={max(speedups):.2f}x  worst={min(speedups):.2f}x"
+        )
+    else:
+        print("\n  No config engaged CP-auto on this device; speedups are serial-vs-serial.")
 
     print(f"\n{sep}\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="bench_kda_sm90_cp: SM90 intracard CP speedup")
+    parser = argparse.ArgumentParser(description="bench_kda_sm90_cp: FlashKDA CP-auto vs CP-off")
     parser.add_argument("--ncu", action="store_true", help="NCU profiling mode: warmup=1, iters=1")
     parser.add_argument("--sanitizer", action="store_true", help="Sanitizer mode: warmup=1, iters=1")
     args = parser.parse_args()

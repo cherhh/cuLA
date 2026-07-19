@@ -1,7 +1,11 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Intracard-CP end-to-end correctness: CP vs serial, CP vs FLA, determinism."""
+"""FlashKDA CuTeDSL intracard CP (SM90): CP vs serial, CP vs FLA, determinism.
+
+Distinct from tests/test_intracard_cp_sm90.py, which covers the CUDA C++
+fully-fused path (kda_prefill_hopper_opt / auto_cp via cp_context).
+"""
 
 import pytest
 import torch
@@ -10,7 +14,9 @@ from fla.utils import assert_close
 
 from cula.kda import flashkda_prefill as cula_kda_prefill
 from cula.ops.kda.sm90.cp import intracard_prefill
+from cula.ops.kda.sm90.cp.plan import plan_auto, plan_manual
 from cula.ops.kda.sm90.fwd import D, flash_kda_fwd
+from cula.utils import get_device_sm_count
 
 H = 8
 SCALE = D**-0.5
@@ -18,6 +24,8 @@ LB = -5.0
 TOL_MAX = 1e-2
 TOL_RMSE = 4e-3
 TOL_FLA = 5e-3
+_DETERMINISM_ITERS_FAST = 100
+_DETERMINISM_ITERS_SLOW = 10000
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 pytestmark = pytest.mark.sm90_only
@@ -117,8 +125,52 @@ def _run_cp(q, k, v, g, beta, A_log, dt_bias, init=None, want_final=True, cu=Non
     return out, fin
 
 
+def _run_determinism(iters, *, varlen):
+    if varlen:
+        lens = [1024, 1, 63, 65, 129]
+        cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device="cuda")
+        q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, sum(lens), seed=5)
+        out0, fin0 = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, cu=cu, s_split=8)
+        for i in range(iters):
+            out, fin = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, cu=cu, s_split=8)
+            assert torch.equal(out, out0), f"non-deterministic varlen out at iter {i}"
+            assert torch.equal(fin, fin0), f"non-deterministic varlen ht at iter {i}"
+        return
+    q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, 4096, seed=17)
+    out0, fin0 = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, s_split=8)
+    for i in range(iters):
+        out, fin = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, s_split=8)
+        assert torch.equal(out, out0), f"non-deterministic out at iter {i}"
+        assert torch.equal(fin, fin0), f"non-deterministic ht at iter {i}"
+
+
+@pytest.mark.kda_fast
+def test_plan_auto_splits_ragged_at_h100_sm_count():
+    for lens in ([14336] + [128] * 16, [8192, 2048]):
+        seq_tiles = [(sl + 15) // 16 for sl in lens]
+        plan = plan_auto(seq_tiles, H, 132)
+        assert not plan.trivial, f"expected split for {lens} at sm_count=132"
+
+
+@pytest.mark.kda_fast
+def test_trivial_manual_plan_is_single_segment():
+    plan = plan_manual([128], 1)
+    assert plan.trivial and plan.n_seg_total == 1
+
+
 @needs_cuda
-@pytest.mark.parametrize("s_split", [1, 2, 4, 7])
+@pytest.mark.kda_fast
+def test_trivial_manual_plan_falls_back_to_serial():
+    q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, 2048, seed=2)
+    out_ref, fin_ref = _run_serial(q, k, v, g, beta, A_log, dt_bias, None, True)
+    out_fb, fin_fb = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, s_split=1)
+    assert torch.equal(out_fb, out_ref)
+    assert torch.equal(fin_fb, fin_ref)
+
+
+@needs_cuda
+@pytest.mark.kda_fast
+@pytest.mark.parametrize("s_split", [2, 4, 7])
 def test_cp_matches_serial_fixed(s_split):
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, 2048)
     out_ref, fin_ref = _run_serial(q, k, v, g, beta, A_log, dt_bias, None, True)
@@ -128,6 +180,7 @@ def test_cp_matches_serial_fixed(s_split):
 
 
 @needs_cuda
+@pytest.mark.kda_fast
 def test_cp_matches_serial_fixed_b2_with_state():
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(2, 1024, seed=3)
     init = torch.randn(2, H, D, D, dtype=torch.float32, device="cuda")
@@ -138,6 +191,7 @@ def test_cp_matches_serial_fixed_b2_with_state():
 
 
 @needs_cuda
+@pytest.mark.kda_fast
 def test_cp_matches_serial_varlen():
     lens = [1024, 512, 2048, 256]
     T = sum(lens)
@@ -151,6 +205,7 @@ def test_cp_matches_serial_varlen():
 
 
 @needs_cuda
+@pytest.mark.kda_fast
 @pytest.mark.parametrize(
     ("cu_values", "message"),
     [
@@ -167,6 +222,7 @@ def test_cp_rejects_invalid_cu_seqlens_before_launch(cu_values, message):
 
 
 @needs_cuda
+@pytest.mark.kda_fast
 def test_cp_matches_serial_state_transposed():
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, 1024, seed=11)
     init = torch.randn(1, H, D, D, dtype=torch.float32, device="cuda")
@@ -177,6 +233,7 @@ def test_cp_matches_serial_state_transposed():
 
 
 @needs_cuda
+@pytest.mark.kda_fast
 def test_cp_no_final_state():
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, 512, seed=13)
     out_ref, _ = _run_serial(q, k, v, g, beta, A_log, dt_bias, None, False)
@@ -188,10 +245,10 @@ def test_cp_no_final_state():
 @pytest.mark.parametrize(
     "lens",
     [
-        [1024, 1, 63, 65, 129],
-        [28679, 4096],
-        [40007],
-        [32768, 100],
+        pytest.param([1024, 1, 63, 65, 129], marks=pytest.mark.kda_fast, id="small-mixed"),
+        pytest.param([28679, 4096], marks=pytest.mark.kda_slow, id="large-28679-4096"),
+        pytest.param([40007], marks=pytest.mark.kda_slow, id="large-40007"),
+        pytest.param([32768, 100], marks=pytest.mark.kda_slow, id="large-32768-100"),
     ],
 )
 def test_cp_matches_serial_varlen_nonaligned(lens):
@@ -205,7 +262,14 @@ def test_cp_matches_serial_varlen_nonaligned(lens):
 
 
 @needs_cuda
-@pytest.mark.parametrize("T", [100, 4100, 8197])
+@pytest.mark.parametrize(
+    "T",
+    [
+        pytest.param(100, marks=pytest.mark.kda_fast, id="T100"),
+        pytest.param(4100, marks=pytest.mark.kda_fast, id="T4100"),
+        pytest.param(8197, marks=pytest.mark.kda_slow, id="T8197"),
+    ],
+)
 def test_cp_matches_serial_dense_nonaligned(T):
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, T, seed=9)
     out_ref, fin_ref = _run_serial(q, k, v, g, beta, A_log, dt_bias, None, True)
@@ -257,49 +321,63 @@ def _check_cp_vs_fla(T, *, with_state, cu, seed):
 
 
 @needs_cuda
-@pytest.mark.parametrize("T", [8192, 16384])
+@pytest.mark.kda_fast
+def test_cp_vs_fla_dense_small():
+    _check_cp_vs_fla(2048, with_state=False, cu=None, seed=42)
+
+
+@needs_cuda
+@pytest.mark.parametrize(
+    "T",
+    [
+        pytest.param(8192, marks=pytest.mark.kda_slow, id="T8192"),
+        pytest.param(16384, marks=pytest.mark.kda_slow, id="T16384"),
+    ],
+)
 def test_cp_vs_fla_dense(T):
     _check_cp_vs_fla(T, with_state=False, cu=None, seed=42)
 
 
 @needs_cuda
+@pytest.mark.kda_slow
 def test_cp_vs_fla_dense_with_state():
     _check_cp_vs_fla(16384, with_state=True, cu=None, seed=42)
 
 
 @needs_cuda
+@pytest.mark.kda_slow
 def test_cp_vs_fla_varlen_with_state():
     lens = [16384, 8192, 4096]
     cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device="cuda")
     _check_cp_vs_fla(sum(lens), with_state=True, cu=cu, seed=7)
 
 
-_DETERMINISM_ITERS = 10000
-
-
 @needs_cuda
+@pytest.mark.kda_fast
 def test_cp_determinism():
-    q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, 4096, seed=17)
-    out0, fin0 = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, s_split=8)
-    for i in range(_DETERMINISM_ITERS):
-        out, fin = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, s_split=8)
-        assert torch.equal(out, out0), f"non-deterministic out at iter {i}"
-        assert torch.equal(fin, fin0), f"non-deterministic ht at iter {i}"
+    _run_determinism(_DETERMINISM_ITERS_FAST, varlen=False)
 
 
 @needs_cuda
+@pytest.mark.kda_fast
 def test_cp_determinism_varlen():
-    lens = [1024, 1, 63, 65, 129]
-    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device="cuda")
-    q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, sum(lens), seed=5)
-    out0, fin0 = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, cu=cu, s_split=8)
-    for i in range(_DETERMINISM_ITERS):
-        out, fin = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, cu=cu, s_split=8)
-        assert torch.equal(out, out0), f"non-deterministic varlen out at iter {i}"
-        assert torch.equal(fin, fin0), f"non-deterministic varlen ht at iter {i}"
+    _run_determinism(_DETERMINISM_ITERS_FAST, varlen=True)
 
 
 @needs_cuda
+@pytest.mark.kda_slow
+def test_cp_determinism_stress():
+    _run_determinism(_DETERMINISM_ITERS_SLOW, varlen=False)
+
+
+@needs_cuda
+@pytest.mark.kda_slow
+def test_cp_determinism_varlen_stress():
+    _run_determinism(_DETERMINISM_ITERS_SLOW, varlen=True)
+
+
+@needs_cuda
+@pytest.mark.kda_slow
 @pytest.mark.parametrize(
     "lens",
     [
@@ -308,15 +386,11 @@ def test_cp_determinism_varlen():
     ],
 )
 def test_cp_matches_serial_ragged_auto_plan(lens):
-    """Ragged varlen batches planned by the duration-balanced auto planner
-    (s_split=None). Splitting must not change any accumulation order, so CP
-    output is required to be BIT-IDENTICAL to the serial path."""
-    from cula.ops.kda.sm90.cp.plan import plan_auto
-    from cula.utils import get_device_sm_count
-
+    """Auto-planned ragged varlen must be bit-identical to serial when CP engages."""
     seq_tiles = [(sl + 15) // 16 for sl in lens]
     plan = plan_auto(seq_tiles, H, get_device_sm_count(torch.device("cuda")))
-    assert not plan.trivial, "precondition: auto planner must split this batch"
+    if plan.trivial:
+        pytest.skip(f"auto planner declined CP for {lens} on this device (SM count too low)")
 
     total = sum(lens)
     q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, total, seed=7)
@@ -332,6 +406,7 @@ def test_cp_matches_serial_ragged_auto_plan(lens):
 
 
 @needs_cuda
+@pytest.mark.kda_fast
 def test_cp_same_shape_on_two_streams_matches_serial():
     args_a = _make_inputs(1, 2048, seed=23)
     args_b = _make_inputs(1, 2048, seed=29)

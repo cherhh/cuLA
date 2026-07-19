@@ -15,7 +15,8 @@ cuLA exposes several KDA entry points targeting different GPU architectures:
 | Two-Kernel Prefill | Hopper (SM90) | `from cula.kda import flashkda_prefill` |
 | Auto-dispatch Prefill | Hopper (SM90) | `from cula.kda import kda_prefill` |
 
-The explicit entry points provide direct kernel access, while `kda_prefill` selects an SM90 implementation at runtime.
+`chunk_kda`, `kda_prefill_hopper`, and `flashkda_prefill` each call a fixed implementation.
+`kda_prefill` is the only one that picks an SM90 backend automatically.
 
 **General Notes**
 
@@ -27,7 +28,9 @@ The explicit entry points provide direct kernel access, while `kda_prefill` sele
 
 ### Auto-dispatch Prefill (SM90 — Hopper)
 
-`kda_prefill` is a forward-only, grad-disabled API. It tries the CuTeDSL FlashKDA path first and falls back to the fully-fused CUDA C++ path when the call is outside FlashKDA's contract, such as grouped-value attention. With the default in-kernel gate, `A_log` is required; provide `dt_bias` to remain eligible for FlashKDA.
+`kda_prefill` only runs forward (use it under `torch.inference_mode()` / `no_grad`).
+It tries FlashKDA first; if that path cannot handle the call (for example GVA, where `V` heads ≠ `Q/K` heads), it falls back to the fully-fused CUDA C++ kernel.
+Pass both `A_log` and `dt_bias` if you want FlashKDA to be eligible — without them, FlashKDA rejects the call.
 
 ```python
 import torch
