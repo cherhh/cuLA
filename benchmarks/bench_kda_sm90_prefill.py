@@ -167,8 +167,7 @@ def bench_fixed(configs):
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
-        cu_seqlens = torch.tensor(exclusive_cumsum([T] * B), dtype=torch.int32, device=device)
-        common = _make_common(B, T, cu_seqlens, device)
+        common = _make_common(B, T, None, device)
         rel_rmse, rel_max, mean_diff, ms_fla, ms_cula, speedup = _bench_one(common)
         results.append(
             {
