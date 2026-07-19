@@ -20,6 +20,7 @@ TOL_RMSE = 4e-3
 TOL_FLA = 5e-3
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+pytestmark = pytest.mark.sm90_only
 
 
 def _make_inputs(B, T, seed=0):
@@ -147,6 +148,22 @@ def test_cp_matches_serial_varlen():
     out_cp, fin_cp = _run_cp(q, k, v, g, beta, A_log, dt_bias, init, True, cu=cu, s_split=4)
     _assert_cp_matches(out_cp, out_ref, "o")
     _assert_cp_matches(fin_cp, fin_ref, "ht")
+
+
+@needs_cuda
+@pytest.mark.parametrize(
+    ("cu_values", "message"),
+    [
+        ([1, 64], "start at 0"),
+        ([0, 80], "must equal packed T"),
+        ([0, 32, 32, 64], "must be non-empty"),
+    ],
+)
+def test_cp_rejects_invalid_cu_seqlens_before_launch(cu_values, message):
+    q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, 64, seed=19)
+    cu = torch.tensor(cu_values, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match=message):
+        _run_cp(q, k, v, g, beta, A_log, dt_bias, cu=cu, s_split=2)
 
 
 @needs_cuda
@@ -312,3 +329,25 @@ def test_cp_matches_serial_ragged_auto_plan(lens):
     out, fin = _run_cp(q, k, v, g, beta, A_log, dt_bias, cu=cu, s_split=None)
     assert torch.equal(out, ref_o)
     assert torch.equal(fin, ref_f)
+
+
+@needs_cuda
+def test_cp_same_shape_on_two_streams_matches_serial():
+    args_a = _make_inputs(1, 2048, seed=23)
+    args_b = _make_inputs(1, 2048, seed=29)
+    ref_a = _run_serial(*args_a)
+    ref_b = _run_serial(*args_b)
+    torch.cuda.synchronize()
+
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    with torch.cuda.stream(stream_a):
+        actual_a = _run_cp(*args_a, s_split=4)
+    with torch.cuda.stream(stream_b):
+        actual_b = _run_cp(*args_b, s_split=4)
+
+    torch.cuda.current_stream().wait_stream(stream_a)
+    torch.cuda.current_stream().wait_stream(stream_b)
+    for name, actual, ref in (("a", actual_a, ref_a), ("b", actual_b, ref_b)):
+        _assert_cp_matches(actual[0], ref[0], f"o-{name}")
+        _assert_cp_matches(actual[1], ref[1], f"ht-{name}")

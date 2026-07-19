@@ -37,6 +37,7 @@ import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
+from cula.ops.kda.sm90._common import _stream_key
 from cula.ops.kda.sm90.k2 import D, _get_current_custream
 from cula.ops.ptx import cvt_f32_to_tf32, mma_m16n8k8_tf32
 
@@ -376,10 +377,11 @@ def _get_compiled_merge(H: int, has_init: int):
 _PER_SEQ_TENSOR_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _PER_SEQ_TENSOR_CACHE_MAXSIZE = 64
 _DUMMY_INIT_CACHE: dict[tuple, torch.Tensor] = {}
+_DUMMY_INIT_CACHE_MAXSIZE = 64
 
 
 def _get_per_seq_tensors(per_seq: tuple, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (per_seq, str(device))
+    key = (per_seq, _stream_key(device))
     cached = _PER_SEQ_TENSOR_CACHE.get(key)
     if cached is not None:
         return cached
@@ -392,9 +394,11 @@ def _get_per_seq_tensors(per_seq: tuple, device: torch.device) -> tuple[torch.Te
 
 
 def _get_dummy_init(H: int, device: torch.device) -> torch.Tensor:
-    key = (H, str(device))
+    key = (H, _stream_key(device))
     cached = _DUMMY_INIT_CACHE.get(key)
     if cached is None:
+        if len(_DUMMY_INIT_CACHE) >= _DUMMY_INIT_CACHE_MAXSIZE:
+            _DUMMY_INIT_CACHE.pop(next(iter(_DUMMY_INIT_CACHE)))
         cached = torch.zeros(1, H, D, D, dtype=torch.float32, device=device)
         _DUMMY_INIT_CACHE[key] = cached
     return cached

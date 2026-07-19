@@ -177,6 +177,8 @@ def plan_prefill(
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_cpu: torch.Tensor | None = None,
     mode: CPMode | None = None,
+    *,
+    _seq_tiles: list[int] | None = None,
 ) -> CPPlan:
     """Planning entry for the prefill wrapper. Trivial plan -> serial path.
     AUTO declines unprofitable splits; FORCE splits whenever possible and
@@ -184,7 +186,9 @@ def plan_prefill(
     if mode is None or mode is CPMode.OFF:
         return CPPlan.serial((), "disabled")
     B, T, H, _K = q.shape
-    if cu_seqlens is None:
+    if _seq_tiles is not None:
+        seq_tiles = list(_seq_tiles)
+    elif cu_seqlens is None:
         # Non-CHUNK-aligned lengths run CP via pad-to-tile, hence ceil tiles.
         seq_tiles = [_ceil_div(T, CHUNK)] * B
     elif B != 1:

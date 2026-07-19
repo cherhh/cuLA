@@ -11,7 +11,7 @@ from torch.amp import custom_bwd, custom_fwd
 
 from cula.ops.kda.cp_mode import CPMode
 from cula.ops.kda.sm90.cp.plan import plan_prefill
-from cula.ops.kda.sm90.fwd import flash_kda_fwd
+from cula.ops.kda.sm90.fwd import _seq_tiles_from_problem, _validate_inputs, _validate_launch_options, flash_kda_fwd
 from cula.utils import assert_hopper
 
 
@@ -133,7 +133,15 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         else:
             beta = _beta_logits_bf16(beta)
 
-        plan = plan_prefill(q, cu_seqlens, cu_seqlens_cpu, use_intracard_cp)
+        problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu)
+        _validate_launch_options(q, out, lower_bound, True)
+        plan = plan_prefill(
+            q,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            use_intracard_cp,
+            _seq_tiles=_seq_tiles_from_problem(problem),
+        )
         if not plan.trivial:
             from cula.ops.kda.sm90.cp.driver import run_cp
 
@@ -153,6 +161,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
                 final_state=final_state,
                 cu_seqlens=cu_seqlens,
                 state_transposed=False,
+                _problem=problem,
             )
         else:
             flash_kda_fwd(
@@ -172,6 +181,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
                 cu_seqlens_cpu=cu_seqlens_cpu,
                 state_transposed=False,
                 use_gate_in_kernel=True,
+                _problem=problem,
             )
 
         return out.to(q.dtype), final_state
@@ -228,10 +238,10 @@ def cula_kda_prefill(
             Scale factor for the KDA attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, K, V]` for `N` input sequences.
+            Initial state of shape `[N, H, V, K]` for `N` input sequences.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
+            Whether to output the final state of shape `[N, H, V, K]`. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
             Accepted for API compatibility; CuTeDSL always applies L2-norm
             internally. Default: `False`.
@@ -265,7 +275,7 @@ def cula_kda_prefill(
             Preallocated output buffer, bf16, same shape as ``v``, written in
             place (also returned). ``None`` allocates per call. Default: `None`.
         final_state (Optional[torch.Tensor]):
-            Preallocated final-state buffer, fp32, shape `[N, H, K, V]`,
+            Preallocated final-state buffer, fp32, shape `[N, H, V, K]`,
             written in place (also returned). Requires
             ``output_final_state=True``. ``None`` allocates per call.
             Default: `None`.
@@ -274,9 +284,9 @@ def cula_kda_prefill(
         o (torch.Tensor):
             Outputs of shape `[B, T, H, V]`.
         final_state (torch.Tensor):
-            Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+            Final state of shape `[N, H, V, K]` if `output_final_state=True` else `None`.
     """
-    assert_hopper()
+    assert_hopper(q.device)
     if not use_gate_in_kernel:
         raise NotImplementedError(
             "SM90 CuTeDSL KDA prefill only supports use_gate_in_kernel=True. "

@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 
 from cula.ops.kda.cp_mode import NotSplittableError
+from cula.ops.kda.sm90._common import _stream_key
 from cula.ops.kda.sm90.cp.merge import launch_merge
 from cula.ops.kda.sm90.cp.plan import CPPlan, plan_auto, plan_manual, split_balanced
 from cula.ops.kda.sm90.cp.pre_scan import launch_pre_scan
@@ -20,6 +21,9 @@ from cula.ops.kda.sm90.fwd import (
     _cute_arch_for_device,
     _get_or_alloc_workspaces,
     _get_or_build_varlen_metadata,
+    _seq_tiles_from_problem,
+    _validate_inputs,
+    _validate_launch_options,
     flash_kda_fwd,
 )
 from cula.ops.kda.sm90.k1 import launch_k1
@@ -33,7 +37,7 @@ _PLAN_TENSOR_CACHE_MAXSIZE = 64
 
 
 def _get_plan_tensor(values: tuple, dtype, device: torch.device) -> torch.Tensor:
-    key = (values, dtype, str(device))
+    key = (values, dtype, _stream_key(device))
     cached = _PLAN_TENSOR_CACHE.get(key)
     if cached is None:
         if len(_PLAN_TENSOR_CACHE) >= _PLAN_TENSOR_CACHE_MAXSIZE:
@@ -44,7 +48,7 @@ def _get_plan_tensor(values: tuple, dtype, device: torch.device) -> torch.Tensor
 
 
 def _get_scratch(key_name: str, shape: tuple, dtype, device) -> torch.Tensor:
-    key = (key_name, shape, dtype, str(device))
+    key = (key_name, shape, dtype, _stream_key(device))
     cached = _SCRATCH_CACHE.get(key)
     if cached is None:
         if len(_SCRATCH_CACHE) >= _SCRATCH_CACHE_MAXSIZE:
@@ -52,15 +56,6 @@ def _get_scratch(key_name: str, shape: tuple, dtype, device) -> torch.Tensor:
         cached = torch.empty(shape, dtype=dtype, device=device)
         _SCRATCH_CACHE[key] = cached
     return cached
-
-
-def _seq_tiles_of(q: torch.Tensor, cu_seqlens: torch.Tensor | None) -> list[int]:
-    B, T, _H, _K = q.shape
-    if cu_seqlens is None:
-        return [(T + CHUNK - 1) // CHUNK] * B
-    assert B == 1 and cu_seqlens.dtype == torch.int32
-    meta = _get_or_build_varlen_metadata(cu_seqlens)
-    return [(sl + CHUNK - 1) // CHUNK for sl in meta.seq_lens]
 
 
 def run_cp(
@@ -80,10 +75,15 @@ def run_cp(
     final_state=None,
     cu_seqlens=None,
     state_transposed=False,
+    _problem=None,
 ) -> None:
     """Execute a non-trivial CPPlan verbatim -- no re-planning, no fallback."""
     assert not plan.trivial
-    assert q.is_cuda and q.dtype == torch.bfloat16
+    problem = _problem or _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens)
+    _validate_launch_options(q, out, lower_bound, True)
+    expected_seq_tiles = tuple(_seq_tiles_from_problem(problem))
+    if plan.seq_tiles != expected_seq_tiles:
+        raise ValueError(f"CP plan seq_tiles {plan.seq_tiles} do not match validated inputs {expected_seq_tiles}")
     with _cute_arch_for_device(q.device):
         if cu_seqlens is None and q.shape[1] % CHUNK != 0:
             _run_padded_dense(
@@ -143,7 +143,9 @@ def intracard_prefill(
     """Plan-and-run for direct callers. s_split forces a manual split;
     allow_fallback=False means forced CP (structural split only, raise on a
     trivial plan); otherwise a trivial plan falls back to the serial kernel."""
-    seq_tiles = _seq_tiles_of(q, cu_seqlens)
+    problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens)
+    _validate_launch_options(q, out, lower_bound, True)
+    seq_tiles = _seq_tiles_from_problem(problem)
     H = q.shape[2]
     if s_split is not None:
         plan = plan_manual(seq_tiles, s_split)
@@ -169,6 +171,7 @@ def intracard_prefill(
             final_state=final_state,
             cu_seqlens=cu_seqlens,
             state_transposed=state_transposed,
+            _problem=problem,
         )
         return
     run_cp(
@@ -187,6 +190,7 @@ def intracard_prefill(
         final_state=final_state,
         cu_seqlens=cu_seqlens,
         state_transposed=state_transposed,
+        _problem=problem,
     )
 
 

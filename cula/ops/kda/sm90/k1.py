@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-from cula.ops.kda.sm90._common import add_f16x2_u32, movm_t_b16
+from cula.ops.kda.sm90._common import _stream_key, add_f16x2_u32, movm_t_b16
 
 CHUNK: int = 16
 D: int = 128
@@ -671,8 +671,10 @@ def run_k1(
 # cutlass.Int32, so one compiled kernel serves every batch shape.
 _k1_kernel_cache: dict = {}
 _CU_STREAM_CACHE: dict[int, object] = {}
-_DUMMY_INT32_CACHE: dict[str, torch.Tensor] = {}
+_DUMMY_INT32_CACHE: dict[tuple, torch.Tensor] = {}
+_K1_KERNEL_CACHE_MAXSIZE = 32
 _CU_STREAM_CACHE_MAXSIZE = 64
+_DUMMY_INT32_CACHE_MAXSIZE = 64
 
 
 def _compile_k1(H, scale, gate_scale, is_varlen):
@@ -735,6 +737,8 @@ def _get_compiled_k1(H, scale, gate_scale, is_varlen):
     key = (H, scale, gate_scale, is_varlen)
     cached = _k1_kernel_cache.get(key)
     if cached is None:
+        if len(_k1_kernel_cache) >= _K1_KERNEL_CACHE_MAXSIZE:
+            _k1_kernel_cache.pop(next(iter(_k1_kernel_cache)))
         cached = _compile_k1(H, scale, gate_scale, is_varlen)
         _k1_kernel_cache[key] = cached
     return cached
@@ -753,10 +757,12 @@ def _get_current_custream():
 
 
 def _get_dummy_int32(device: torch.device) -> torch.Tensor:
-    key = str(device)
+    key = _stream_key(device)
     cached = _DUMMY_INT32_CACHE.get(key)
     if cached is not None:
         return cached
+    if len(_DUMMY_INT32_CACHE) >= _DUMMY_INT32_CACHE_MAXSIZE:
+        _DUMMY_INT32_CACHE.pop(next(iter(_DUMMY_INT32_CACHE)))
     cached = torch.zeros(1, dtype=torch.int32, device=device)
     _DUMMY_INT32_CACHE[key] = cached
     return cached

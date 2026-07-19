@@ -13,6 +13,10 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T as _T
 
 
+def _stream_key(device: torch.device) -> tuple[str, int]:
+    return str(device), int(torch.cuda.current_stream(device).cuda_stream)
+
+
 @cutlass.dsl_user_op
 def movm_t_b16(src_u32: Int32, *, loc=None, ip=None) -> Int32:
     """``movmatrix.sync.aligned.m8n8.trans.b16`` -- register-file 8x8 b16 transpose."""

@@ -44,7 +44,7 @@ def _make_state_smem_layout():
     return cute.tile_to_shape(atom, (D, D), (0, 1))
 
 
-from cula.ops.kda.sm90._common import movm_t_b16  # noqa: E402
+from cula.ops.kda.sm90._common import _stream_key, movm_t_b16  # noqa: E402
 
 
 def _make_out_kinter_one_stage():
@@ -741,10 +741,11 @@ def run_k2(
 # (total_tiles, O_T_total, V_T_total, N) are dynamic cutlass.Int32, so one
 # compiled kernel serves every batch shape.
 _k2_kernel_cache: dict = {}
-_DUMMY_FP32_CACHE: dict[str, torch.Tensor] = {}
-_DUMMY_INT32_CACHE: dict[str, torch.Tensor] = {}
+_DUMMY_FP32_CACHE: dict[tuple, torch.Tensor] = {}
+_DUMMY_INT32_CACHE: dict[tuple, torch.Tensor] = {}
 _CU_STREAM_CACHE: dict[int, object] = {}
 _CU_STREAM_CACHE_MAXSIZE = 64
+_DUMMY_CACHE_MAXSIZE = 64
 _FIXED_CU_TILES_CACHE: dict[tuple, torch.Tensor] = {}
 _FIXED_CU_TILES_CACHE_MAXSIZE = 64
 _IDENTITY_ORDER_CACHE: dict[tuple, torch.Tensor] = {}
@@ -838,20 +839,24 @@ def _get_current_custream():
 
 
 def _get_dummy_fp32(device: torch.device) -> torch.Tensor:
-    key = str(device)
+    key = _stream_key(device)
     cached = _DUMMY_FP32_CACHE.get(key)
     if cached is not None:
         return cached
+    if len(_DUMMY_FP32_CACHE) >= _DUMMY_CACHE_MAXSIZE:
+        _DUMMY_FP32_CACHE.pop(next(iter(_DUMMY_FP32_CACHE)))
     cached = torch.zeros(1, dtype=torch.float32, device=device)
     _DUMMY_FP32_CACHE[key] = cached
     return cached
 
 
 def _get_dummy_int32(device: torch.device) -> torch.Tensor:
-    key = str(device)
+    key = _stream_key(device)
     cached = _DUMMY_INT32_CACHE.get(key)
     if cached is not None:
         return cached
+    if len(_DUMMY_INT32_CACHE) >= _DUMMY_CACHE_MAXSIZE:
+        _DUMMY_INT32_CACHE.pop(next(iter(_DUMMY_INT32_CACHE)))
     cached = torch.zeros(1, dtype=torch.int32, device=device)
     _DUMMY_INT32_CACHE[key] = cached
     return cached
@@ -859,7 +864,7 @@ def _get_dummy_int32(device: torch.device) -> torch.Tensor:
 
 def _get_identity_order(n: int, device: torch.device) -> torch.Tensor:
     """Cached identity launch order [0..n) for serial/uniform batches."""
-    key = (n, str(device))
+    key = (n, _stream_key(device))
     cached = _IDENTITY_ORDER_CACHE.get(key)
     if cached is not None:
         return cached
@@ -872,7 +877,7 @@ def _get_identity_order(n: int, device: torch.device) -> torch.Tensor:
 
 def _get_fixed_cu_seqlens_tiles(B: int, t_tiles_per_seq: int, device: torch.device) -> torch.Tensor:
     """Cached [0, t, 2t, ..., B*t] tile offsets for the fixed-length path."""
-    key = (B, t_tiles_per_seq, str(device))
+    key = (B, t_tiles_per_seq, _stream_key(device))
     cached = _FIXED_CU_TILES_CACHE.get(key)
     if cached is not None:
         return cached

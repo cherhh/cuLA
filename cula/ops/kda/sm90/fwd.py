@@ -31,6 +31,8 @@ from dataclasses import dataclass
 
 import torch
 
+from cula.ops.kda.sm90._common import _stream_key
+
 CHUNK: int = 16
 D: int = 128  # only 128 supported
 
@@ -67,6 +69,12 @@ class _PrefillProblem:
     varlen_meta: _VarlenMetadata | None = None
 
 
+def _seq_tiles_from_problem(problem: _PrefillProblem) -> list[int]:
+    if problem.varlen_meta is not None:
+        return [(sl + CHUNK - 1) // CHUNK for sl in problem.varlen_meta.seq_lens]
+    return [(problem.T + CHUNK - 1) // CHUNK] * problem.B
+
+
 def _validate_inputs(
     q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu=None
 ) -> _PrefillProblem:
@@ -75,8 +83,10 @@ def _validate_inputs(
     if not q.is_cuda or q.dtype != torch.bfloat16:
         raise TypeError(f"q must be a CUDA bfloat16 tensor, got dtype={q.dtype}, device={q.device}")
     for name, tensor in (("k", k), ("v", v), ("g", g), ("beta", beta)):
-        if not tensor.is_cuda or tensor.dtype != torch.bfloat16:
+        if not tensor.is_cuda or tensor.device != q.device or tensor.dtype != torch.bfloat16:
             raise TypeError(f"{name} must be a CUDA bfloat16 tensor, got dtype={tensor.dtype}, device={tensor.device}")
+    if any(not tensor.is_contiguous() for tensor in (q, k, v, g, beta)):
+        raise ValueError("q, k, v, g and beta must be contiguous")
     if q.shape != k.shape or q.shape != g.shape:
         raise ValueError(f"q/k/g shapes must match, got q={tuple(q.shape)}, k={tuple(k.shape)}, g={tuple(g.shape)}")
     if v.shape != q.shape:
@@ -89,13 +99,19 @@ def _validate_inputs(
         raise ValueError(f"only K=V={D} supported, got K={K} V={v.shape[-1]}")
     if beta.shape != (B, T, H):
         raise ValueError(f"beta shape mismatch: {tuple(beta.shape)} vs ({B},{T},{H})")
-    if A_log is None or not A_log.is_cuda or not A_log.is_contiguous() or A_log.shape != (H,) or A_log.dtype != torch.float32:
+    if (
+        A_log is None
+        or A_log.device != q.device
+        or not A_log.is_contiguous()
+        or A_log.shape != (H,)
+        or A_log.dtype != torch.float32
+    ):
         raise ValueError(
             f"A_log must be float32 with shape ({H},), got {None if A_log is None else (A_log.dtype, tuple(A_log.shape))}"
         )
     if (
         dt_bias is None
-        or not dt_bias.is_cuda
+        or dt_bias.device != q.device
         or not dt_bias.is_contiguous()
         or dt_bias.shape != (H, K)
         or dt_bias.dtype != torch.float32
@@ -109,14 +125,17 @@ def _validate_inputs(
     if is_varlen:
         if B != 1:
             raise ValueError(f"varlen requires B=1, got B={B}")
-        if not cu_seqlens.is_cuda or cu_seqlens.ndim != 1:
-            raise ValueError("cu_seqlens must be a 1D CUDA tensor")
+        if cu_seqlens.device != q.device or cu_seqlens.ndim != 1 or not cu_seqlens.is_contiguous():
+            raise ValueError("cu_seqlens must be a contiguous 1D tensor on the q device")
         if cu_seqlens.dtype != torch.int32:
             raise TypeError(f"cu_seqlens must be int32, got {cu_seqlens.dtype}")
         if cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must contain at least two entries")
         if cu_seqlens_cpu is not None and (
-            cu_seqlens_cpu.device.type != "cpu" or cu_seqlens_cpu.ndim != 1 or cu_seqlens_cpu.numel() != cu_seqlens.numel()
+            cu_seqlens_cpu.device.type != "cpu"
+            or cu_seqlens_cpu.dtype != torch.int32
+            or cu_seqlens_cpu.ndim != 1
+            or cu_seqlens_cpu.numel() != cu_seqlens.numel()
         ):
             raise ValueError(
                 "cu_seqlens_cpu must be a 1D CPU tensor with the same numel as "
@@ -143,13 +162,13 @@ def _validate_inputs(
     if has_state_in:
         if initial_state.shape != (N, H, D, D):
             raise ValueError(f"initial_state shape must be ({N}, {H}, {D}, {D}), got {tuple(initial_state.shape)}")
-        if not initial_state.is_cuda or initial_state.dtype != torch.float32 or not initial_state.is_contiguous():
-            raise TypeError("initial_state must be a contiguous CUDA float32 tensor")
+        if initial_state.device != q.device or initial_state.dtype != torch.float32 or not initial_state.is_contiguous():
+            raise TypeError("initial_state must be a contiguous float32 tensor on the q device")
     if has_state_out:
         if final_state.shape != (N, H, D, D):
             raise ValueError(f"final_state shape must be ({N}, {H}, {D}, {D}), got {tuple(final_state.shape)}")
-        if not final_state.is_cuda or final_state.dtype != torch.float32 or not final_state.is_contiguous():
-            raise TypeError("final_state must be a contiguous CUDA float32 tensor")
+        if final_state.device != q.device or final_state.dtype != torch.float32 or not final_state.is_contiguous():
+            raise TypeError("final_state must be a contiguous float32 tensor on the q device")
 
     return _PrefillProblem(
         B=B,
@@ -162,6 +181,23 @@ def _validate_inputs(
         has_state_out=has_state_out,
         varlen_meta=varlen_meta,
     )
+
+
+def _validate_launch_options(q, out, lower_bound, use_gate_in_kernel) -> None:
+    if out.shape != q.shape or out.device != q.device or out.dtype != torch.bfloat16 or not out.is_contiguous():
+        raise ValueError(
+            f"out must be contiguous bfloat16 with shape {tuple(q.shape)} on {q.device}, "
+            f"got dtype={out.dtype}, device={out.device}, shape={tuple(out.shape)}"
+        )
+    if not use_gate_in_kernel:
+        raise NotImplementedError(
+            "CuTeDSL FlashKDA prefill only supports use_gate_in_kernel=True. "
+            "Pre-gated inputs would require the torch reference, which is test-only."
+        )
+    if lower_bound is None:
+        raise ValueError("lower_bound must be specified.")
+    if not (-5 <= lower_bound < 0):
+        raise ValueError(f"lower_bound must be in the safe range [-5, 0), got {lower_bound}.")
 
 
 _DEVICE_ARCH_CACHE: dict[int, str] = {}
@@ -190,7 +226,7 @@ def _cute_arch_for_device(device: torch.device):
 
 
 _VARLEN_LAYOUT_CACHE: dict = {}
-_VARLEN_METADATA_CACHE: dict[int, tuple[weakref.ReferenceType[torch.Tensor], tuple, _VarlenMetadata]] = {}
+_VARLEN_METADATA_CACHE: dict[tuple, tuple[weakref.ReferenceType[torch.Tensor], tuple, _VarlenMetadata]] = {}
 _K1_SYMBOLS = None
 _K2_LAUNCHER = None
 
@@ -209,8 +245,7 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
     keyed stream: the next call's K1 cannot overwrite a workspace before this
     call's K2 finished reading it.
     """
-    stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
-    arena_key = (str(device), stream_ptr)
+    arena_key = _stream_key(device)
     sizes_key = (n_qk, n_cc, n_gt, n_beta, dtype)
     entry = _WS_ARENA.get(arena_key)
     if entry is not None:
@@ -261,7 +296,7 @@ def _get_or_alloc_workspaces(n_qk: int, n_cc: int, n_gt: int, n_beta: int, devic
 
 def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
     """CHUNK-aligned cumulative token offsets and tile counts for non-aligned varlen."""
-    key = (seq_lens, str(device), cu_dtype)
+    key = (seq_lens, _stream_key(device), cu_dtype)
     cached = _VARLEN_LAYOUT_CACHE.get(key)
     if cached is not None:
         return cached
@@ -282,7 +317,7 @@ def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
 
 def _get_or_build_varlen_metadata(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None = None) -> _VarlenMetadata:
     """Cache varlen metadata (seq_lens, tile offsets, padding flags) for cu_seqlens."""
-    cache_key = id(cu_seqlens)
+    cache_key = (id(cu_seqlens), _stream_key(cu_seqlens.device))
     attrs = (
         cu_seqlens.data_ptr(),
         tuple(cu_seqlens.shape),
@@ -378,6 +413,7 @@ def flash_kda_fwd(
     cu_seqlens_cpu: torch.Tensor | None = None,
     state_transposed: bool = False,
     use_gate_in_kernel: bool = True,
+    _problem: _PrefillProblem | None = None,
 ) -> None:
     """FlashKDA fwd. ``out`` and ``final_state`` are written in-place.
 
@@ -396,20 +432,10 @@ def flash_kda_fwd(
             GPU->host sync when first building varlen metadata.
         state_transposed: False -> [N,H,V,K] (default), True -> [N,H,K,V].
     """
-    problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu)
-    if out.shape != q.shape or not out.is_cuda or out.dtype != torch.bfloat16:
-        raise ValueError(
-            f"out must be CUDA bfloat16 with shape {tuple(q.shape)}, got dtype={out.dtype}, shape={tuple(out.shape)}"
-        )
-    if not use_gate_in_kernel:
-        raise NotImplementedError(
-            "CuTeDSL FlashKDA prefill only supports use_gate_in_kernel=True. "
-            "Pre-gated inputs would require the torch reference, which is test-only."
-        )
-    if lower_bound is None:
-        raise ValueError("lower_bound must be specified.")
-    if not (-5 <= lower_bound < 0):
-        raise ValueError(f"lower_bound must be in the safe range [-5, 0), got {lower_bound}.")
+    problem = _problem or _validate_inputs(
+        q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu
+    )
+    _validate_launch_options(q, out, lower_bound, use_gate_in_kernel)
 
     with _cute_arch_for_device(q.device):
         _dispatch_cute(
