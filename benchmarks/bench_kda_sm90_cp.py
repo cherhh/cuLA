@@ -24,7 +24,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import torch
 
-from benchmarks.utils import SEED, exclusive_cumsum, prepare_safe_gate_inputs, set_seed
+from benchmarks.utils import (
+    SEED,
+    benchmark_cuda_mode_fn,
+    exclusive_cumsum,
+    prepare_safe_gate_inputs,
+    resolve_benchmark_repeats,
+    set_seed,
+)
 from cula.kda import flashkda_prefill as cula_kda_prefill
 from cula.ops.kda.sm90.cp.plan import CHUNK, plan_auto
 from cula.utils import assert_hopper, get_device_sm_count
@@ -38,36 +45,33 @@ SANITIZER_MODE = False
 
 # (tag, seq_lens) — each entry is tested at every H in H_VALUES.
 CONFIGS = [
+    ("T=1023", [1023]),
+    ("T=1025", [1025]),
     ("T=4K", [4096]),
     ("T=8K", [8192]),
     ("T=16K", [16384]),
     ("T=32K", [32768]),
     ("T=64K", [65536]),
+    ("T=64K+1", [65537]),
     ("2x16K", [16384, 16384]),
     ("32K+4K", [32768, 4096]),
     ("32K+1K", [32768, 1024]),
+    ("32K+1023+1025", [32768, 1023, 1025]),
     ("64K+1K", [65536, 1024]),
     ("64K+2x1K", [65536, 1024, 1024]),
     ("64K+5x1K", [65536] + [1024] * 5),
+    ("64K+1+1023+1025", [65537, 1023, 1025]),
 ]
 
 
-def time_kernel(fn, warmup=None, n_iters=None):
-    if warmup is None:
-        warmup = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
-    if n_iters is None:
-        n_iters = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(n_iters):
-        fn()
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt) / n_iters
+def time_kernel(fn):
+    return benchmark_cuda_mode_fn(
+        fn,
+        default_warmup=WARMUP,
+        default_rep=N_ITERS,
+        ncu_mode=NCU_MODE,
+        sanitizer_mode=SANITIZER_MODE,
+    )
 
 
 def run_kernel(q, k, v, g, beta, scale, A_log, dt_bias, cu_seqlens, lower_bound, *, use_auto_cp):
@@ -157,8 +161,7 @@ def print_report(results, h_values):
     print("               BENCHMARK REPORT: SM90 FlashKDA")
     print('               CP-auto (use_intracard_cp="auto") vs CP-off (False)')
     print(f"               D={D}  dtype=bf16  safe_gate=True")
-    wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
-    ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
+    wu, ni = resolve_benchmark_repeats(WARMUP, N_ITERS, ncu_mode=NCU_MODE, sanitizer_mode=SANITIZER_MODE)
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
     print(f"               Warmup={wu}  Iters={ni}{mode_tag}")
     print(sep)
