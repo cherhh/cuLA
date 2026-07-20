@@ -3,7 +3,6 @@
 
 """SM90 KDA prefill wrapper for the two-kernel K1+K2 CuTeDSL path"""
 
-import contextlib
 from typing import Literal
 
 import torch
@@ -42,10 +41,7 @@ def _guarded_forward(
     out: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
 ):
-    device_ctx = (
-        torch.cuda.device(q.device.index) if q.device.index != torch.cuda.current_device() else contextlib.nullcontext()
-    )
-    with device_ctx:
+    with torch.cuda.device_of(q):
         return HopperChunkKDAFunction._forward_impl(
             q,
             k,

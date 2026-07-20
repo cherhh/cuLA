@@ -259,7 +259,7 @@ def cula_kda_prefill(
     assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Currently we only support head dim of 128 for KDA"
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    with torch.cuda.device(q.device):
+    with torch.cuda.device_of(q):
         o, final_state = HopperChunkKDAFunction.apply(
             q,
             k,

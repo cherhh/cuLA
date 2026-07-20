@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import contextlib
-
 import torch
 
 from cula.backends import BackendRegistry
@@ -40,8 +38,7 @@ def kda_prefill(
     priority over the fully-fused CUDA path; disabling either backend with its
     ``CULA_BACKEND_*`` variable makes dispatch try the remaining implementation.
     """
-    device_ctx = torch.cuda.device(q.device) if q.device.type == "cuda" else contextlib.nullcontext()
-    with device_ctx:
+    with torch.cuda.device_of(q):
         return kda_prefill_registry.dispatch(
             "kda_prefill",
             q,

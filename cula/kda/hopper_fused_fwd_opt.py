@@ -343,7 +343,7 @@ def cula_kda_prefill_opt(
         scale = k.shape[-1] ** -0.5
 
     needs_grad = torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v, g, beta) if t is not None)
-    with torch.cuda.device(q.device):
+    with torch.cuda.device_of(q):
         if not needs_grad:
             o, final_state = _inference_forward(
                 q,
