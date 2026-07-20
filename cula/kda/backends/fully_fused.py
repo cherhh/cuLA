@@ -16,7 +16,6 @@ _ACCEPTED_KWARGS = {
     "cu_seqlens_cpu",
     "use_beta_sigmoid_in_kernel",
     "use_intracard_cp",
-    "use_cp",
     "out",
     "final_state",
 }
@@ -110,11 +109,7 @@ class FullyFusedBackend(BaseBackend):
                 return False, "requires int32 CPU cu_seqlens_cpu"
         if kwargs.get("use_beta_sigmoid_in_kernel", False) is not False:
             return False, "does not support use_beta_sigmoid_in_kernel=True"
-        use_intracard_cp, use_cp = kwargs.get("use_intracard_cp"), kwargs.get("use_cp")
-        if use_intracard_cp is not None and use_cp is not None:
-            return False, "pass only one of use_intracard_cp or use_cp"
-        cp_mode = use_intracard_cp if use_intracard_cp is not None else use_cp
-        if cp_mode not in (None, "auto"):
+        if kwargs.get("use_intracard_cp") not in (None, "auto"):
             return False, "supports only automatic intracard CP selection"
         if kwargs.get("out") is not None or kwargs.get("final_state") is not None:
             return False, "does not support preallocated out or final_state buffers"
@@ -123,6 +118,6 @@ class FullyFusedBackend(BaseBackend):
     def kda_prefill(self, q, k, v, g, beta, **kwargs):
         from cula.kda.auto_route import cula_kda_prefill_auto
 
-        for name in ("use_beta_sigmoid_in_kernel", "use_intracard_cp", "use_cp", "out", "final_state"):
+        for name in ("use_beta_sigmoid_in_kernel", "use_intracard_cp", "out", "final_state"):
             kwargs.pop(name, None)
         return cula_kda_prefill_auto(q, k, v, g, beta, **kwargs)

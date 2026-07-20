@@ -7,6 +7,6 @@ sm90/   SM90 (Hopper) two-kernel (K1+K2) FlashKDA prefill, fwd-only (+ cp/)
 sm100/  SM100 (Blackwell) modular-chunk recurrence/output/bwd kernels (+ cp/)
 decode/         single-token decode (CuTe DSL + FLA reference)
 experimental/   unwired fully-fused WIP
-policy.py       CP dispatch policy (use_cp / use_intracard_cp)
+cp_mode.py      shared intracard-CP mode vocabulary (CPMode / NotSplittableError)
 
 """

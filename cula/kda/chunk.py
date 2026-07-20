@@ -354,10 +354,7 @@ def chunk_kda(
         )
     """
 
-    # just for backward compatibility, resolve the deprecated `use_cp` argument
-    # TODO: maybe we can remove this in the future
-    use_cp_alias = kwargs.pop("use_cp", None)
-    use_intracard_cp = CPMode.parse(use_intracard_cp, use_cp_alias)
+    use_intracard_cp = CPMode.parse(use_intracard_cp)
 
     if cp_context is not None:
         if use_intracard_cp is CPMode.FORCE:
@@ -391,10 +388,11 @@ def chunk_kda(
     if initial_state is not None:
         assert initial_state.dtype == torch.float32, "initial_state must be in float32."
 
-    A_log, dt_bias = None, None
+    A_log, dt_bias = kwargs.pop("A_log", None), kwargs.pop("dt_bias", None)
+    if kwargs:
+        raise TypeError(f"chunk_kda() got unexpected keyword arguments: {sorted(kwargs)}")
     if use_gate_in_kernel:
-        assert "A_log" in kwargs, "A_log must be provided when use_gate_in_kernel=True."
-        A_log, dt_bias = kwargs["A_log"], kwargs.get("dt_bias")
+        assert A_log is not None, "A_log must be provided when use_gate_in_kernel=True."
 
     if safe_gate and use_gate_in_kernel:
         if lower_bound is None:

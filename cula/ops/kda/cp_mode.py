@@ -22,12 +22,9 @@ class CPMode(Enum):
     FORCE = "force"
 
     @classmethod
-    def parse(cls, use_intracard_cp, use_cp=None) -> CPMode | None:
-        """Public use_intracard_cp value ("auto"/True/False; use_cp is a
-        deprecated alias) -> mode. None stays None (backend default)."""
-        if use_intracard_cp is not None and use_cp is not None:
-            raise TypeError("Pass only one of use_intracard_cp or use_cp.")
-        value = use_intracard_cp if use_intracard_cp is not None else use_cp
+    def parse(cls, value) -> CPMode | None:
+        """Public use_intracard_cp value ("auto"/True/False) -> mode.
+        None stays None (backend default)."""
         if value is None or isinstance(value, cls):
             return value
         # Identity checks (not ==): `1 == True` would match stray ints.

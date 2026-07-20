@@ -205,7 +205,7 @@ Long sequences can be split into sub-sequences, processed in parallel on one GPU
 
 ### SM90 — via `flashkda_prefill(use_intracard_cp=...)`
 
-Pass `use_intracard_cp` (alias `use_cp`) to the Hopper prefill:
+Pass `use_intracard_cp` to the Hopper prefill:
 
 - **`"auto"`** — the auto-router enables CP only when it predicts a speedup, otherwise runs serial (no error, no regression).
 - **`True`** — force CP; raises if the shape cannot be meaningfully split.
