@@ -15,22 +15,12 @@ from cula.ops.kda.sm90.fwd import _seq_tiles_from_problem, _validate_inputs, _va
 from cula.utils import assert_hopper
 
 
-def _cast_g_bf16(g: torch.Tensor) -> torch.Tensor:
-    return g if g.dtype == torch.bfloat16 else g.to(torch.bfloat16)
-
-
 def _beta_logits_bf16(beta: torch.Tensor) -> torch.Tensor:
     return torch.logit(beta.float(), eps=1e-6).to(torch.bfloat16)
 
 
 def _cast_beta_bf16(beta: torch.Tensor) -> torch.Tensor:
     return beta if beta.dtype == torch.bfloat16 else beta.to(torch.bfloat16)
-
-
-def _contig(t: torch.Tensor | None) -> torch.Tensor | None:
-    if t is None or t.is_contiguous():
-        return t
-    return t.contiguous()
 
 
 def _guarded_forward(
@@ -52,9 +42,6 @@ def _guarded_forward(
     out: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
 ):
-    q, k, v, g, beta = _contig(q), _contig(k), _contig(v), _contig(g), _contig(beta)
-    A_log, dt_bias = _contig(A_log), _contig(dt_bias)
-    initial_state, cu_seqlens = _contig(initial_state), _contig(cu_seqlens)
     device_ctx = (
         torch.cuda.device(q.device.index) if q.device.index != torch.cuda.current_device() else contextlib.nullcontext()
     )
@@ -127,7 +114,6 @@ class HopperChunkKDAFunction(torch.autograd.Function):
                 device=q.device,
             )
 
-        g = _cast_g_bf16(g)
         if beta_is_logits:
             beta = _cast_beta_bf16(beta)
         else:
@@ -223,6 +209,9 @@ def cula_kda_prefill(
     ``use_qk_l2norm_in_kernel`` is accepted for API compatibility; CuTeDSL
     always applies L2-norm internally.
 
+    Tensor inputs must be contiguous and ``g`` must be bfloat16; no implicit
+    copies or casts are made, non-conforming inputs raise.
+
     Args:
         q (torch.Tensor):
             queries of shape `[B, T, H, K]`.
@@ -269,8 +258,7 @@ def cula_kda_prefill(
         use_intracard_cp (Literal["auto"] | bool):
             Whether to use the SM90 intracard-CP path when profitable. ``True``
             requires CP support and raises on rejection, ``"auto"`` falls back
-            to the serial K1+K2 path, and ``False`` disables CP. ``use_cp`` is
-            accepted as a compatibility alias.
+            to the serial K1+K2 path, and ``False`` disables CP.
         out (Optional[torch.Tensor]):
             Preallocated output buffer, bf16, same shape as ``v``, written in
             place (also returned). ``None`` allocates per call. Default: `None`.
@@ -318,8 +306,7 @@ def cula_kda_prefill(
     A_log = kwargs.pop("A_log", None)
     dt_bias = kwargs.pop("dt_bias", None)
     cu_seqlens_cpu = kwargs.pop("cu_seqlens_cpu", None)
-    use_cp_alias = kwargs.pop("use_cp", None)
-    use_intracard_cp = CPMode.parse(use_intracard_cp, use_cp_alias)
+    use_intracard_cp = CPMode.parse(use_intracard_cp)
     if kwargs:
         raise TypeError(f"cula_kda_prefill got unexpected keyword arguments: {set(kwargs)}")
     if A_log is None:

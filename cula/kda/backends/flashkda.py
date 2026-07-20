@@ -17,7 +17,6 @@ _ACCEPTED_KWARGS = {
     "cu_seqlens_cpu",
     "use_beta_sigmoid_in_kernel",
     "use_intracard_cp",
-    "use_cp",
     "out",
     "final_state",
 }
@@ -65,6 +64,10 @@ class FlashKDABackend(BaseBackend):
             return False, f"unsupported kwargs: {sorted(unknown)}"
         if v.shape[2] != q.shape[2]:
             return False, f"no GVA support (HV={v.shape[2]} != H={q.shape[2]})"
+        if any(not t.is_contiguous() for t in (q, k, v, g)):
+            return False, "requires contiguous q/k/v/g (no implicit copies)"
+        if g.dtype != torch.bfloat16:
+            return False, f"requires bfloat16 g (no implicit cast), got {g.dtype}"
         if not use_gate_in_kernel:
             return False, "requires use_gate_in_kernel=True"
         if not safe_gate:
@@ -82,21 +85,29 @@ class FlashKDABackend(BaseBackend):
             return False, "requires A_log and dt_bias on the q device"
         if A_log.dtype != torch.float32 or dt_bias.dtype != torch.float32:
             return False, "requires float32 A_log and dt_bias"
+        if not A_log.is_contiguous() or not dt_bias.is_contiguous():
+            return False, "requires contiguous A_log and dt_bias"
         H, D = q.shape[2], q.shape[3]
         if A_log.shape != (H,) or dt_bias.numel() != H * D:
             return False, f"requires A_log shape ({H},) and {H * D} dt_bias elements"
         if cu_seqlens is not None:
             if not isinstance(cu_seqlens, torch.Tensor):
                 return False, "requires tensor cu_seqlens"
-            if q.shape[0] != 1 or cu_seqlens.ndim != 1 or cu_seqlens.device != q.device or cu_seqlens.dtype != torch.int32:
-                return False, "requires packed B=1 and int32 cu_seqlens on the q device"
+            if (
+                q.shape[0] != 1
+                or cu_seqlens.ndim != 1
+                or cu_seqlens.device != q.device
+                or cu_seqlens.dtype != torch.int32
+                or not cu_seqlens.is_contiguous()
+            ):
+                return False, "requires packed B=1 and contiguous int32 cu_seqlens on the q device"
         if initial_state is not None:
             if not isinstance(initial_state, torch.Tensor):
                 return False, "requires tensor initial_state"
             N = cu_seqlens.numel() - 1 if cu_seqlens is not None else q.shape[0]
             expected = (N, H, D, D)
-            if initial_state.device != q.device or initial_state.dtype != torch.float32:
-                return False, "requires float32 initial_state on the q device"
+            if initial_state.device != q.device or initial_state.dtype != torch.float32 or not initial_state.is_contiguous():
+                return False, "requires contiguous float32 initial_state on the q device"
             if initial_state.shape != expected:
                 return False, f"requires initial_state shape {expected}, got {tuple(initial_state.shape)}"
         cu_seqlens_cpu = kwargs.get("cu_seqlens_cpu")
@@ -109,7 +120,7 @@ class FlashKDABackend(BaseBackend):
         if not isinstance(use_beta_sigmoid, bool):
             return False, "requires boolean use_beta_sigmoid_in_kernel"
         try:
-            CPMode.parse(kwargs.get("use_intracard_cp"), kwargs.get("use_cp"))
+            CPMode.parse(kwargs.get("use_intracard_cp"))
         except (TypeError, ValueError) as exc:
             return False, str(exc)
         out = kwargs.get("out")
@@ -137,6 +148,5 @@ class FlashKDABackend(BaseBackend):
     def kda_prefill(self, q, k, v, g, beta, **kwargs):
         from cula.kda.flashkda import cula_kda_prefill
 
-        if "use_cp" not in kwargs:
-            kwargs.setdefault("use_intracard_cp", "auto")
+        kwargs.setdefault("use_intracard_cp", "auto")
         return cula_kda_prefill(q, k, v, g, beta, **kwargs)
