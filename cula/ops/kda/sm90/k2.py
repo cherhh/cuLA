@@ -221,10 +221,7 @@ def k2_kernel(
         cute.group_modes(gSrc_beta, 0, 2),
     )
 
-    if tidx < D:
-        for e in cutlass.range_constexpr(D):
-            sState[tidx, e] = cutlass.BFloat16(0.0)
-    # Load initial_state -> sState[K_in, D_out].
+    # Load initial_state -> sState[K_in, D_out]
     if has_initial_state:
         state_base = cutlass.Int32(seq_idx) * cutlass.Int32(H * D * D) + cutlass.Int32(head_idx) * cutlass.Int32(D * D)
         if tidx < D:
@@ -238,6 +235,10 @@ def k2_kernel(
                     sState[tidx, d_out] = cutlass.BFloat16(
                         initial_state_g[state_base + cutlass.Int32(d_out * D) + cutlass.Int32(tidx)]
                     )
+    else:
+        if tidx < D:
+            for e in cutlass.range_constexpr(D):
+                sState[tidx, e] = cutlass.BFloat16(0.0)
     cute.arch.barrier()
 
     mma_atom = warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))

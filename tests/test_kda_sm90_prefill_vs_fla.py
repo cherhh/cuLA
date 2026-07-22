@@ -159,6 +159,7 @@ def test_prefill_varlen_matches_fla(cu_seqlens, H, with_state):
     assert_close("ht", ref_ht, tri_ht, 0.005)
 
 
+@pytest.mark.kda_fast
 def test_prefill_workspace_reuse_across_shapes():
     """Back-to-back calls with different shapes share the grow-only workspace
     arena; earlier shapes must keep matching FLA after the arena has been
