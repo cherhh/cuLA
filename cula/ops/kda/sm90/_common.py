@@ -3,13 +3,10 @@
 
 """Shared low-level helpers for the SM90 FlashKDA kernels."""
 
-import weakref
-
 import cutlass
 import torch
 from cutlass import Int32
 from cutlass._mlir.dialects import llvm as _llvm
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T as _T
 
 
@@ -52,30 +49,3 @@ def add_f16x2_u32(a_u32: Int32, b_u32: Int32, *, loc=None, ip=None) -> Int32:
         ip=ip,
     )
     return Int32(result)
-
-
-_WRAP_CACHE: dict = {}
-_WRAP_CACHE_MAXSIZE = 512
-
-
-def _wrap_input(t: torch.Tensor, align: int, *, view_shape=None, cache: bool = False):
-    """Wrap a tensor as a CuTe tensor via from_dlpack.
-
-    ``cache=True``: reuse across launches, keyed by (id, _version, align, view_shape)
-    and verified by weakref.
-
-    Use ``cache=False`` for per-call buffers (workspaces, states).
-    """
-    if not cache:
-        src = t if view_shape is None else t.view(view_shape)
-        return from_dlpack(src.detach(), assumed_align=align)
-    ckey = (id(t), t._version, align, view_shape)
-    entry = _WRAP_CACHE.get(ckey)
-    if entry is not None and entry[0]() is t:
-        return entry[1]
-    src = t if view_shape is None else t.view(view_shape)
-    w = from_dlpack(src.detach(), assumed_align=align)
-    if len(_WRAP_CACHE) >= _WRAP_CACHE_MAXSIZE:
-        _WRAP_CACHE.pop(next(iter(_WRAP_CACHE)))
-    _WRAP_CACHE[ckey] = (weakref.ref(t), w)
-    return w

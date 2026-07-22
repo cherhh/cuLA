@@ -118,16 +118,15 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu)
         _validate_launch_options(q, out, lower_bound, True)
         plan = plan_prefill(
-            q,
-            cu_seqlens,
-            cu_seqlens_cpu,
+            _seq_tiles_from_problem(problem),
+            num_heads,
+            q.device,
             use_intracard_cp,
-            _seq_tiles=_seq_tiles_from_problem(problem),
         )
         if not plan.trivial:
-            from cula.ops.kda.sm90.cp.driver import run_cp
+            from cula.ops.kda.sm90.cp.driver import _run_cp
 
-            run_cp(
+            _run_cp(
                 plan,
                 q,
                 k,
@@ -166,7 +165,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
                 _problem=problem,
             )
 
-        return out.to(q.dtype), final_state
+        return out, final_state
 
     @staticmethod
     @custom_bwd(device_type="cuda")
@@ -278,25 +277,6 @@ def cula_kda_prefill(
         )
     if not safe_gate:
         raise NotImplementedError("SM90 CuTeDSL KDA prefill only supports safe_gate=True.")
-    if lower_bound is None:
-        raise ValueError("`lower_bound` must be specified when `safe_gate=True` and `use_gate_in_kernel=True`.")
-    if not (-5 <= lower_bound < 0):
-        raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
-    if cu_seqlens is not None:
-        if q.shape[0] != 1:
-            raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing.",
-            )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
-            raise ValueError(
-                f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
-            )
-    if initial_state is not None:
-        if initial_state.dtype != torch.float32:
-            raise TypeError("initial_state must be in float32.")
-
     num_qk_heads, head_dim = q.shape[2], q.shape[3]
     num_kv_heads = v.shape[2]
     A_log = kwargs.pop("A_log", None)
@@ -305,52 +285,19 @@ def cula_kda_prefill(
     use_intracard_cp = CPMode.parse(use_intracard_cp)
     if kwargs:
         raise TypeError(f"cula_kda_prefill got unexpected keyword arguments: {set(kwargs)}")
-    if A_log is None:
-        raise ValueError("A_log must be provided when use_gate_in_kernel=True.")
-    if dt_bias is None:
-        raise ValueError("dt_bias must be provided when use_gate_in_kernel=True.")
-    elif dt_bias.ndim == 1:
+    if dt_bias is not None and dt_bias.ndim == 1:
         dt_bias = dt_bias.view(num_kv_heads, head_dim)
 
-    if q.shape != k.shape:
-        raise ValueError(f"q and k must have the same shape, got q={tuple(q.shape)}, k={tuple(k.shape)}")
-    if g.shape != v.shape:
-        raise ValueError(f"g and v must have the same shape, got g={tuple(g.shape)}, v={tuple(v.shape)}")
-    if beta.shape != v.shape[:3]:
-        raise ValueError(f"beta must have shape {tuple(v.shape[:3])}, got {tuple(beta.shape)}")
-    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
-        raise TypeError("q, k, v must be in bfloat16.")
     if beta.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError("beta must be in bfloat16 or float32.")
-    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
-        raise ValueError("Currently we only support head dim of 128 for KDA.")
     if num_kv_heads != num_qk_heads:
         raise NotImplementedError(
             "SM90 CuTeDSL KDA prefill does not support grouped-value attention yet "
             f"(num_kv_heads={num_kv_heads} != num_qk_heads={num_qk_heads}); native GVA is a follow-up change."
         )
 
-    if out is not None:
-        if out.shape != v.shape or out.dtype != torch.bfloat16 or not out.is_cuda or not out.is_contiguous():
-            raise ValueError(
-                f"out must be a contiguous CUDA bfloat16 tensor of shape {tuple(v.shape)}, "
-                f"got dtype={out.dtype}, shape={tuple(out.shape)}"
-            )
-    if final_state is not None:
-        if not output_final_state:
-            raise ValueError("final_state buffer requires output_final_state=True.")
-        n_seqs = cu_seqlens.numel() - 1 if cu_seqlens is not None else q.shape[0]
-        expected = (n_seqs, num_kv_heads, head_dim, head_dim)
-        if (
-            final_state.shape != expected
-            or final_state.dtype != torch.float32
-            or not final_state.is_cuda
-            or not final_state.is_contiguous()
-        ):
-            raise ValueError(
-                f"final_state must be a contiguous CUDA float32 tensor of shape {expected}, "
-                f"got dtype={final_state.dtype}, shape={tuple(final_state.shape)}"
-            )
+    if final_state is not None and not output_final_state:
+        raise ValueError("final_state buffer requires output_final_state=True.")
 
     if scale is None:
         scale = k.shape[-1] ** -0.5

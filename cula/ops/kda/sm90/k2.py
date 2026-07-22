@@ -919,11 +919,7 @@ def launch_k2(
     seq_order: optional int32 [N] launch-slot -> sequence index permutation
         (longest-first for ragged CP batches); None = identity.
     """
-    assert v.is_cuda and v.dtype == torch.bfloat16 and v.is_contiguous()
-    assert out.is_cuda and out.dtype == torch.bfloat16 and out.is_contiguous()
-    B, T, H, K = v.shape
-    assert K == D
-    assert out.ndim == 4 and out.shape[0] == B and out.shape[2] == H and out.shape[3] == D
+    B, T, H, _ = v.shape
     V_T_total = B * T
     O_T_total = out.shape[0] * out.shape[1]
     v_is_varlen = v_tile_starts is not None
@@ -947,17 +943,10 @@ def launch_k2(
 
     _dummy = _get_dummy_fp32(v.device)
     if has_initial_state_flag:
-        assert initial_state.shape == (N_seqs, H, D, D), (
-            f"initial_state shape must be ({N_seqs}, {H}, {D}, {D}), got {initial_state.shape}"
-        )
-        initial_state_fp32 = initial_state.contiguous().reshape(-1)
+        initial_state_fp32 = initial_state.reshape(-1)
     else:
         initial_state_fp32 = _dummy
     if has_final_state_flag:
-        assert final_state.shape == (N_seqs, H, D, D), (
-            f"final_state shape must be ({N_seqs}, {H}, {D}, {D}), got {final_state.shape}"
-        )
-        assert final_state.dtype == torch.float32, f"final_state must be fp32, got {final_state.dtype}"
         final_state_fp32 = final_state.reshape(-1)
     else:
         final_state_fp32 = _dummy

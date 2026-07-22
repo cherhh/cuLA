@@ -36,7 +36,6 @@ from cula.ops.kda.sm90.k2 import (
     D,
     _get_current_custream,
     _get_dummy_int32,
-    _get_identity_order,
     _make_out_kinter_one_stage,
     _make_state_smem_layout,
 )
@@ -654,26 +653,20 @@ def launch_pre_scan(
     b_state: torch.Tensor,  # [S, H, D, D] fp32, written (bhvk)
     m_state: torch.Tensor,  # [S, H, D, D] fp32, written (bhvk)
     seg_cu_tiles: torch.Tensor,  # int32 [S+1], global tile prefix sum
+    *,
+    total_tiles: int,
+    seg_order: torch.Tensor,  # int32 launch list
     v_tile_starts: torch.Tensor | None = None,  # per-tile packed offset (native varlen)
     v_tile_actual_lens: torch.Tensor | None = None,  # per-tile valid rows (partial-tile mask)
-    total_tiles: int | None = None,  # ceil tile sum (varlen); None -> T_total // CHUNK
-    seg_order: torch.Tensor | None = None,  # int32 launch list
 ) -> None:
     """Launch fused pre_scan: B_seg and M_seg for the segments in seg_order."""
-    assert v.is_cuda and v.dtype == torch.bfloat16 and v.is_contiguous()
     B, T, H, K = v.shape
-    assert K == D
     T_total = B * T
     v_is_varlen = v_tile_starts is not None
     if not v_is_varlen:
         dummy = _get_dummy_int32(v.device)
         v_tile_starts = dummy
         v_tile_actual_lens = dummy
-    if total_tiles is None:
-        total_tiles = T_total // CHUNK
-    if seg_order is None:
-        seg_order = _get_identity_order(seg_cu_tiles.numel() - 1, v.device)
-
     compiled_fn = _get_compiled_pre_scan(H, v_is_varlen)
     stream = _get_current_custream()
     # TMA descriptors are (re)built inside run_pre_scan from the dynamic Int32

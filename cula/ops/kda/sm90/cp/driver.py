@@ -4,7 +4,7 @@
 """Intracard-CP prefill executor: K1 once → pre_scan → merge → segment-K2.
 
 Only *runs* a given CPPlan; planning lives in cp.plan. The wrapper calls
-run_cp with a plan from plan_prefill; intracard_prefill is the plan-and-run
+_run_cp with a plan from plan_prefill; intracard_prefill is the plan-and-run
 entry for direct callers.
 """
 
@@ -18,9 +18,9 @@ from cula.ops.kda.sm90.cp.merge import launch_merge
 from cula.ops.kda.sm90.cp.plan import CPPlan, plan_auto, plan_manual, split_balanced
 from cula.ops.kda.sm90.cp.pre_scan import launch_pre_scan
 from cula.ops.kda.sm90.fwd import (
-    _cute_arch_for_device,
     _get_or_alloc_workspaces,
     _get_or_build_varlen_metadata,
+    _PrefillProblem,
     _seq_tiles_from_problem,
     _validate_inputs,
     _validate_launch_options,
@@ -58,7 +58,7 @@ def _get_scratch(key_name: str, shape: tuple, dtype, device) -> torch.Tensor:
     return cached
 
 
-def run_cp(
+def _run_cp(
     plan: CPPlan,
     q,
     k,
@@ -71,55 +71,48 @@ def run_cp(
     A_log,
     dt_bias,
     lower_bound,
+    _problem: _PrefillProblem,
     initial_state=None,
     final_state=None,
     cu_seqlens=None,
     state_transposed=False,
-    _problem=None,
 ) -> None:
     """Execute a non-trivial CPPlan verbatim -- no re-planning, no fallback."""
-    assert not plan.trivial
-    problem = _problem or _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens)
-    _validate_launch_options(q, out, lower_bound, True)
-    expected_seq_tiles = tuple(_seq_tiles_from_problem(problem))
-    if plan.seq_tiles != expected_seq_tiles:
-        raise ValueError(f"CP plan seq_tiles {plan.seq_tiles} do not match validated inputs {expected_seq_tiles}")
-    with _cute_arch_for_device(q.device):
-        if cu_seqlens is None and q.shape[1] % CHUNK != 0:
-            _run_padded_dense(
-                plan,
-                q,
-                k,
-                v,
-                g,
-                beta,
-                scale,
-                out,
-                A_log,
-                dt_bias,
-                lower_bound,
-                initial_state,
-                final_state,
-                state_transposed,
-            )
-        else:
-            _run_pipeline(
-                plan,
-                q,
-                k,
-                v,
-                g,
-                beta,
-                scale,
-                out,
-                A_log,
-                dt_bias,
-                lower_bound,
-                initial_state,
-                final_state,
-                cu_seqlens,
-                state_transposed,
-            )
+    if not _problem.is_varlen and _problem.T % CHUNK != 0:
+        _run_padded_dense(
+            plan,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            out,
+            A_log,
+            dt_bias,
+            lower_bound,
+            initial_state,
+            final_state,
+            state_transposed,
+        )
+    else:
+        _run_pipeline(
+            plan,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            out,
+            A_log,
+            dt_bias,
+            lower_bound,
+            initial_state,
+            final_state,
+            cu_seqlens,
+            state_transposed,
+        )
 
 
 def intracard_prefill(
@@ -174,7 +167,7 @@ def intracard_prefill(
             _problem=problem,
         )
         return
-    run_cp(
+    _run_cp(
         plan,
         q,
         k,
@@ -186,11 +179,11 @@ def intracard_prefill(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        _problem=problem,
         initial_state=initial_state,
         final_state=final_state,
         cu_seqlens=cu_seqlens,
         state_transposed=state_transposed,
-        _problem=problem,
     )
 
 
@@ -272,7 +265,6 @@ def _run_pipeline(
         tile_starts = tile_actual_lens = None
         is_varlen_padded = False
     else:
-        assert B == 1 and cu_seqlens.dtype == torch.int32
         varlen_meta = _get_or_build_varlen_metadata(cu_seqlens)
         T_total = T
         is_varlen_padded = varlen_meta.needs_padding
@@ -341,11 +333,9 @@ def _run_pipeline(
 
     init_bhvk = None
     if initial_state is not None:
-        assert initial_state.shape == (plan.n_seqs, H, D, D)
-        init_bhvk = initial_state.to(torch.float32)
+        init_bhvk = initial_state
         if state_transposed:
-            init_bhvk = init_bhvk.transpose(-1, -2)
-        init_bhvk = init_bhvk.contiguous()
+            init_bhvk = init_bhvk.transpose(-1, -2).contiguous()
     carries = _get_scratch("carries", (n_seg, H, D, D), torch.float32, device)
     launch_merge(carries, m_seg, b_seg, plan.per_seq, init_bhvk)
 
@@ -374,15 +364,7 @@ def _run_pipeline(
 
     if final_state is not None:
         last_idx = _get_plan_tensor(tuple(first + n - 1 for first, n in plan.per_seq), torch.long, device)
-        if (
-            not state_transposed
-            and final_state.dtype == torch.float32
-            and final_state.is_contiguous()
-            and final_state.shape == (plan.n_seqs, H, D, D)
-        ):
+        if not state_transposed:
             torch.index_select(seg_final, 0, last_idx, out=final_state)
         else:
-            fin = seg_final.index_select(0, last_idx)
-            if state_transposed:
-                fin = fin.transpose(-1, -2)
-            final_state.copy_(fin.to(final_state.dtype))
+            final_state.copy_(seg_final.index_select(0, last_idx).transpose(-1, -2))

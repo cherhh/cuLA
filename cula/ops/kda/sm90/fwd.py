@@ -24,9 +24,7 @@ two-kernel (K1 Prepare + K2 Recurrence), CHUNK=16, D=128.
 
 from __future__ import annotations
 
-import os
 import weakref
-from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -36,7 +34,6 @@ from cula.ops.kda.sm90._common import _stream_key
 CHUNK: int = 16
 D: int = 128  # only 128 supported
 
-_CUTE_ARCH_BY_CC = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a"}
 _VARLEN_LAYOUT_CACHE_MAXSIZE = 64
 
 
@@ -61,11 +58,8 @@ class _PrefillProblem:
     B: int
     T: int
     H: int
-    N: int  # number of sequences (=B for fixed-len, =len(cu_seqlens)-1 for varlen)
     total_tiles: int
     is_varlen: bool
-    has_state_in: bool
-    has_state_out: bool
     varlen_meta: _VarlenMetadata | None = None
 
 
@@ -95,7 +89,7 @@ def _validate_inputs(
     B, T, H, K = q.shape
     if B <= 0 or T <= 0 or H <= 0:
         raise ValueError(f"B, T and H must be positive, got B={B}, T={T}, H={H}")
-    if K != D or v.shape[-1] != D:
+    if K != D:
         raise ValueError(f"only K=V={D} supported, got K={K} V={v.shape[-1]}")
     if beta.shape != (B, T, H):
         raise ValueError(f"beta shape mismatch: {tuple(beta.shape)} vs ({B},{T},{H})")
@@ -157,14 +151,12 @@ def _validate_inputs(
         total_tiles = B * ((T + CHUNK - 1) // CHUNK)
         varlen_meta = None
 
-    has_state_in = initial_state is not None
-    has_state_out = final_state is not None
-    if has_state_in:
+    if initial_state is not None:
         if initial_state.shape != (N, H, D, D):
             raise ValueError(f"initial_state shape must be ({N}, {H}, {D}, {D}), got {tuple(initial_state.shape)}")
         if initial_state.device != q.device or initial_state.dtype != torch.float32 or not initial_state.is_contiguous():
             raise TypeError("initial_state must be a contiguous float32 tensor on the q device")
-    if has_state_out:
+    if final_state is not None:
         if final_state.shape != (N, H, D, D):
             raise ValueError(f"final_state shape must be ({N}, {H}, {D}, {D}), got {tuple(final_state.shape)}")
         if final_state.device != q.device or final_state.dtype != torch.float32 or not final_state.is_contiguous():
@@ -174,11 +166,8 @@ def _validate_inputs(
         B=B,
         T=T,
         H=H,
-        N=N,
         total_tiles=total_tiles,
         is_varlen=is_varlen,
-        has_state_in=has_state_in,
-        has_state_out=has_state_out,
         varlen_meta=varlen_meta,
     )
 
@@ -198,31 +187,6 @@ def _validate_launch_options(q, out, lower_bound, use_gate_in_kernel) -> None:
         raise ValueError("lower_bound must be specified.")
     if not (-5 <= lower_bound < 0):
         raise ValueError(f"lower_bound must be in the safe range [-5, 0), got {lower_bound}.")
-
-
-_DEVICE_ARCH_CACHE: dict[int, str] = {}
-
-
-@contextmanager
-def _cute_arch_for_device(device: torch.device):
-    """Ensure CUTE_DSL_ARCH matches the device before any lazy cute.compile.
-
-    Cached + check-and-set (no pop): compiles only happen on the first call
-    per kernel config, so re-writing the env var on every dispatch was pure
-    overhead. Leaving it set is safe — other arches' dispatch paths perform
-    the same check-and-set before their own compiles.
-    """
-    idx = device.index if device.index is not None else torch.cuda.current_device()
-    arch = _DEVICE_ARCH_CACHE.get(idx)
-    if arch is None:
-        major, minor = torch.cuda.get_device_capability(device)
-        arch = _CUTE_ARCH_BY_CC.get((major, minor))
-        if arch is None:
-            raise RuntimeError(f"unsupported compute capability sm_{major}{minor}")
-        _DEVICE_ARCH_CACHE[idx] = arch
-    if os.environ.get("CUTE_DSL_ARCH") != arch:
-        os.environ["CUTE_DSL_ARCH"] = arch
-    yield
 
 
 _VARLEN_LAYOUT_CACHE: dict = {}
@@ -318,12 +282,13 @@ def _get_or_build_varlen_layout(seq_lens: tuple[int, ...], device, cu_dtype):
 def _get_or_build_varlen_metadata(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None = None) -> _VarlenMetadata:
     """Cache varlen metadata (seq_lens, tile offsets, padding flags) for cu_seqlens."""
     cache_key = (id(cu_seqlens), _stream_key(cu_seqlens.device))
+    version = 0 if torch.is_inference(cu_seqlens) else int(cu_seqlens._version)
     attrs = (
         cu_seqlens.data_ptr(),
         tuple(cu_seqlens.shape),
         str(cu_seqlens.device),
         cu_seqlens.dtype,
-        int(cu_seqlens._version),
+        version,
     )
     cached = _VARLEN_METADATA_CACHE.get(cache_key)
     if cached is not None:
@@ -432,29 +397,29 @@ def flash_kda_fwd(
             GPU->host sync when first building varlen metadata.
         state_transposed: False -> [N,H,V,K] (default), True -> [N,H,K,V].
     """
-    problem = _problem or _validate_inputs(
-        q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu
-    )
-    _validate_launch_options(q, out, lower_bound, use_gate_in_kernel)
+    if _problem is None:
+        problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu)
+        _validate_launch_options(q, out, lower_bound, use_gate_in_kernel)
+    else:
+        problem = _problem
 
-    with _cute_arch_for_device(q.device):
-        _dispatch_cute(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale,
-            out,
-            A_log,
-            dt_bias,
-            lower_bound,
-            initial_state,
-            final_state,
-            cu_seqlens,
-            problem,
-            state_transposed=state_transposed,
-        )
+    _dispatch_cute(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        out,
+        A_log,
+        dt_bias,
+        lower_bound,
+        initial_state,
+        final_state,
+        cu_seqlens,
+        problem,
+        state_transposed=state_transposed,
+    )
 
 
 def _dispatch_cute(
@@ -495,11 +460,8 @@ def _dispatch_cute(
             B=B,
             T=T_pad,
             H=H,
-            N=problem.N,
             total_tiles=B * (T_pad // K1_CHUNK),
             is_varlen=False,
-            has_state_in=problem.has_state_in,
-            has_state_out=problem.has_state_out,
         )
 
     k1_q, k1_k, k1_g, k1_beta = q, k, g, beta
@@ -519,10 +481,6 @@ def _dispatch_cute(
         if varlen_meta.needs_padding:
             total_aligned = varlen_meta.total_aligned
 
-            k1_q = q.contiguous()
-            k1_k = k.contiguous()
-            k1_g = g.contiguous()
-            k1_beta = beta.contiguous()
             k1_total_tiles = varlen_meta.total_tiles
             k1_tile_starts = varlen_meta.tile_starts
             k1_tile_actual_lens = varlen_meta.tile_actual_lens
@@ -542,11 +500,8 @@ def _dispatch_cute(
                 B=1,
                 T=total_aligned,
                 H=problem.H,
-                N=problem.N,
                 total_tiles=total_aligned // K1_CHUNK,
                 is_varlen=True,
-                has_state_in=problem.has_state_in,
-                has_state_out=problem.has_state_out,
             )
             cu_seqlens, problem = cu_pad, problem_pad
         else:
@@ -570,14 +525,6 @@ def _dispatch_cute(
     ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta = _get_or_alloc_workspaces(
         n_qk, n_cc, total_tiles * H * K1_D, T_total * H, q.device, beta.dtype
     )
-
-    k2_initial_state = None
-    if problem.has_state_in:
-        k2_initial_state = initial_state.contiguous()
-
-    k2_final_state = None
-    if problem.has_state_out:
-        k2_final_state = final_state
 
     # K1 reads beta from its original packed [T, H] layout and emits raw beta
     # into ws_beta (tail rows = -80); K2 reads ws_beta directly, so no
@@ -614,8 +561,8 @@ def _dispatch_cute(
         ws_mqk,
         out,
         k2_cu_seqlens_tiles,
-        initial_state=k2_initial_state,
-        final_state=k2_final_state,
+        initial_state=initial_state,
+        final_state=final_state,
         state_transposed=state_transposed,
         v_tile_starts=k2_v_tile_starts,
         v_tile_actual_lens=k2_v_tile_actual_lens,

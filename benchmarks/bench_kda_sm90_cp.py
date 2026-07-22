@@ -137,7 +137,9 @@ def bench_cp(h_values, configs):
             ms_off = time_kernel(lambda: run_kernel(**common, use_auto_cp=False))
             ms_auto = time_kernel(lambda: run_kernel(**common, use_auto_cp=True))
 
-            speedup = ms_off / ms_auto if ms_auto > 0 else float("inf")
+            if ms_off <= 0 or ms_auto <= 0:
+                raise RuntimeError(f"invalid benchmark timing: CP-off={ms_off} ms, CP-auto={ms_auto} ms")
+            speedup = ms_off / ms_auto
             r = dict(
                 tag=tag,
                 H=H,

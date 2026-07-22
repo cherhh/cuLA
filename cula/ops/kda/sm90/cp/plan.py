@@ -11,7 +11,6 @@ are H100-fitted ratios of like chains (no per-SKU recalibration).
 from __future__ import annotations
 
 import os
-import weakref
 from dataclasses import dataclass
 
 import torch
@@ -78,9 +77,8 @@ def _materialize(seq_tiles: list[int], n_segs: list[int]) -> CPPlan:
     seg_cu = [0]
     per_seq = []
     for tiles, n in zip(seq_tiles, n_segs):
-        n = min(n, tiles)
         first = len(seg_cu) - 1
-        base, rem = divmod(tiles, max(n, 1))
+        base, rem = divmod(tiles, n)
         for i in range(n):
             seg_cu.append(seg_cu[-1] + base + (1 if i < rem else 0))
         per_seq.append((first, n))
@@ -107,8 +105,6 @@ def plan_auto(seq_tiles: list[int], H: int, sm_count: int) -> CPPlan:
     Counter-example: seq_tiles = [64], H=16 -> 2 segments of 32, but
     serial wall 64 < CP wall 3 * 32 = 96 -> serial.
     """
-    if not seq_tiles:
-        return CPPlan.serial(seq_tiles, "empty input")
     plan = split_balanced(seq_tiles, H, sm_count)
     if plan.trivial:
         return CPPlan.serial(seq_tiles, "machine already full or sequences too short to split")
@@ -127,62 +123,23 @@ def plan_auto(seq_tiles: list[int], H: int, sm_count: int) -> CPPlan:
 
 def plan_manual(seq_tiles: list[int], s_split: int) -> CPPlan:
     """Up to s_split segments per sequence; no profitability check (tests)."""
-    n_segs = [max(1, min(s_split, tiles // max(1, MIN_SEG_TILES))) for tiles in seq_tiles]
+    n_segs = [max(1, min(s_split, tiles // MIN_SEG_TILES)) for tiles in seq_tiles]
     return _materialize(seq_tiles, n_segs)
 
 
-_SEQ_LENS_CACHE: dict = {}
-
-
-def _seq_lens_from_cu(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None) -> list[int]:
-    """Cache host seq lengths by tensor identity to avoid a D2H sync per call."""
-    key = id(cu_seqlens)
-    stamp = (cu_seqlens.data_ptr(), int(cu_seqlens._version), cu_seqlens.numel())
-    cached = _SEQ_LENS_CACHE.get(key)
-    if cached is not None:
-        ref, cstamp, seq_lens = cached
-        if ref() is cu_seqlens and cstamp == stamp:
-            return seq_lens
-        _SEQ_LENS_CACHE.pop(key, None)
-    src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.cpu()
-    cu_list = [int(x) for x in src.tolist()]
-    seq_lens = [cu_list[i + 1] - cu_list[i] for i in range(len(cu_list) - 1)]
-    if len(_SEQ_LENS_CACHE) >= 32:
-        _SEQ_LENS_CACHE.pop(next(iter(_SEQ_LENS_CACHE)))
-    _SEQ_LENS_CACHE[key] = (weakref.ref(cu_seqlens), stamp, seq_lens)
-    return seq_lens
-
-
 def plan_prefill(
-    q: torch.Tensor,
-    cu_seqlens: torch.Tensor | None = None,
-    cu_seqlens_cpu: torch.Tensor | None = None,
+    seq_tiles: list[int],
+    H: int,
+    device: torch.device,
     mode: CPMode | None = None,
-    *,
-    _seq_tiles: list[int] | None = None,
 ) -> CPPlan:
     """Prefill planning entry. Trivial => serial. FORCE raises if unsplittable."""
     if mode is None or mode is CPMode.OFF:
         return CPPlan.serial((), "disabled")
-    B, T, H, _K = q.shape
-    if _seq_tiles is not None:
-        seq_tiles = list(_seq_tiles)
-    elif cu_seqlens is None:
-        # CP pads to whole tiles, so planning uses ceil(T / CHUNK).
-        seq_tiles = [_ceil_div(T, CHUNK)] * B
-    elif B != 1:
-        if mode is CPMode.FORCE:
-            raise NotSplittableError("SM90 intracard CP varlen mode requires packed B=1.")
-        return CPPlan.serial((), "varlen requires packed B=1")
-    else:
-        seq_lens = _seq_lens_from_cu(cu_seqlens, cu_seqlens_cpu)
-        seq_tiles = [_ceil_div(sl, CHUNK) for sl in seq_lens]
-
+    sm_count = get_device_sm_count(device)
     if mode is CPMode.FORCE:
-        if not seq_tiles:
-            raise NotSplittableError("SM90 intracard CP requires at least one sequence.")
-        plan = split_balanced(seq_tiles, H, get_device_sm_count(q.device))
+        plan = split_balanced(seq_tiles, H, sm_count)
         if plan.trivial:
             raise NotSplittableError("SM90 intracard CP cannot split this shape.")
         return plan
-    return plan_auto(seq_tiles, H, get_device_sm_count(q.device))
+    return plan_auto(seq_tiles, H, sm_count)

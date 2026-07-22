@@ -195,3 +195,23 @@ def test_prefill_workspace_reuse_across_shapes():
                 lower_bound=-5.0,
             )
         assert_close("o", ref_o, tri_o, 0.005)
+
+
+@pytest.mark.kda_fast
+def test_prefill_reuses_inference_cu_seqlens_metadata():
+    q, k, v, g, beta, A_log, dt_bias, _ = _make_inputs(1, 47, 2, with_state=False)
+    with torch.inference_mode():
+        cu = torch.tensor([0, 15, 47], dtype=torch.int32, device=device)
+        kwargs = dict(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            cu_seqlens=cu,
+            output_final_state=True,
+            safe_gate=True,
+            lower_bound=-5.0,
+        )
+        out_first, state_first = cula_kda_prefill(q, k, v, g, beta, **kwargs)
+        out_cached, state_cached = cula_kda_prefill(q, k, v, g, beta, **kwargs)
+
+    assert torch.equal(out_cached, out_first)
+    assert torch.equal(state_cached, state_first)

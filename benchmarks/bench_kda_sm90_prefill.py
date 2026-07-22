@@ -58,12 +58,9 @@ from benchmarks.utils import (
     set_seed,
 )
 from cula.kda import flashkda_prefill as cula_kda_prefill
-from cula.utils import assert_hopper, get_device_sm_version
+from cula.utils import assert_hopper
 
-_device = torch.device("cuda")
-assert_hopper(_device)
-_major, _minor = get_device_sm_version(_device)
-_SM_TAG = f"sm{_major}{_minor}"
+_SM_TAG = "sm90"
 
 H, D = 64, 128
 WARMUP = 25
@@ -136,7 +133,9 @@ def _bench_one(common):
         sanitizer_mode=SANITIZER_MODE,
         aggregate="iqr_mean",
     )
-    speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
+    if ms_fla <= 0 or ms_cula <= 0:
+        raise RuntimeError(f"invalid benchmark timing: FLA={ms_fla} ms, cuLA={ms_cula} ms")
+    speedup = ms_fla / ms_cula
     del o_fla, o_cula
     return rel_rmse, rel_max, mean_diff, ms_fla, ms_cula, speedup
 
@@ -279,6 +278,8 @@ def main():
     global H
     parser.add_argument("--heads", type=int, default=H, help=f"Number of heads (H == HV, MHA). Default: {H}")
     args = parser.parse_args()
+
+    assert_hopper(torch.device("cuda"))
 
     global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE
     H = args.heads

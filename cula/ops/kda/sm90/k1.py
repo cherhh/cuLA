@@ -791,12 +791,7 @@ def launch_k1(
     is_varlen: bool = False,
 ) -> None:
     """Run K1 pipeline; produces all 6 K2-ready workspace tensors."""
-    for t in (q, k, g, beta):
-        assert t.dtype == torch.bfloat16 and t.is_cuda and t.is_contiguous()
-    assert A_log.dtype == torch.float32 and A_log.is_contiguous()
-    assert dt_bias.dtype == torch.float32 and dt_bias.is_contiguous()
-    B, T, H, K = q.shape
-    assert K == D
+    B, T, H, _ = q.shape
     T_total = B * T
     if not is_varlen:
         total_tiles = (B * T) // CHUNK
