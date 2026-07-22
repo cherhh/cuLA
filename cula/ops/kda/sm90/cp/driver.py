@@ -316,6 +316,13 @@ def _run_pipeline(
     # Longest-first launch order: stable sort -> identity for uniform splits.
     seg_tiles = plan.seg_tiles
     seg_order = _get_plan_tensor(tuple(sorted(range(n_seg), key=lambda i: -seg_tiles[i])), torch.int32, device)
+    # pre_scan skips each sequence's last segment.
+    last_segs = {first + n - 1 for first, n in plan.per_seq}
+    prescan_order = _get_plan_tensor(
+        tuple(sorted((i for i in range(n_seg) if i not in last_segs), key=lambda i: -seg_tiles[i])),
+        torch.int32,
+        device,
+    )
     launch_pre_scan(
         v_flat,
         ws_beta,
@@ -329,7 +336,7 @@ def _run_pipeline(
         v_tile_starts=tile_starts,
         v_tile_actual_lens=tile_actual_lens,
         total_tiles=plan.total_tiles,
-        seg_order=seg_order,
+        seg_order=prescan_order,
     )
 
     init_bhvk = None

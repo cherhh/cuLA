@@ -657,9 +657,9 @@ def launch_pre_scan(
     v_tile_starts: torch.Tensor | None = None,  # per-tile packed offset (native varlen)
     v_tile_actual_lens: torch.Tensor | None = None,  # per-tile valid rows (partial-tile mask)
     total_tiles: int | None = None,  # ceil tile sum (varlen); None -> T_total // CHUNK
-    seg_order: torch.Tensor | None = None,  # int32 [S] launch order; None = identity
+    seg_order: torch.Tensor | None = None,  # int32 launch list
 ) -> None:
-    """Launch fused pre_scan: B_seg and M_seg for all segments."""
+    """Launch fused pre_scan: B_seg and M_seg for the segments in seg_order."""
     assert v.is_cuda and v.dtype == torch.bfloat16 and v.is_contiguous()
     B, T, H, K = v.shape
     assert K == D
@@ -671,9 +671,8 @@ def launch_pre_scan(
         v_tile_actual_lens = dummy
     if total_tiles is None:
         total_tiles = T_total // CHUNK
-    S_total = seg_cu_tiles.numel() - 1
     if seg_order is None:
-        seg_order = _get_identity_order(S_total, v.device)
+        seg_order = _get_identity_order(seg_cu_tiles.numel() - 1, v.device)
 
     compiled_fn = _get_compiled_pre_scan(H, v_is_varlen)
     stream = _get_current_custream()
@@ -694,6 +693,6 @@ def launch_pre_scan(
         v_tile_actual_lens,
         total_tiles,
         T_total,
-        S_total,
+        seg_order.numel(),
         stream,
     )
